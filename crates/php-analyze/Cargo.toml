@@ -14,7 +14,22 @@ crate-type = ["cdylib", "rlib"]
 # the operator-facing artifact is libphp_analyze.so from the cdylib output.
 
 [dependencies]
-# Populated in §2 of the OpenSpec change.
+# `secrecy` wraps the bearer token in a `SecretString` with redacted `Debug`
+# and no `Display` (§6.3 of `SPECIFICATION.md`).
+secrecy = "0.10"
+# `thiserror` powers the `ConfigError` enum.
+thiserror = "2"
+# `url` parses and validates `server_url` (must be `http://` or `https://`).
+url = "2"
+#
+# `ext-php-rs` is *intentionally not yet added* — see the `scaffold-workspace-and-config`
+# OpenSpec change, §2.1. The build host needs `php8.3-dev` or `php8.4-dev` for
+# `ext-php-rs`'s `build.rs` to find `php-config`. Add it together with the
+# `bootstrap` module once headers are installed.
+
+[dev-dependencies]
+# Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
+tempfile = "3"
 
 [lints]
 workspace = true
