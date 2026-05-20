@@ -7,35 +7,34 @@ clarification.
 
 ## Open blockers
 
-### B-1 — `ext-php-rs` integration deferred
+### B-2 — `git push` blocked on remote auth
 
-**Status**: blocks the second half of `scaffold-workspace-and-config`
-(§2.1, §2.6, §5, §6, §9.5, §9.6).
+**Status**: blocks §10.3 only.
 
-**Cause**: the build host used to land this OpenSpec change has PHP 8.4
-(cli) installed but **not** the `php8.4-dev` (or `php8.3-dev`) headers,
-and no passwordless sudo. `ext-php-rs`'s `build.rs` requires
-`php-config` on `PATH`; without it the crate cannot compile, which
-takes the entire workspace down with it.
+**Cause**: this build host has no SSH key registered with
+`git@github.com:kalaspuffar/php-analyze.git`. `git push -u origin
+feat/scaffold-workspace-and-config` fails with `Permission denied
+(publickey)`.
 
-**Consequence**: the first half of the change is fully implemented and
-green (`fmt`, `clippy -D warnings`, all 14 `Config` unit tests pass,
-`cargo build --release --workspace` succeeds). The `cdylib` artifact
-`target/release/libphp_analyze.so` exists but is **not** a loadable PHP
-extension yet — it contains no `MINIT`/`MSHUTDOWN`/`RINIT`/`RSHUTDOWN`/
-`MINFO` entry points. The bootstrap module (`src/bootstrap.rs`) will
-add those once headers are available.
+**To unblock**: push the branch from a workstation that has push
+credentials:
 
-**To unblock**:
+```bash
+git push -u origin feat/scaffold-workspace-and-config
+```
 
-1. Install `php8.3-dev` **or** `php8.4-dev` (Ubuntu/Debian) on the build
-   host, plus the matching `libclang-dev` for `bindgen`.
-2. Verify `php-config --version` runs.
-3. Resume `/opsx:apply scaffold-workspace-and-config`. The remaining
-   tasks are §2.1 (add `ext-php-rs`), §5 (INI registration + lifecycle
-   skeletons in `bootstrap.rs`), §6 (`#[php_module]` entry +
-   `PhpInfoRenderer`), §9.5/§9.6 (manual `php --ri php_analyze`
-   verification).
+The branch is fully committed locally and ready to push.
+
+## Closed blockers
+
+### B-1 — `ext-php-rs` integration deferred *(closed)*
+
+`php8.4-dev` and `libclang-dev` were installed on the build host;
+`php-config 8.4.21` is on `PATH`. `ext-php-rs` was added pinned at
+`=0.15.13`, the `bootstrap.rs` module was implemented, and `MINIT` /
+`MSHUTDOWN` / `RINIT` / `RSHUTDOWN` / `MINFO` are all wired through
+`#[php_module]`. Manual verification with `php --ri php_analyze` on
+PHP 8.4.21 cli passes both §9.5 and §9.6.
 
 ## Spec clarifications adopted while implementing this change
 

@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 # the operator-facing artifact is libphp_analyze.so from the cdylib output.
 
 [dependencies]
+ext-php-rs = "=0.15.13"
 # `secrecy` wraps the bearer token in a `SecretString` with redacted `Debug`
 # and no `Display` (§6.3 of `SPECIFICATION.md`).
 secrecy = "0.10"
