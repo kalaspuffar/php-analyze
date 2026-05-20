@@ -1,0 +1,18 @@
+[package]
+name = "stub-ingest"
+description = "Placeholder ingest binary; the real implementation arrives in Phase 3."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "stub-ingest"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

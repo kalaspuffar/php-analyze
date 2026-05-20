@@ -1,0 +1,31 @@
+[package]
+name = "php-analyze"
+description = "PHP function-call tracing extension (cdylib loaded into PHP 8.3/8.4)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+# rlib is kept so `cargo test -p php-analyze` can link the test harness;
+# the operator-facing artifact is libphp_analyze.so from the cdylib output.
+
+[dependencies]
+ext-php-rs = "=0.15.13"
+# `secrecy` wraps the bearer token in a `SecretString` with redacted `Debug`
+# and no `Display` (§6.3 of `SPECIFICATION.md`).
+secrecy = "0.10"
+# `thiserror` powers the `ConfigError` enum.
+thiserror = "2"
+# `url` parses and validates `server_url` (must be `http://` or `https://`).
+url = "2"
+
+[dev-dependencies]
+# Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
+tempfile = "3"
+
+[lints]
+workspace = true
