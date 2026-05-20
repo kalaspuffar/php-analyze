@@ -32,6 +32,12 @@ jobs:
       # `ext-php-rs` shells out to `php-config` at build time, so the
       # matching `php<version>-dev` package must be present. Sury PPA is
       # the canonical source for non-distro PHP minor versions on Ubuntu.
+      #
+      # `ext-php-rs` also pulls `ext-php-rs-bindgen` → `clang-sys` as a
+      # build dependency. `clang-sys` needs a working `libclang` on the
+      # host or the build aborts with `Unable to find libclang`, so we
+      # install `libclang-dev` (the loadable `libclang.so.*`) and `clang`
+      # (which bindgen invokes as the preprocessor).
       - name: Install PHP ${{ matrix.php }} development headers
         run: |
           sudo apt-get update
@@ -41,7 +47,9 @@ jobs:
           sudo apt-get install -y \
             php${{ matrix.php }} \
             php${{ matrix.php }}-cli \
-            php${{ matrix.php }}-dev
+            php${{ matrix.php }}-dev \
+            libclang-dev \
+            clang
           sudo update-alternatives --set php /usr/bin/php${{ matrix.php }} || true
           sudo update-alternatives --set php-config /usr/bin/php-config${{ matrix.php }} || true
           php --version
