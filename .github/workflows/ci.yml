@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: cargo fmt + clippy + test (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.3", "8.4"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins the channel and components, so the
+      # default action installs the version we expect.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # `ext-php-rs` shells out to `php-config` at build time, so the
+      # matching `php<version>-dev` package must be present. Sury PPA is
+      # the canonical source for non-distro PHP minor versions on Ubuntu.
+      - name: Install PHP ${{ matrix.php }} development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ondrej/php
+          sudo apt-get update
+          sudo apt-get install -y \
+            php${{ matrix.php }} \
+            php${{ matrix.php }}-cli \
+            php${{ matrix.php }}-dev
+          sudo update-alternatives --set php /usr/bin/php${{ matrix.php }} || true
+          sudo update-alternatives --set php-config /usr/bin/php-config${{ matrix.php }} || true
+          php --version
+          php-config --version
+
+      # Cache cargo registry/git and the workspace `target/` directory.
+      # The key includes `Cargo.lock` so cache invalidates whenever the
+      # resolved dependency graph changes.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-php${{ matrix.php }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php${{ matrix.php }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all

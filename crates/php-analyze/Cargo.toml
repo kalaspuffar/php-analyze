@@ -1,0 +1,20 @@
+[package]
+name = "php-analyze"
+description = "PHP function-call tracing extension (cdylib loaded into PHP 8.3/8.4)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+# rlib is kept so `cargo test -p php-analyze` can link the test harness;
+# the operator-facing artifact is libphp_analyze.so from the cdylib output.
+
+[dependencies]
+# Populated in §2 of the OpenSpec change.
+
+[lints]
+workspace = true
