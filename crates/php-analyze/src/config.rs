@@ -201,6 +201,30 @@ const RANGE_SHIPPER_QUEUE_DEPTH: (i64, i64) = (1, 1024);
 // --- public constructor & global --------------------------------------------
 
 impl Config {
+    /// A `Config` representing the silent-disable state, with every
+    /// numeric directive at its documented §3.5 default. Used by the
+    /// `master_enabled = false` short-circuit in [`from_ini_values`] so
+    /// stale URL / range warnings do not surface on a deliberately-off
+    /// pool.
+    fn disabled(reason: DisableReason) -> Self {
+        Self {
+            enabled: false,
+            disable_reason: Some(reason),
+            server_url: None,
+            auth_token: SecretString::default(),
+            auth_token_source: TokenSource::None,
+            flush_records: DEFAULT_FLUSH_RECORDS as usize,
+            flush_bytes: DEFAULT_FLUSH_BYTES as usize,
+            buffer_cap_bytes: DEFAULT_BUFFER_CAP_BYTES as usize,
+            max_depth: DEFAULT_MAX_DEPTH as u16,
+            retry_count: DEFAULT_RETRY_COUNT as u8,
+            retry_backoff: Duration::from_millis(DEFAULT_RETRY_BACKOFF_MS as u64),
+            http_timeout: Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64),
+            shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS as u64),
+            shipper_queue_depth: DEFAULT_SHIPPER_QUEUE_DEPTH as usize,
+        }
+    }
+
     /// Pure constructor: takes raw INI values and returns the resolved
     /// [`Config`] plus the list of warnings the caller must log at
     /// `E_WARNING`. Has no side effects (it may read `auth_token_file` from
@@ -210,10 +234,24 @@ impl Config {
     /// file silently disables the extension; we deliberately do **not**
     /// fall back to the inline `auth_token` (§3.7 / configuration spec
     /// scenario "Unreadable token file triggers silent disable").
+    ///
+    /// When `php_analyze.enabled = 0` the function bails before any other
+    /// validation runs. That makes the disabled-pool quiet: no
+    /// `OutOfRange`/URL warnings even if stale directives remain in
+    /// `php.ini` (NFR-USE-2 / review finding R-5).
     pub fn from_ini_values(raw: &RawIni) -> (Self, Vec<ConfigWarning>) {
-        let mut warnings = Vec::new();
-
         let master_enabled = raw.enabled.unwrap_or(DEFAULT_ENABLED);
+
+        // Operator turned the extension off via php_analyze.enabled = 0.
+        // Do not re-validate the rest of php.ini: stale URL or
+        // out-of-range numeric directives must not clutter the error
+        // log on a deliberately-disabled pool (NFR-USE-2). Every
+        // numeric directive keeps its documented default.
+        if !master_enabled {
+            return (Self::disabled(DisableReason::MasterSwitchOff), Vec::new());
+        }
+
+        let mut warnings = Vec::new();
 
         let flush_records = clamp_directive(
             raw.flush_records,
@@ -291,43 +329,39 @@ impl Config {
         // disable-summary warning is pushed per call: either the specific
         // failure (Invalid/Unsupported/TokenFileUnreadable/EmptyTokenFile)
         // or the generic Missing{ServerUrl,Token}. See the per-variant
-        // commentary in §3.8.
-        let (auth_token, token_source, disable_reason) = if !master_enabled {
-            (
-                SecretString::default(),
-                TokenSource::None,
-                Some(DisableReason::MasterSwitchOff),
-            )
-        } else if let Some(reason) = server_url_outcome.disable_reason() {
-            if matches!(reason, DisableReason::ServerUrlNotConfigured) {
-                warnings.push(ConfigWarning::MissingServerUrl);
-            }
-            (SecretString::default(), TokenSource::None, Some(reason))
-        } else {
-            match resolve_token(raw, &mut warnings) {
-                TokenOutcome::Resolved(secret, source) => (secret, source, None),
-                TokenOutcome::Missing => {
-                    warnings.push(ConfigWarning::MissingToken);
-                    (
+        // commentary in §3.8. The `MasterSwitchOff` arm is handled by the
+        // early-return above.
+        let (auth_token, token_source, disable_reason) =
+            if let Some(reason) = server_url_outcome.disable_reason() {
+                if matches!(reason, DisableReason::ServerUrlNotConfigured) {
+                    warnings.push(ConfigWarning::MissingServerUrl);
+                }
+                (SecretString::default(), TokenSource::None, Some(reason))
+            } else {
+                match resolve_token(raw, &mut warnings) {
+                    TokenOutcome::Resolved(secret, source) => (secret, source, None),
+                    TokenOutcome::Missing => {
+                        warnings.push(ConfigWarning::MissingToken);
+                        (
+                            SecretString::default(),
+                            TokenSource::None,
+                            Some(DisableReason::TokenNotConfigured),
+                        )
+                    }
+                    TokenOutcome::FileUnreadable => (
                         SecretString::default(),
                         TokenSource::None,
-                        Some(DisableReason::TokenNotConfigured),
-                    )
+                        Some(DisableReason::TokenFileUnreadable),
+                    ),
+                    TokenOutcome::FileEmpty => (
+                        SecretString::default(),
+                        TokenSource::None,
+                        Some(DisableReason::TokenFileEmpty),
+                    ),
                 }
-                TokenOutcome::FileUnreadable => (
-                    SecretString::default(),
-                    TokenSource::None,
-                    Some(DisableReason::TokenFileUnreadable),
-                ),
-                TokenOutcome::FileEmpty => (
-                    SecretString::default(),
-                    TokenSource::None,
-                    Some(DisableReason::TokenFileEmpty),
-                ),
-            }
-        };
+            };
 
-        let enabled = master_enabled && disable_reason.is_none();
+        let enabled = disable_reason.is_none();
 
         let config = Self {
             enabled,
@@ -480,9 +514,16 @@ fn resolve_token(raw: &RawIni, warnings: &mut Vec<ConfigWarning>) -> TokenOutcom
     if let Some(path) = file_path {
         // File precedence: file wins over inline; failure does NOT fall
         // back to the inline token (§3.7).
+        //
+        // Trim both ends, matching the inline branch (`raw.auth_token`
+        // is `trim()`med below): a token written with
+        // `echo "  secret  " > /etc/php-analyze/token` must yield the
+        // same `SecretString` as the same content inline. Without this
+        // the server gets a leading-whitespace bearer token, 401s every
+        // batch, and the silent-disable posture never catches it.
         return match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let trimmed = content.trim_end();
+                let trimmed = content.trim();
                 if trimmed.is_empty() {
                     warnings.push(ConfigWarning::EmptyTokenFile { path });
                     TokenOutcome::FileEmpty
@@ -651,6 +692,26 @@ mod tests {
     }
 
     #[test]
+    fn auth_token_file_with_surrounding_whitespace_is_fully_trimmed() {
+        // Regression for the R-4 review finding: the file branch used
+        // `trim_end()` while the inline branch used `trim()`, so
+        // `"  file-token  \n"` from a file produced the
+        // `SecretString` `"  file-token"` (leading whitespace kept).
+        // Both branches must produce exactly `"file-token"`.
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(file, "  file-token  ").expect("write");
+        let raw = RawIni {
+            auth_token_file: Some(file.path().to_string_lossy().into_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert!(config.enabled, "{warnings:?}");
+        assert_eq!(config.auth_token.expose_secret(), "file-token");
+        assert!(matches!(config.auth_token_source, TokenSource::File(_)));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
     fn unreadable_auth_token_file_silently_disables_does_not_fall_back_to_inline() {
         let raw = RawIni {
             auth_token: Some("inline-token".to_owned()),
@@ -686,6 +747,34 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| matches!(w, ConfigWarning::EmptyTokenFile { .. })));
+    }
+
+    #[test]
+    fn master_switch_off_with_garbage_directives_emits_no_warnings() {
+        // Regression for R-5: when the operator deliberately turns the
+        // extension off, the rest of php.ini is not the operator's
+        // immediate concern. Re-validating stale URL / out-of-range
+        // numeric directives would clutter the PHP error log for no
+        // benefit. The disabled-pool path is silent.
+        let raw = RawIni {
+            enabled: Some(false),
+            server_url: Some("not-a-url".to_owned()),
+            auth_token: None,
+            flush_records: Some(-1),
+            http_timeout_ms: Some(999_999),
+            ..RawIni::default()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert!(!config.enabled);
+        assert_eq!(config.disable_reason, Some(DisableReason::MasterSwitchOff));
+        assert!(
+            warnings.is_empty(),
+            "master-switch-off path must be warning-free, got {warnings:?}"
+        );
+        // Numeric directives keep their documented defaults rather than
+        // the clamped-from-garbage values.
+        assert_eq!(config.flush_records, DEFAULT_FLUSH_RECORDS as usize);
+        assert_eq!(config.http_timeout, Duration::from_millis(2_000));
     }
 
     #[test]
