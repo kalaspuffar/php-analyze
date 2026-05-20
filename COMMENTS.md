@@ -9,21 +9,25 @@ clarification.
 
 ### B-2 — `git push` blocked on remote auth
 
-**Status**: blocks §10.3 only.
+**Status**: blocks remote-push of every branch this host creates.
 
 **Cause**: this build host has no SSH key registered with
 `git@github.com:kalaspuffar/php-analyze.git`. `git push -u origin
-feat/scaffold-workspace-and-config` fails with `Permission denied
-(publickey)`.
+<branch>` fails with `Permission denied (publickey)`.
 
-**To unblock**: push the branch from a workstation that has push
-credentials:
+**To unblock**: push from a workstation that has push credentials.
+Two branches are currently pending push from this host:
 
 ```bash
+# Phase 1 — already merged to main via PR #1; pushing the branch
+# again is no longer necessary but harmless.
 git push -u origin feat/scaffold-workspace-and-config
+
+# Phase 0 spike — committed locally, ready to push and open a PR.
+git push -u origin feat/spike-zend-observer
 ```
 
-The branch is fully committed locally and ready to push.
+Both branches are fully committed locally and ready to push.
 
 ## Closed blockers
 
