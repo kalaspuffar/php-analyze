@@ -76,6 +76,89 @@ this only affects inline tokens. The configuration spec's "Only inline
 token configured is accepted" scenario remains green because the test
 token has no surrounding whitespace.
 
+### C-5 — `zend_observer` viability (Phase-0 outcome)
+
+Output of the `spike-zend-observer` change. Retires Risk **R-2** from
+`SPECIFICATION.md` §11.
+
+**Crate version exercised:** `ext-php-rs = "=0.15.13"`, the same
+version Phase 1 pinned. The locked-set of crate dependencies is
+unchanged (verified by `cargo metadata` diff against `main`); the
+feature list of `ext-php-rs` grew by one entry — `"observer"` —
+which activates the public `FcallObserver` / `FcallInfo` /
+`ModuleBuilder::fcall_observer` surface upstream.
+
+**Reach path:** the spike registers an `FcallObserver` impl
+(`crates/php-analyze/src/spike.rs::SpikeObserver`) via
+`ModuleBuilder::fcall_observer(build_spike_observer)` inside
+`lib.rs::get_module`. The factory reads `Config::global()` — which
+is populated before the upstream `observer_startup()` runs because
+our user `startup` shim is the `module_startup_func`, invoked first
+by the `#[php_module]` macro's auto-generated `ext_php_rs_startup`
+(verified by reading the macro expansion at
+`ext-php-rs-derive-0.11.12/src/module.rs:35-50`). No raw FFI or C
+glue is needed; the design.md §D-1 "Resolution" subsection records
+the corrected approach.
+
+`FcallInfo::from_execute_data` is `pub(crate)` upstream, so the
+spike reconstructs the same parsing as `LocalFcallInfo` +
+`extract_info` against the public `ffi::*` bindgen surface
+(documented inline at `spike.rs:140`). When Phase 2 lands, the
+likely cleanup is to drop both `LocalFcallInfo` and `extract_info`
+in favour of an upstream `pub` constructor — assuming `ext-php-rs`
+exposes one by then. If not, the local versions ship as-is.
+
+**PHP versions verified:** PHP **8.4.21** on the build host (Debian
+package, matching the closed B-1 note). PHP 8.3 has **not** been
+verified on this host — there is no 8.3 install reachable here.
+Tracked as a follow-up under task 10.1 of this OpenSpec change;
+Phase 2's Recorder change MUST include 8.3 verification as part of
+its own acceptance, or a separate `verify-observer-on-php83` change
+must land first.
+
+**Coverage table (PHP 8.4.21 cli):**
+
+| Category | Fixture | Observed `entry:`? | Observed `exit:`? | `abnormal_exit` correct? |
+| --- | --- | --- | --- | --- |
+| Top-level user function | `only_me()` in `user_calls.php` | yes (`function:<file>:15:only_me`) | yes | yes (false on normal return) |
+| User method | `(new C)->m()` in `user_calls.php` | yes (`method:C::m`) | yes | yes (false) |
+| User closure | `$closure()` in `user_calls.php` | yes (`closure:<file>:21`) | yes | yes (false) |
+| Internal — `array_map` | `internal_calls.php` | yes (`internal:array_map`) | yes | yes (false) |
+| Internal — `json_encode` | `internal_calls.php` | yes (`internal:json_encode`) | yes | yes (false) |
+| Internal — `preg_match` | `internal_calls.php` | yes (`internal:preg_match`) | yes | yes (false) |
+| Internal — `strlen("hi")` | `internal_calls.php` | **no** (PHP 8.x opcode-specialises constant-arg `strlen` away) | no | n/a |
+| Internal — `__construct` of `RuntimeException` | `throws.php` | yes (`internal:__construct`) | yes | yes (false; exception is set AFTER the constructor returns) |
+| Throwing user function | `bad()` in `throws.php` | yes (`function:<file>:13:bad`) | yes | yes (**true** on unwind) |
+| Top-level script body | every fixture | yes, as `closure:<file>:1` | yes | yes (false; or true if uncaught top-level throw — not exercised) |
+
+Three further structural findings worth carrying into Phase 2:
+
+1. The `array_map` callback (an arrow function) fires its
+   `closure:` pair **once per element** — three times for
+   `[1, 2, 3]`. This is exactly the per-call coverage Phase 2's
+   Recorder needs; no special handling required for higher-order
+   internals.
+2. The top-level script body is reported as
+   `closure:<file>:1`. This is the natural place for Phase 2's
+   `Trace` `RINIT`-allocation to happen if it ever needs an "entry
+   to the request" anchor.
+3. `RuntimeException`'s constructor is observed as
+   `internal:__construct`; the `abnormal=false` reading on its
+   exit confirms the order — Zend writes `EG(exception)` only
+   *after* the constructor returns, so a peek at
+   `has_exception()` inside the constructor's `end` handler
+   correctly reads `false`. (The `bad()` function's own exit then
+   reads `true`.)
+
+**R-2 verdict:** **Closed for PHP 8.4** (`SPECIFICATION.md` §11
+updated accordingly), **partially closed for PHP 8.3** — pending
+the verification noted above. The pivot scenario from §10 Phase 0
+("hybrid fallback") is NOT triggered: the observer surface covers
+every category v1 cares about (per `SPECIFICATION.md` §3.2 and
+§4.1.5). The `strlen` opcode-specialisation finding is recorded in
+the spec scenario `PHP-specialised internals are NOT observed` so
+Phase 2 inherits the known limitation cleanly.
+
 ## Repository hygiene notes (out of scope for this change)
 
 ### N-1 — `.gitignore` excludes `openspec/`, `personas/`, `CLAUDE.md`

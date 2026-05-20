@@ -892,7 +892,7 @@ Pulls forward REQ §14 with architect-level updates:
 | ID | Risk | L | I | Mitigation | Status |
 | --- | --- | --- | --- | --- | --- |
 | R-1 | Hot-path overhead > 2× target | M | H | Phase 5 dedicated to tuning; AC-RC-5 zero-alloc guarantee; fallback target 5× if budget cannot be hit. Re-evaluate hook strategy if observer overhead dominates. | Open |
-| R-2 | `zend_observer` doesn't cover internal calls | M | M | **Phase 0 spike** retires this risk before any other work commits. | Open until Phase 0 done |
+| R-2 | `zend_observer` doesn't cover internal calls | M | M | **Phase 0 spike** retires this risk before any other work commits. | Closed for PHP 8.4; partially closed for PHP 8.3 (pending verification). See `COMMENTS.md` C-5. |
 | R-3 | Huge batches exceed HTTP timeouts | M | M | `flush_bytes` default 1 MiB caps per-batch payload; timeouts independent of batch count. | Mitigated by design |
 | R-4 | Drop policy silently loses data | L | M | `dropped_records` in every `meta`; visualization layer obligated to surface. | Mitigated by design |
 | R-5 | Generators / fibers produce surprising results | M | M | Documented limitation L-1/L-2; follow-up change. | Accepted |
