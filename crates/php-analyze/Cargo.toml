@@ -49,6 +49,13 @@ libc = "0.2"
 # dep so the wire derive isn't relying on a transitive supply chain.
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+# Phase 4 shipper channel; named in `SPECIFICATION.md` §1.4 OQ-5.
+# `crossbeam_channel::bounded` is the bounded MPSC used between the
+# recorder (producer, request thread) and the shipper (consumer, one
+# background thread per process). `recv_deadline` is the API the
+# MSHUTDOWN drain hinges on; `std::sync::mpsc` does not offer it
+# ergonomically.
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 # Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.

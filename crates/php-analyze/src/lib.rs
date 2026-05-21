@@ -28,6 +28,12 @@
 //!   (`php_analyze.spike_observer = 0`). Reached only through the
 //!   `BootObserver::Spike` variant; production loads with the default
 //!   directive set route through `BootObserver::Recorder`.
+//! - [`shipper`] — Phase-4 substrate (slice 1): the bounded
+//!   `crossbeam_channel` between the recorder (producer) and the
+//!   shipper (consumer), the lazy thread spawn at the first `RINIT`
+//!   per process, and the `MSHUTDOWN` drain protocol. The shipper
+//!   currently drains and drops; encoding + POST + retry land in
+//!   later slices.
 //! - [`wire`] — serde-derived types matching `SPECIFICATION.md` §4.2
 //!   (the MessagePack batch schema the Phase-4 shipper will encode and
 //!   the `stub-ingest` crate decodes). Production-side encode-only in
@@ -37,6 +43,7 @@ pub mod bootstrap;
 pub mod clocks;
 pub mod config;
 pub mod recorder;
+pub(crate) mod shipper;
 pub mod spike;
 pub mod wire;
 
