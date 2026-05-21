@@ -1,6 +1,6 @@
 [package]
 name = "stub-ingest"
-description = "Placeholder ingest binary; the real implementation arrives in Phase 3."
+description = "Test-only HTTP ingest server for php-analyze integration tests."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,6 +13,41 @@ name = "stub-ingest"
 path = "src/main.rs"
 
 [dependencies]
+# Path-dep on the production crate so the stub decodes batches via the
+# same `wire::Batch` type the (Phase-4) shipper encodes. Single source
+# of truth for the §4.2 schema lives in `crates/php-analyze/src/wire.rs`.
+# Cost: pulls `ext-php-rs` (and therefore PHP-dev headers) into the
+# stub's build graph. Acceptable because every test that touches the
+# production crate already requires `php8.x-dev` on the host.
+php-analyze = { path = "../php-analyze" }
+
+# `tiny_http` over `axum` per design D-5: sync API mirrors the
+# production extension's sync shipper model and avoids dragging tokio
+# into integration tests.
+tiny_http = "0.12"
+
+# Decoder for the MessagePack request body.
+rmp-serde = "1"
+
+# `serde` derive for the in-stub structs (currently just CLI shaping);
+# the `wire::*` types are imported from `php-analyze`.
+serde = { version = "1", features = ["derive"] }
+
+# `GET /debug/batches` returns the in-memory store as JSON for
+# test + human inspection. Stub-only — production code path is
+# MessagePack (the wire format).
+serde_json = "1"
+
+# `--bind` / `--auth-token` / `--path` CLI surface.
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+# Round-trip integration test posts MessagePack to the stub via
+# `ureq`. ureq is already in the lockfile transitively (it's the
+# production extension's HTTP client per `SPECIFICATION.md` OQ-5);
+# pinning it as a dev-dep here adds zero new crates to the resolve
+# graph.
+ureq = "3"
 
 [lints]
 workspace = true
