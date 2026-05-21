@@ -162,9 +162,16 @@ pub fn startup(_type_: i32, module_number: i32) -> i32 {
 ///
 /// This function is the `C` ABI entry point called by Zend during module
 /// shutdown. It must be invoked exactly once per module by the PHP
-/// runtime, on the main thread, and not from Rust code. The body does no
-/// pointer-deref so the contract is trivial in this change.
+/// runtime, on the main thread, and not from Rust code. The body is
+/// wrapped in `catch_unwind` so any panic from a future shipper-drain
+/// path becomes a silent extension-disable rather than a process abort
+/// (RO-1 / NFR-REL-1).
 pub unsafe extern "C" fn mshutdown(_type_: i32, _module_number: i32) -> i32 {
+    let _ = std::panic::catch_unwind(|| {
+        // Slice 2: body is a no-op. The catch_unwind frame exists so
+        // Phase-4's shipper-drain code lands inside the firewall
+        // without a structural change here.
+    });
     0
 }
 
@@ -174,6 +181,13 @@ pub unsafe extern "C" fn mshutdown(_type_: i32, _module_number: i32) -> i32 {
 /// (silent-disable posture) or when the spike is the active observer
 /// (the spike doesn't need the recorder's trace).
 ///
+/// The body runs inside `std::panic::catch_unwind` so any downstream
+/// panic — an allocator-OOM in `Trace::new`, a future clock-syscall
+/// failure, a programming error in a sub-slice — is contained at this
+/// FFI frame instead of aborting the PHP process. The matching
+/// `RSHUTDOWN` will then observe an empty slot and silently no-op,
+/// honouring `SPECIFICATION.md` §8.3 NFR-REL-1 / AD-4 (RO-1).
+///
 /// # Safety
 ///
 /// `C` ABI entry point called by Zend at the start of each PHP request.
@@ -182,26 +196,40 @@ pub unsafe extern "C" fn mshutdown(_type_: i32, _module_number: i32) -> i32 {
 /// requires no locking. The `SapiGlobals` / `SapiModule` reads acquire
 /// short-lived `RwLock` guards via ext-php-rs.
 pub unsafe extern "C" fn rinit(_type_: i32, _module_number: i32) -> i32 {
+    let _ = std::panic::catch_unwind(rinit_body);
+    0
+}
+
+/// Pure-Rust body of [`rinit`]. Factored out so the `catch_unwind`
+/// frame in the FFI entry point captures every panic site downstream
+/// — including the `Config::global()` read, identity construction,
+/// and `Trace` allocation. Returning `()` keeps the closure
+/// `UnwindSafe` without requiring `AssertUnwindSafe`.
+fn rinit_body() {
     let Some(config) = Config::global() else {
-        return 0;
+        return;
     };
     if !config.enabled || config.spike_observer {
-        return 0;
+        return;
     }
     let identity = build_request_identity();
     recorder::rinit_allocate_trace(identity);
-    0
 }
 
 /// `RSHUTDOWN` — request shutdown. Releases the recorder's per-request
 /// `Trace`. The recorder's helper is a no-op when the slot is empty,
 /// so this is safe to call regardless of whether `RINIT` allocated.
 ///
+/// As with [`rinit`], the body is wrapped in `catch_unwind` so any
+/// panic — including a stale-trace drop that itself panics, or a
+/// Phase-4 shipper-handoff failure — is contained inside this FFI
+/// frame rather than aborting the PHP process (RO-1).
+///
 /// # Safety
 ///
 /// `C` ABI entry point called by Zend at the end of each PHP request.
 pub unsafe extern "C" fn rshutdown(_type_: i32, _module_number: i32) -> i32 {
-    recorder::rshutdown_release_trace();
+    let _ = std::panic::catch_unwind(recorder::rshutdown_release_trace);
     0
 }
 

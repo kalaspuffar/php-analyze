@@ -60,17 +60,30 @@ thread_local! {
 
 /// Populate the thread-local with a fresh `Trace`. Called from
 /// `bootstrap::rinit` when the extension is enabled and the spike is
-/// off. Panics if a previous `RINIT` did not pair with an
-/// `RSHUTDOWN` — that pairing failure is a bug we want to know about
-/// loudly rather than silently leaking the prior buffer.
+/// off.
+///
+/// **Posture (RO-1).** A previous request that ran `RINIT` without a
+/// matching `RSHUTDOWN` is a bug we want to know about — but
+/// panicking here would propagate across the `extern "C"` FFI
+/// boundary and abort the PHP process, violating
+/// `SPECIFICATION.md` §8.3 NFR-REL-1 ("never crash the PHP process")
+/// and AD-4 (silent-disable posture). The compromise is a
+/// `debug_assert!` (so tests and debug builds still catch the
+/// pairing bug loudly) plus an explicit release-mode recovery that
+/// drops the stale `Trace` before installing the fresh one. The
+/// stale buffer is lost — slice 3's `dropped_records` counter will
+/// be the operator-visible signal once that lands.
 pub fn rinit_allocate_trace(identity: RequestIdentity) {
     CURRENT_TRACE.with(|slot| {
         let mut borrow = slot.borrow_mut();
-        assert!(
+        debug_assert!(
             borrow.is_none(),
             "RINIT without RSHUTDOWN: the recorder thread-local already holds a Trace; \
              a previous request did not call rshutdown_release_trace",
         );
+        // Release-path recovery: drop the stale Trace silently and
+        // replace it with a fresh one. The assignment itself drops
+        // the previous Option contents via `Drop`.
         *borrow = Some(Trace::new(identity));
     });
 }
@@ -161,17 +174,59 @@ impl ExitSnapshots {
     }
 }
 
-// --- FcallInfo extraction (mirrors the spike's pattern) --------------------
+// --- Call-site extraction --------------------------------------------------
 
-/// Parse `&ExecuteData` into a public `FcallInfo<'a>` value.
+/// A call-site as extracted from `&ExecuteData`, with `Cow<'a, str>` for
+/// every string field so non-UTF-8 payloads (file paths in particular,
+/// see RO-4) round-trip as lossy `String`s rather than vanishing.
+///
+/// This is the recorder-owned analogue of `ext_php_rs::zend::FcallInfo<'a>`.
+/// We can't use `FcallInfo<'a>` directly because its string fields are
+/// `Option<&'a str>` — there's nowhere to put a lossy-decoded `String`
+/// with the right lifetime. The `Cow` form sidesteps the problem at
+/// the source: a UTF-8 payload stays a zero-copy borrow; a malformed
+/// payload becomes an owned `String` with U+FFFD substituted for the
+/// invalid bytes. The recorder's hot path is unchanged in the common
+/// (UTF-8) case.
+#[derive(Clone, Debug)]
+pub(crate) struct RawCallSite<'a> {
+    pub function_name: Option<std::borrow::Cow<'a, str>>,
+    pub class_name: Option<std::borrow::Cow<'a, str>>,
+    pub filename: Option<std::borrow::Cow<'a, str>>,
+    pub lineno: u32,
+    pub is_internal: bool,
+    /// Raw `execute_data` pointer captured as `usize`. Used **only**
+    /// as a call-site tiebreaker in the unknown-function fallback
+    /// (RO-5) so two distinct unnamed call sites do not collapse to
+    /// one dictionary entry. The pointer is never dereferenced from
+    /// here, so storing it as `usize` is sound regardless of the
+    /// pointer's provenance lifetime.
+    pub execute_data_addr: usize,
+}
+
+impl RawCallSite<'static> {
+    /// A `RawCallSite` with no inner borrows. Used for the null-func
+    /// defensive branch in [`extract_call_site`] (and reachable from
+    /// tests).
+    fn empty() -> Self {
+        Self {
+            function_name: None,
+            class_name: None,
+            filename: None,
+            lineno: 0,
+            is_internal: false,
+            execute_data_addr: 0,
+        }
+    }
+}
+
+/// Parse `&ExecuteData` into a [`RawCallSite<'a>`].
 ///
 /// `ext_php_rs::zend::FcallInfo::from_execute_data` is `pub(crate)`
-/// upstream, so we cannot call it. The struct literal of `FcallInfo<'a>`
-/// IS public though (every field is `pub`), so we walk the
-/// `execute_data → func → (op_array | internal_function)` chain
-/// ourselves — same shape as the spike's `extract_info`. When
-/// `ext-php-rs` promotes the constructor, the right move is to drop
-/// this function (and the spike's twin) and call upstream directly.
+/// upstream, so we cannot call it. The struct walk below mirrors the
+/// spike's `extract_info`; when `ext-php-rs` promotes the constructor,
+/// the right move is to drop this function (and the spike's twin) and
+/// adapt the upstream value into `RawCallSite`.
 ///
 /// # Safety
 ///
@@ -182,10 +237,13 @@ impl ExitSnapshots {
 /// are either null or valid for the duration of the call. All of those
 /// invariants are upheld by the Zend observer machinery for the
 /// duration of a `begin`/`end` callback.
-unsafe fn extract_fcall_info<'a>(execute_data: &'a ExecuteData) -> FcallInfo<'a> {
+unsafe fn extract_call_site<'a>(execute_data: &'a ExecuteData) -> RawCallSite<'a> {
+    let execute_data_addr = std::ptr::from_ref(execute_data) as usize;
     let func_ptr = execute_data.func;
     if func_ptr.is_null() {
-        return empty_fcall_info();
+        let mut empty = RawCallSite::empty();
+        empty.execute_data_addr = execute_data_addr;
+        return empty;
     }
 
     // SAFETY: `func_ptr` non-null per the check above; pointed-to
@@ -195,15 +253,15 @@ unsafe fn extract_fcall_info<'a>(execute_data: &'a ExecuteData) -> FcallInfo<'a>
     #[allow(clippy::cast_possible_truncation)]
     let is_internal = common.type_ == ffi::ZEND_INTERNAL_FUNCTION as u8;
 
-    let function_name = unsafe { zend_string_to_str(common.function_name) };
+    let function_name = unsafe { zend_string_to_cow(common.function_name) };
 
     let class_name = if common.scope.is_null() {
         None
     } else {
         // SAFETY: `scope` is null-checked; `name` may itself be null
-        // (handled by `zend_string_to_str`).
+        // (handled by `zend_string_to_cow`).
         let ce = unsafe { &*common.scope };
-        unsafe { zend_string_to_str(ce.name) }
+        unsafe { zend_string_to_cow(ce.name) }
     };
 
     let (filename, lineno) = if is_internal {
@@ -213,74 +271,71 @@ unsafe fn extract_fcall_info<'a>(execute_data: &'a ExecuteData) -> FcallInfo<'a>
         // is the active member; reading `func.op_array.filename` and
         // `.line_start` is well-defined.
         let op_array = unsafe { &func.op_array };
-        let filename = unsafe { zend_string_to_str(op_array.filename) };
+        let filename = unsafe { zend_string_to_cow(op_array.filename) };
         (filename, op_array.line_start)
     };
 
-    FcallInfo {
+    RawCallSite {
         function_name,
         class_name,
         filename,
         lineno,
         is_internal,
+        execute_data_addr,
     }
 }
 
-/// An `FcallInfo` with no inner borrows. Used for the null-func
-/// defensive branch in [`extract_fcall_info`]. Returns a `'static`
-/// instance because, by reference covariance, it coerces into any
-/// caller-chosen `'a`.
-fn empty_fcall_info() -> FcallInfo<'static> {
-    FcallInfo {
-        function_name: None,
-        class_name: None,
-        filename: None,
-        lineno: 0,
-        is_internal: false,
-    }
-}
-
-/// Convert a `*mut zend_string` into a borrowed `&'a str`. The caller
-/// picks `'a`; at the call sites inside [`extract_fcall_info`] the
-/// inference picks the lifetime of the enclosing `&'a ExecuteData`,
-/// which is the borrow-checker bound the Zend observer surface
-/// guarantees.
+/// Convert a `*mut zend_string` into a borrowed UTF-8 view, lossily
+/// decoding non-UTF-8 bytes via [`String::from_utf8_lossy`].
+///
+/// The common case — function/method names, which are parser-validated
+/// PHP identifiers — returns `Cow::Borrowed(&'a str)` with zero
+/// allocation. The rare non-UTF-8 case — most often a file path on a
+/// filesystem with non-UTF-8 names — returns `Cow::Owned(String)`
+/// with U+FFFD substituted for each invalid byte (RO-4). A previous
+/// version of this helper silently dropped non-UTF-8 names; that
+/// caused (a) distinct files to collapse to the same empty-file
+/// `FunctionKey` and (b) the closure-vs-function precedence rule to
+/// misroute, both of which the wire format would have been unable to
+/// see.
 ///
 /// # Safety
 ///
 /// `zs` must be either null or a pointer to a `zend_string` whose
-/// payload bytes form valid UTF-8 and remain alive for the chosen
-/// `'a`. The Zend observer surface only passes us names for user
-/// functions (parser-validated identifiers) and filenames (path
-/// strings from disk). Invalid UTF-8 → returns `None`; the
-/// categorisation falls back to `(unknown)`.
-unsafe fn zend_string_to_str<'a>(zs: *mut ffi::zend_string) -> Option<&'a str> {
+/// payload bytes remain alive for the chosen `'a`. The Zend observer
+/// surface upholds that invariant for the duration of the
+/// `begin`/`end` callback.
+unsafe fn zend_string_to_cow<'a>(zs: *mut ffi::zend_string) -> Option<std::borrow::Cow<'a, str>> {
     if zs.is_null() {
         return None;
     }
     let len = unsafe { (*zs).len };
     let ptr = unsafe { (*zs).val.as_ptr() };
     let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-    std::str::from_utf8(slice).ok()
+    Some(String::from_utf8_lossy(slice))
 }
 
 // --- categorise -----------------------------------------------------------
 
-/// Result of categorising an `FcallInfo` per `SPECIFICATION.md` §4.1.2.
+/// Result of categorising a [`RawCallSite`] per `SPECIFICATION.md`
+/// §4.1.2.
 ///
-/// `fqn`, `file` are `&'a str` borrows from the input — copied into
-/// `String`s lazily inside the dictionary's `intern` build closure
-/// (only on a dictionary miss).
+/// Both `fqn` and `file` are `Cow<'a, str>` so the common UTF-8 path
+/// stays zero-copy while the lossy non-UTF-8 path (RO-4) and the
+/// synthesised unknown-fallback names (RO-5) can flow through as
+/// owned `String`s. They are turned into owned `String`s lazily
+/// inside the dictionary's `intern` build closure (only on a
+/// dictionary miss).
 #[derive(Debug)]
 pub(crate) struct Categorised<'a> {
     pub key: FunctionKey,
     pub kind: FunctionKind,
     pub fqn: std::borrow::Cow<'a, str>,
-    pub file: &'a str,
+    pub file: std::borrow::Cow<'a, str>,
     pub line: u32,
 }
 
-/// Map an `FcallInfo` to its `(FunctionKey, FunctionKind, fqn, file, line)`.
+/// Map a [`RawCallSite`] to its `(FunctionKey, FunctionKind, fqn, file, line)`.
 ///
 /// Precedence per `SPECIFICATION.md` §4.1.2 (matches the spike's `fqn`):
 ///
@@ -295,74 +350,117 @@ pub(crate) struct Categorised<'a> {
 /// — see the spike's C-5 evidence. The substring match `starts_with("{closure")`
 /// catches both the bare `{closure}` form and the
 /// `{closure:<file>:<line>}` form PHP 8.4 uses.
-pub(crate) fn categorise<'a>(info: &'a FcallInfo<'a>) -> Categorised<'a> {
+///
+/// ## RO-5: unknown-function fallback identity
+///
+/// A previous version of this function papered over Zend reporting
+/// gaps with the literal placeholder strings `(unknown)` /
+/// `(anonymous)`. Every distinct gap-shaped call site collapsed to
+/// one `FunctionKey`, causing the dictionary to fold unrelated
+/// functions into a single per-call counter. The fallback now
+/// incorporates the `execute_data` address as a tiebreaker —
+/// `(unknown)@0x<hex>` — so two genuinely-distinct call sites stay
+/// genuinely distinct in the trace. Zend reuse of the same
+/// `execute_data` slot within one request is a known collision, but
+/// it's bounded and recognisable; the previous "everything is one"
+/// behaviour was not.
+pub(crate) fn categorise<'a>(info: &'a RawCallSite<'a>) -> Categorised<'a> {
     use std::borrow::Cow;
     use std::sync::Arc;
 
     let line = info.lineno;
-    let file = info.filename.unwrap_or("");
+    // File is empty when Zend reports no filename — kept as a
+    // borrow when the Cow itself is borrowed.
+    let file: Cow<'a, str> = match info.filename.as_ref() {
+        Some(f) => Cow::Borrowed(f.as_ref()),
+        None => Cow::Borrowed(""),
+    };
 
     if info.is_internal {
-        let name = info.function_name.unwrap_or("(anonymous)");
+        let name = info.function_name.as_ref().map_or_else(
+            || Cow::Owned(unknown_placeholder("anonymous", info.execute_data_addr)),
+            |n| Cow::Borrowed(n.as_ref()),
+        );
         return Categorised {
             key: FunctionKey::Internal {
-                name: Arc::from(name),
+                name: Arc::from(name.as_ref()),
             },
             kind: FunctionKind::Internal,
-            fqn: Cow::Borrowed(name),
-            file: "",
+            fqn: name,
+            file: Cow::Borrowed(""),
             line: 0,
         };
     }
 
-    if let Some(class) = info.class_name {
-        let method = info.function_name.unwrap_or("(unknown)");
+    if let Some(class) = info.class_name.as_ref() {
+        let class_str: &str = class.as_ref();
+        let method = info.function_name.as_ref().map_or_else(
+            || Cow::Owned(unknown_placeholder("unknown", info.execute_data_addr)),
+            |m| Cow::Borrowed(m.as_ref()),
+        );
         return Categorised {
             key: FunctionKey::Method {
-                class: Arc::from(class),
-                method: Arc::from(method),
+                class: Arc::from(class_str),
+                method: Arc::from(method.as_ref()),
             },
             kind: FunctionKind::Method,
-            fqn: Cow::Owned(format!("{class}::{method}")),
+            fqn: Cow::Owned(format!("{class_str}::{}", method.as_ref())),
             file,
             line,
         };
     }
 
-    let is_closure = match info.function_name {
+    let is_closure = match info.function_name.as_ref() {
         Some(name) => name.starts_with("{closure"),
         None => info.filename.is_some(),
     };
     if is_closure {
+        let file_str: &str = file.as_ref();
         return Categorised {
             key: FunctionKey::Closure {
-                file: Arc::from(file),
+                file: Arc::from(file_str),
                 line,
             },
             kind: FunctionKind::Closure,
-            fqn: Cow::Owned(format!("closure:{file}:{line}")),
+            fqn: Cow::Owned(format!("closure:{file_str}:{line}")),
             file,
             line,
         };
     }
 
     // Fall-through: user function. `function_name` is `Some` here
-    // (the closure branch caught `None`-with-file; an internal would
-    // have caught `None`-without-file at branch 1). The
-    // `unwrap_or("(unknown)")` is defensive against a Zend that
-    // changes shape under us.
-    let function = info.function_name.unwrap_or("(unknown)");
+    // for any Zend-reported shape we expect (the closure branch
+    // caught `None`-with-file; an internal would have caught
+    // `None`-without-file at branch 1). The synthesised
+    // `(unknown)@<addr>` is the RO-5 tiebreaker for any unexpected
+    // shape so distinct call sites do not collide in the dict.
+    let function = info.function_name.as_ref().map_or_else(
+        || Cow::Owned(unknown_placeholder("unknown", info.execute_data_addr)),
+        |f| Cow::Borrowed(f.as_ref()),
+    );
+    let file_str: &str = file.as_ref();
     Categorised {
         key: FunctionKey::Function {
-            file: Arc::from(file),
-            function: Arc::from(function),
+            file: Arc::from(file_str),
+            function: Arc::from(function.as_ref()),
             line,
         },
         kind: FunctionKind::Function,
-        fqn: Cow::Borrowed(function),
+        fqn: function,
         file,
         line,
     }
+}
+
+/// Build a call-site-distinguishing fallback name for a missing
+/// `function_name`. The address is the raw `execute_data` pointer so
+/// distinct call sites within one request map to distinct names;
+/// Zend's reuse of the same address across calls is the one
+/// remaining collision mode and is documented in the
+/// `categorise_unknown_fallback_uses_execute_data_addr_as_tiebreaker`
+/// test.
+fn unknown_placeholder(kind: &str, addr: usize) -> String {
+    format!("({kind})@0x{addr:x}")
 }
 
 // --- Recorder -------------------------------------------------------------
@@ -380,20 +478,26 @@ pub fn build_recorder_observer() -> Recorder {
 }
 
 impl Recorder {
-    /// Production begin handler. Captures snapshots from the live
-    /// clocks, parses `execute_data` into an `FcallInfo`, categorises
-    /// it, and pushes a `CallFrame`. A no-op when the thread-local
-    /// slot is empty.
+    /// Production begin handler. Parses `execute_data` into a
+    /// [`RawCallSite`], categorises it, and pushes a `CallFrame`. A
+    /// no-op when the thread-local slot is empty.
+    ///
+    /// RO-6: the clock/memory snapshot is taken **inside** the
+    /// `with_current_trace` closure so the syscall trio runs only
+    /// when there is somewhere for the data to go. Observer fires
+    /// between `MINIT` and the first `RINIT` (slot empty) — and any
+    /// future out-of-request fire — no longer pay for clock reads
+    /// they cannot record.
     fn begin_handler(&self, execute_data: &ExecuteData) {
         // SAFETY: the observer trait hands us a `&ExecuteData` that is
-        // valid for the duration of the call. `extract_fcall_info`
+        // valid for the duration of the call. `extract_call_site`
         // reads through `(*execute_data).func` and a handful of
         // `zend_string` pointers, all of which remain valid until
         // `end` returns.
-        let info = unsafe { extract_fcall_info(execute_data) };
-        let snapshots = EntrySnapshots::capture_now();
+        let info = unsafe { extract_call_site(execute_data) };
 
         with_current_trace(|trace| {
+            let snapshots = EntrySnapshots::capture_now();
             let categorised = categorise(&info);
             begin_with_snapshots(trace, &categorised, snapshots);
         });
@@ -402,14 +506,19 @@ impl Recorder {
     /// Production end handler. Reads exception state, captures exit
     /// snapshots, builds the `CallRecord`, and pushes it. A no-op
     /// when the thread-local slot is empty.
+    ///
+    /// RO-6: snapshot capture moves inside the `with_current_trace`
+    /// closure so the syscall trio runs only when there is a frame
+    /// to close out. `has_exception` is similarly cheap-but-skippable;
+    /// reading it inside the closure keeps the two captures
+    /// co-located with the work that uses them.
     fn end_handler(&self, _execute_data: &ExecuteData, _retval: Option<&Zval>) {
         // `_execute_data` is unused: the frame's identity is already
         // on the trace stack from the matching `begin`. `_retval`
         // is unused per design D-7 (we don't inspect return values).
-        let abnormal = ExecutorGlobals::has_exception();
-        let snapshots = ExitSnapshots::capture_now();
-
         with_current_trace(|trace| {
+            let abnormal = ExecutorGlobals::has_exception();
+            let snapshots = ExitSnapshots::capture_now();
             end_with_snapshots(trace, snapshots, abnormal);
         });
     }
@@ -448,8 +557,8 @@ pub(crate) fn begin_with_snapshots(
     // `build` closure runs at most once per unique key, per slice-1
     // `Dictionary::intern`'s lazy-allocate contract).
     let kind = categorised.kind;
-    let fqn = categorised.fqn.as_ref();
-    let file = categorised.file;
+    let fqn: &str = categorised.fqn.as_ref();
+    let file: &str = categorised.file.as_ref();
     let line = categorised.line;
     let fn_id = trace.push_dict_entry_via_intern(categorised.key.clone(), |fn_id| {
         // NOTE for Phase 5: these two `to_owned()` calls are the
@@ -485,11 +594,28 @@ pub(crate) fn begin_with_snapshots(
 /// pairing — the `debug_assert!` makes it loud in tests; the release
 /// path silently returns to preserve the silent-disable posture).
 pub(crate) fn end_with_snapshots(trace: &mut Trace, snapshots: ExitSnapshots, abnormal: bool) {
-    let Some(frame) = trace.stack.pop() else {
-        debug_assert!(
-            false,
-            "observer end fired with an empty trace stack — begin/end pairing broken",
-        );
+    let popped = trace.stack.pop();
+    debug_assert!(
+        popped.is_some(),
+        "observer end fired with an empty trace stack — begin/end pairing broken",
+    );
+    finish_call_record(trace, popped, snapshots, abnormal);
+}
+
+/// Pure tail of [`end_with_snapshots`]. Takes the already-popped
+/// frame as an `Option`; returns silently on `None`. Split out so
+/// the release-path "empty-stack → silent no-op" contract from
+/// `SPECIFICATION.md` §8.3 NFR-REL-1 / AD-4 can be exercised from a
+/// default `cargo test` (debug) build (RO-3): the `debug_assert!` in
+/// the caller is the loud signal for the pairing bug, this helper
+/// is the recovery path the assert documents.
+pub(crate) fn finish_call_record(
+    trace: &mut Trace,
+    popped: Option<CallFrame>,
+    snapshots: ExitSnapshots,
+    abnormal: bool,
+) {
+    let Some(frame) = popped else {
         return;
     };
 
@@ -607,22 +733,38 @@ mod tests {
         }
     }
 
-    /// `FcallInfo` construction is via struct literal (all fields are
-    /// public on the upstream type). The single helper centralises
-    /// the stub so the four-branch categorise tests stay readable.
-    fn stub_info<'a>(
+    /// Build a [`RawCallSite`] from string literals. Centralises the
+    /// boilerplate so the four-branch categorise tests stay
+    /// readable. The `execute_data_addr` field is set to a stable
+    /// per-test value so collision tests can drive it directly when
+    /// they care, and `0` is fine when they don't.
+    fn stub_site<'a>(
         function_name: Option<&'a str>,
         class_name: Option<&'a str>,
         filename: Option<&'a str>,
         lineno: u32,
         is_internal: bool,
-    ) -> FcallInfo<'a> {
-        FcallInfo {
-            function_name,
-            class_name,
-            filename,
+    ) -> RawCallSite<'a> {
+        RawCallSite {
+            function_name: function_name.map(std::borrow::Cow::Borrowed),
+            class_name: class_name.map(std::borrow::Cow::Borrowed),
+            filename: filename.map(std::borrow::Cow::Borrowed),
             lineno,
             is_internal,
+            execute_data_addr: 0,
+        }
+    }
+
+    /// An empty `FcallInfo` for `should_observe` smoke tests. The
+    /// observer trait still takes the upstream type, so we keep one
+    /// constructor close to the tests that need it.
+    fn empty_fcall_info() -> FcallInfo<'static> {
+        FcallInfo {
+            function_name: None,
+            class_name: None,
+            filename: None,
+            lineno: 0,
+            is_internal: false,
         }
     }
 
@@ -696,17 +838,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "RINIT without RSHUTDOWN")]
-    fn double_rinit_without_rshutdown_panics() {
-        // `_g` is intentionally unbound: we want the second `rinit`
-        // to fire before the first guard is dropped, so the slot is
-        // still populated. The panic propagates out of the test body
-        // and `#[should_panic]` matches it. The first `Trace` leaks
-        // for the duration of the panic-unwind; this is a test-only
-        // path that other tests don't depend on.
+    fn double_rinit_without_rshutdown_panics_in_debug_builds() {
+        // Debug-only invariant: the pairing failure surfaces as a
+        // `debug_assert!` panic so test runs and developer rebuilds
+        // catch it loudly. Release builds take the silent-recovery
+        // path covered by the next test (RO-1).
         rinit_allocate_trace(stub_identity());
         rinit_allocate_trace(stub_identity());
         // Defensive cleanup if `should_panic` somehow didn't match:
+        rshutdown_release_trace();
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds() {
+        // Release-path RO-1 invariant: a `RINIT` on top of a
+        // populated slot does NOT panic across the FFI boundary;
+        // instead the stale `Trace` is dropped and a fresh one
+        // takes its place. The first `Trace` carries `pid = 1`; the
+        // second carries `pid = 2`. After the double-rinit the slot
+        // must hold the second.
+        let first = RequestIdentity {
+            pid: 1,
+            ..stub_identity()
+        };
+        let second = RequestIdentity {
+            pid: 2,
+            ..stub_identity()
+        };
+        rinit_allocate_trace(first);
+        rinit_allocate_trace(second);
+        let pid = with_current_trace(|trace| trace.pid)
+            .expect("slot holds the recovery Trace after double rinit");
+        assert_eq!(pid, 2, "release path must replace the stale Trace");
         rshutdown_release_trace();
     }
 
@@ -720,7 +886,7 @@ mod tests {
 
     #[test]
     fn categorise_routes_methods_to_the_method_branch() {
-        let info = stub_info(
+        let info = stub_site(
             Some("greet"),
             Some("Greeter"),
             Some("/srv/app.php"),
@@ -743,7 +909,7 @@ mod tests {
 
     #[test]
     fn categorise_routes_user_functions_to_the_function_branch() {
-        let info = stub_info(Some("my_fn"), None, Some("/x.php"), 20, false);
+        let info = stub_site(Some("my_fn"), None, Some("/x.php"), 20, false);
         let cat = categorise(&info);
         assert_eq!(cat.kind, FunctionKind::Function);
         assert_eq!(
@@ -761,7 +927,7 @@ mod tests {
 
     #[test]
     fn categorise_routes_closures_via_function_name_prefix() {
-        let info = stub_info(
+        let info = stub_site(
             Some("{closure:/srv/app.php:42}"),
             None,
             Some("/srv/app.php"),
@@ -785,7 +951,7 @@ mod tests {
         // PHP-8.x sometimes reports the closure entry with
         // `function_name = None` and `filename = Some(...)`. The spike
         // handles this branch; the recorder must match.
-        let info = stub_info(None, None, Some("/x.php"), 1, false);
+        let info = stub_site(None, None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
         assert_eq!(cat.kind, FunctionKind::Closure);
         assert_eq!(
@@ -800,7 +966,7 @@ mod tests {
 
     #[test]
     fn categorise_routes_internals_to_the_internal_branch() {
-        let info = stub_info(Some("array_map"), None, None, 0, true);
+        let info = stub_site(Some("array_map"), None, None, 0, true);
         let cat = categorise(&info);
         assert_eq!(cat.kind, FunctionKind::Internal);
         assert_eq!(
@@ -822,7 +988,7 @@ mod tests {
         // `file`, the categorisation falls through to the closure
         // branch (per the substring rules). That's the same shape
         // the spike documents in C-5.
-        let info = stub_info(Some("(unknown)"), None, None, 0, false);
+        let info = stub_site(Some("(unknown)"), None, None, 0, false);
         let cat = categorise(&info);
         // No file means we end up in the function branch (the
         // closure branch requires file=Some when function_name is
@@ -834,12 +1000,158 @@ mod tests {
         assert_eq!(cat.line, 0);
     }
 
+    // --- RO-4: lossy UTF-8 decode and RO-5: call-site tiebreaker ----------
+
+    #[test]
+    fn zend_string_to_cow_replaces_invalid_utf8_bytes_with_replacement_char() {
+        // Build a fake `zend_string` with a payload of `[0xFF, 0xFF]`
+        // (never valid UTF-8) and assert the helper returns
+        // `Cow::Owned(...)` containing the U+FFFD replacement
+        // character, rather than `None` (which would silently drop
+        // the field). The previous helper, `zend_string_to_str`,
+        // returned `None` here; that caused per-call collisions
+        // documented in the RO-4 review note.
+        let payload = b"\xFF\xFF";
+        let bytes = make_zend_string(payload);
+        let zs = bytes.as_ptr() as *mut ffi::zend_string;
+
+        // SAFETY: the buffer outlives the call to `zend_string_to_cow`;
+        // the layout matches `zend_string` for `len + val` (the
+        // refcount/h/flags prefix is zeroed and not read by the
+        // helper).
+        let cow =
+            unsafe { zend_string_to_cow::<'_>(zs) }.expect("non-null pointer must produce Some(_)");
+        assert!(
+            cow.contains('\u{FFFD}'),
+            "lossy decode must substitute U+FFFD for invalid bytes; got {cow:?}",
+        );
+        // The decoded form is owned, not borrowed (lossy decoding
+        // always allocates).
+        assert!(
+            matches!(cow, std::borrow::Cow::Owned(_)),
+            "non-UTF-8 input must produce Cow::Owned; got {cow:?}",
+        );
+    }
+
+    #[test]
+    fn zend_string_to_cow_returns_a_zero_copy_borrow_for_valid_utf8() {
+        // The common case (parser-validated PHP identifiers and
+        // UTF-8 paths) must stay zero-copy — the hot path budget
+        // depends on it.
+        let payload = b"my_fn";
+        let bytes = make_zend_string(payload);
+        let zs = bytes.as_ptr() as *mut ffi::zend_string;
+        let cow = unsafe { zend_string_to_cow::<'_>(zs) }.expect("non-null");
+        assert_eq!(cow, "my_fn");
+        assert!(
+            matches!(cow, std::borrow::Cow::Borrowed(_)),
+            "valid UTF-8 must be borrowed, not allocated; got {cow:?}",
+        );
+    }
+
+    #[test]
+    fn categorise_unknown_fallback_uses_execute_data_addr_as_tiebreaker() {
+        // RO-5: two distinct unknown-shaped call sites must NOT
+        // collapse to the same FunctionKey. Before the fix, every
+        // unknown collapsed to the literal `(unknown)` /
+        // `(anonymous)` placeholder; the dictionary then folded
+        // unrelated call sites into a single per-call counter.
+        let mut a = stub_site(None, None, None, 0, false);
+        a.execute_data_addr = 0x1000;
+        let mut b = stub_site(None, None, None, 0, false);
+        b.execute_data_addr = 0x2000;
+
+        // Both should hit the function fall-through (None
+        // function_name with no file → not closure → not method →
+        // not internal). The synthesised names must differ.
+        let ca = categorise(&a);
+        let cb = categorise(&b);
+        assert_ne!(
+            ca.fqn, cb.fqn,
+            "distinct call sites must produce distinct fqns; got {} == {}",
+            ca.fqn, cb.fqn,
+        );
+        assert_ne!(
+            ca.key, cb.key,
+            "distinct call sites must produce distinct keys",
+        );
+        // The synthesised name includes the address marker so
+        // operators recognise the fallback.
+        assert!(
+            ca.fqn.contains("@0x"),
+            "fallback name must surface the address tiebreaker; got {}",
+            ca.fqn,
+        );
+    }
+
+    #[test]
+    fn categorise_internal_with_no_name_uses_execute_data_addr_tiebreaker() {
+        // Same RO-5 invariant on the internal-function branch.
+        // Internal calls with `function_name = None` are rare (Zend
+        // normally fills the name), but the tiebreaker must hold
+        // for any path that goes through the fallback.
+        let mut a = stub_site(None, None, None, 0, true);
+        a.execute_data_addr = 0x1000;
+        let mut b = stub_site(None, None, None, 0, true);
+        b.execute_data_addr = 0x2000;
+        let ca = categorise(&a);
+        let cb = categorise(&b);
+        assert_ne!(ca.key, cb.key);
+        assert!(ca.fqn.contains("(anonymous)@0x"));
+    }
+
+    /// Build a heap-allocated `zend_string`-shaped byte buffer with
+    /// the given payload. The layout matches `ffi::zend_string`'s
+    /// declaration: `gc + h + len + val[len + 1]` with `val` placed
+    /// at the correct offset for the `*(zs).val.as_ptr()` reads.
+    ///
+    /// Used only by the lossy-decode tests above. Keeping it inside
+    /// `mod tests` avoids any chance of the helper leaking into
+    /// production binaries.
+    fn make_zend_string(payload: &[u8]) -> Vec<u8> {
+        use std::mem::{align_of, size_of};
+
+        let zs_size = size_of::<ffi::zend_string>();
+        let zs_align = align_of::<ffi::zend_string>();
+        // `val` is a flexible array `[c_char; 1]` at the tail of
+        // `zend_string`; the layout already includes one byte. We
+        // need `payload.len()` plus the NUL terminator past the
+        // declared `[c_char; 1]` slot, so the trailing extension is
+        // `payload.len()` extra bytes (the `+1` for NUL is offset
+        // by the declared one-byte slot).
+        let extra = payload.len();
+        let total = zs_size + extra;
+        // Allocate with the right alignment; `Vec<u8>` does not
+        // guarantee `zend_string` alignment, but the system allocator
+        // typically returns 16-byte alignment for any allocation and
+        // `zend_string`'s alignment requirement is `align_of::<usize>()`
+        // (8 on x86_64). We assert just in case.
+        let mut buf = vec![0u8; total];
+        assert!(
+            (buf.as_ptr() as usize) % zs_align == 0,
+            "Vec<u8>'s default alignment must satisfy zend_string's; \
+             rerun with `Box::into_raw(vec![..].into_boxed_slice())` if this trips",
+        );
+        // SAFETY: `buf` is sized as `zend_string` + extra. The
+        // initial zeroing covers `gc`, `h`, and the leading
+        // refcount/flags bits the helper does not read.
+        unsafe {
+            let zs_ptr = buf.as_mut_ptr().cast::<ffi::zend_string>();
+            (*zs_ptr).len = payload.len();
+            // `val` is the flexible-array tail; write into the byte
+            // offset immediately after the declared one-byte slot.
+            let val_ptr = std::ptr::addr_of_mut!((*zs_ptr).val) as *mut u8;
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), val_ptr, payload.len());
+        }
+        buf
+    }
+
     // --- begin_with_snapshots / end_with_snapshots ------------------------
 
     #[test]
     fn begin_with_snapshots_pushes_one_frame_with_call_id_one_and_parent_zero() {
         let mut trace = Trace::new(stub_identity());
-        let info = stub_info(Some("only_me"), None, Some("/x.php"), 3, false);
+        let info = stub_site(Some("only_me"), None, Some("/x.php"), 3, false);
         let cat = categorise(&info);
         begin_with_snapshots(&mut trace, &cat, entry_snapshots());
 
@@ -859,7 +1171,7 @@ mod tests {
     #[test]
     fn begin_then_end_emits_one_callrecord_with_matching_fields() {
         let mut trace = Trace::new(stub_identity());
-        let info = stub_info(Some("only_me"), None, Some("/x.php"), 3, false);
+        let info = stub_site(Some("only_me"), None, Some("/x.php"), 3, false);
         let cat = categorise(&info);
 
         begin_with_snapshots(&mut trace, &cat, entry_snapshots());
@@ -889,10 +1201,10 @@ mod tests {
 
         // `info_*` bindings must outlive the `Categorised` values
         // returned by `categorise` (the categorisation borrows
-        // `fqn`/`file` from the `FcallInfo`).
-        let info_a = stub_info(Some("a"), None, Some("/x.php"), 1, false);
-        let info_b = stub_info(Some("b"), None, Some("/x.php"), 2, false);
-        let info_c = stub_info(Some("c"), None, Some("/x.php"), 3, false);
+        // `fqn`/`file` from the `RawCallSite`).
+        let info_a = stub_site(Some("a"), None, Some("/x.php"), 1, false);
+        let info_b = stub_site(Some("b"), None, Some("/x.php"), 2, false);
+        let info_c = stub_site(Some("c"), None, Some("/x.php"), 3, false);
         let a = categorise(&info_a);
         let b = categorise(&info_b);
         let c = categorise(&info_c);
@@ -923,7 +1235,7 @@ mod tests {
     #[test]
     fn dict_miss_allocates_once_dict_hit_allocates_zero_strings() {
         let mut trace = Trace::new(stub_identity());
-        let info = stub_info(Some("repeat"), None, Some("/x.php"), 1, false);
+        let info = stub_site(Some("repeat"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
 
         begin_with_snapshots(&mut trace, &cat, entry_snapshots());
@@ -949,7 +1261,7 @@ mod tests {
     #[test]
     fn end_with_abnormal_true_writes_abnormal_exit_true() {
         let mut trace = Trace::new(stub_identity());
-        let info = stub_info(Some("bad"), None, Some("/x.php"), 1, false);
+        let info = stub_site(Some("bad"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
 
         begin_with_snapshots(&mut trace, &cat, entry_snapshots());
@@ -962,7 +1274,7 @@ mod tests {
     #[test]
     fn saturating_cpu_delta_reads_as_zero_when_exit_cpu_less_than_entry_cpu() {
         let mut trace = Trace::new(stub_identity());
-        let info = stub_info(Some("anywhere"), None, Some("/x.php"), 1, false);
+        let info = stub_site(Some("anywhere"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
 
         // Entry CPU times are higher than the exit's — `saturating_sub`
@@ -990,27 +1302,50 @@ mod tests {
     }
 
     #[test]
-    fn end_on_empty_stack_is_a_silent_noop_in_release() {
-        // Build the trace in a way that bypasses the begin path so the
-        // stack is empty when `end` fires. `debug_assert` would panic
-        // in test builds, so we test the release-mode invariant by
-        // checking the post-state when the assert is disabled.
-        // `debug_assertions` is off in `cargo test --release`; in the
-        // default `cargo test` (debug), the debug_assert fires —
-        // catching this test would require a release run. We instead
-        // assert the post-state when `cfg(debug_assertions)` is off.
-        if cfg!(debug_assertions) {
-            // Skip; the debug_assert! is the documented behaviour
-            // in test builds.
-            return;
-        }
+    fn finish_call_record_with_no_frame_is_a_silent_noop() {
+        // RO-3: the release-path "empty-stack → silent no-op"
+        // contract is exercised through `finish_call_record(None)`
+        // so a default `cargo test` (debug-assertions on) actually
+        // runs it, instead of vacuously returning past a
+        // `cfg!(debug_assertions)` early-return. The
+        // `end_with_snapshots` caller's `debug_assert!` is the loud
+        // signal for the pairing bug in test/dev builds; this
+        // helper is the recovery path the assert documents, and
+        // both should be tested.
         let mut trace = Trace::new(stub_identity());
-        assert!(trace.stack.is_empty());
-        end_with_snapshots(&mut trace, exit_snapshots(), false);
+        finish_call_record(&mut trace, None, exit_snapshots(), false);
         assert!(
             trace.buffer.is_empty(),
-            "end on empty stack must not emit a record",
+            "no popped frame must not emit a record",
         );
+        assert!(trace.stack.is_empty(), "stack must remain empty");
+    }
+
+    #[test]
+    fn finish_call_record_with_a_frame_emits_a_record_with_the_frame_fields() {
+        // Companion to the silent-noop test: prove `finish_call_record`
+        // does the real work when handed `Some(frame)`. Together the
+        // two tests pin both arms of the helper without depending on
+        // `cfg(debug_assertions)`.
+        let mut trace = Trace::new(stub_identity());
+        let frame = CallFrame {
+            call_id: 7,
+            parent: 0,
+            fn_id: 3,
+            depth: 0,
+            t_in_ns: 1_000_000,
+            cpu_u_in_ns: 500,
+            cpu_s_in_ns: 100,
+            mem_in_bytes: 1_024,
+        };
+        finish_call_record(&mut trace, Some(frame), exit_snapshots(), true);
+        assert_eq!(trace.buffer.len(), 1);
+        let r = &trace.buffer[0];
+        assert_eq!(r.call_id, 7);
+        assert_eq!(r.fn_id, 3);
+        assert_eq!(r.cpu_u_ns, 1_000);
+        assert_eq!(r.cpu_s_ns, 200);
+        assert!(r.abnormal_exit);
     }
 
     #[test]
@@ -1018,12 +1353,19 @@ mod tests {
         // The thread-local is empty; `with_current_trace` returns
         // None. The handler should not panic, should not allocate,
         // and should leave the slot empty.
+        //
+        // RO-6 follow-up: the snapshot trio (monotonic clock, CPU
+        // times, memory-real) is now captured **inside** the
+        // `with_current_trace` closure, so a slot-empty fire pays
+        // for the `RefCell::borrow_mut` and the
+        // `Option::as_mut().map(_)` only — no `clock_gettime`, no
+        // `getrusage`, no `zend_memory_usage`. We do not have a
+        // direct way to assert "no syscall" without a mock clock,
+        // so this test pins the structural smoke: the closure body
+        // is never entered when the slot is empty.
         rshutdown_release_trace(); // ensure empty
         let r = Recorder;
         assert!(r.should_observe(&empty_fcall_info()));
-        // We can't easily call `r.begin_handler` here without a real
-        // `ExecuteData`; instead we exercise the `with_current_trace`
-        // accessor directly to prove the no-op semantics.
         let touched = with_current_trace(|_| true);
         assert!(touched.is_none(), "no active trace → no-op closure body");
     }

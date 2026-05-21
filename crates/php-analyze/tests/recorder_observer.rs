@@ -60,11 +60,19 @@ fn recorder_observer_covers_slice_2_scenarios_on_every_available_php() {
         .collect();
 
     if available.is_empty() {
+        // RO-2: `cargo test` treats any non-zero exit as a test
+        // failure (and `std::process::exit` terminates the whole
+        // test binary, taking out result reporting). The skip
+        // semantics we actually want — "PHP not installed, leave
+        // the rest of the suite alone" — is an `eprintln!` plus
+        // an early return, which `cargo test` records as a pass.
+        // CI's apt-install step is what guarantees PHP is present
+        // on the matrix entries that set `PHP_ANALYZE_RUN_RECORDER=1`.
         eprintln!(
-            "recorder_observer: no php8.3 or php8.4 found; tried: {}",
+            "recorder_observer: skipped (no php8.3 or php8.4 found; tried: {})",
             candidates.join(", "),
         );
-        std::process::exit(77);
+        return;
     }
 
     let runner = locate_driver_script();
