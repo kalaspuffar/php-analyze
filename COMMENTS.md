@@ -97,6 +97,50 @@ for PHP 8.3 (pending verification)" to **"Closed for PHP 8.3 and PHP
 8.4"**. The matching `SPECIFICATION.md` §11 R-2 status cell is
 amended in the same change.
 
+### C-17 — Process-global drain-deadline cell, publish-before-send ordering
+
+**Decision**: the MSHUTDOWN drain deadline is published to a
+process-global `Mutex<Option<Instant>>` cell *before* the `Drain`
+message is sent on the channel and *before* the canonical `Sender` is
+dropped. The shipper's `run_loop` snapshots the cell at the head of
+each pre-drain iteration; once observed as `Some(_)`, the loop
+transitions to the deadline-aware recv body without waiting for the
+`Drain` message to surface from a saturated channel.
+
+**Why**: slice 3 (`shipper-encoder-and-http`) wired real per-batch
+work (MessagePack encode + HTTPS POST + up to `retry_count + 1`
+attempts with exponential backoff). With the slice-3 default
+`shipper_queue_depth = 8`, `retry_count = 3`, `http_timeout_ms = 2000`,
+a saturated channel against a black-holed upstream would cost up to
+`8 × 4 × 2s = 64s` before the `Drain` message reaches the front of the
+queue — far past the AC-BS-4 / AC-PB-2 budget of
+`shutdown_grace_ms + 200ms`. The slice-3 deadline-aware retry
+orchestrator already does the right thing once it has a deadline; the
+cell-publish-before-send ordering is what makes the deadline visible
+to the orchestrator early enough to bound the in-flight work.
+
+**Alternatives considered and rejected**:
+
+- `OnceLock<Instant>` for the cell — cannot be cleared between
+  tests; the existing `reset_for_test` pattern needs clearable state.
+- `AtomicI64`-encoded-as-`Instant` for lock-free reads — adds a new
+  "process-start anchor" abstraction and a new error mode for one
+  uncontended mutex acquire per `recv` until first publish.
+- A separate "control" channel selected via `crossbeam_channel::select!` —
+  two channels, two clones at MSHUTDOWN, two state slots, same wake-up
+  latency as recv_deadline.
+- Extending `ShipperMessage` with a `Wake` variant — does not solve
+  the underlying problem (the `Drain` message itself is the wake-up
+  signal we cannot deliver in time).
+
+**Resolution**: implemented in OpenSpec change
+`shipper-deadline-at-recv-loop-head` (branch
+`feat/shipper-deadline-at-recv-loop-head`). Closes SEH-9. Spec
+parity: `SPECIFICATION.md` §3.3 step "observe a global deadline
+`now + shutdown_grace_ms`" and AC-BS-4 / AC-PB-2 wording unchanged;
+this change makes the existing wording self-consistent under
+slice-3 per-batch work without amending the spec text.
+
 ### C-8 — Exception unwind reads `ExecutorGlobals::has_exception()`, not an `end` parameter
 
 `SPECIFICATION.md` §3.2 lists `EG(exception)` under "Interfaces
@@ -210,7 +254,7 @@ review finding.
 
 ### Phase 4 — slice-3 follow-ups carried out of the round-2 review
 
-- `shipper-deadline-at-recv-loop-head` — surface the `Drain` deadline to the shipper recv-loop head (via an `OnceLock<Instant>` or `AtomicI64`-as-`Instant`) so the loop can self-exit even before the `Drain` message surfaces. Slice 3 has materialised the risk the existing `drain_and_join_at_mshutdown` TODO warned about — each batch now carries encode + POST + retry work, so a saturated channel plus slow retries can blow past `shutdown_grace_ms` while the shipper is still chewing through pre-`Drain` batches (SEH-9).
+- `shipper-collapse-drain-phases` — with the cell-publish path in place (SEH-9 / C-17), every code path through `run_loop` that processes a batch now has an `Option<Instant>` deadline available. The two-phase pre-drain/post-drain split is leftover from slice 1's silent-drain semantic. Collapsing them into a single deadline-aware loop body (taking the cell's `Option<Instant>` directly rather than gating on it) would simplify the state machine and remove the `local_deadline` snapshot dance. Open Question Q-1 from `shipper-deadline-at-recv-loop-head`'s `design.md`; deferred so the SEH-9 change stays small and the refactor is reviewable in isolation.
 - `stub-ingest-header-capture` — add a `/debug/last_request_headers` endpoint on `stub-ingest` so the deferred §7.5 (`shipper_round_trip_authorization_header_matches_configured_token`) and §7.6 (`shipper_round_trip_user_agent_includes_crate_version`) integration tests can land (SEH-10).
 - `stub-ingest-connection-counter` — add a `/debug/connection_count` endpoint plus a per-PHP-request fixture loop so the deferred §7.7 (`shipper_round_trip_keep_alive_serves_1000_requests_with_one_connection`) test can land. AC-SH-6 binding evidence (SEH-10).
 - `stub-ingest-configurable-failure` — add a `--respond-with <status>` flag to `stub-ingest` plus a `tests/php-shipper/retry_exhaust.php` fixture so the deferred §7.8 (`shipper_round_trip_500_exhausts_retries_and_bumps_drop_counter`) and §7.9 (`shipper_round_trip_token_not_leaked_to_php_error_log`) integration tests can land. The §7.9 test also binds the SEH-2 `E_NOTICE` emit path end-to-end (SEH-10).
@@ -495,14 +539,20 @@ items that need new infrastructure are queued in the
   fallthrough is now `unreachable!("...")`; the local
   `last_reason` is dropped. The compiler proves the invariant via
   the `unreachable!`.
-- **SEH-9 (minor) — follow-up queued.**
-  `shipper-deadline-at-recv-loop-head` (above, in deferred list)
-  picks up the existing `TODO(slice-2)` in
-  `drain_and_join_at_mshutdown`. Slice 3 has materialised the risk
-  the TODO warned about — each batch now carries encode + POST +
-  retry work — so the deadline-aware recv-loop-head needs to land
-  before any longer-than-trivial backoff is exercised under
-  MSHUTDOWN.
+- **SEH-9 (minor) — closed.** Implemented in OpenSpec change
+  `shipper-deadline-at-recv-loop-head` (branch
+  `feat/shipper-deadline-at-recv-loop-head`). The
+  `drain_and_join_at_mshutdown` function now publishes the deadline
+  to a process-global `Mutex<Option<Instant>>` cell *before* sending
+  the `Drain` message and dropping the canonical `Sender`. The
+  shipper's `run_loop` snapshots the cell at the head of each
+  pre-drain iteration and transitions to the same deadline-aware
+  recv body that the post-`Drain` phase uses — bounding each
+  in-flight batch's `run_with_retry` budget by the published deadline
+  even when the channel is saturated and the `Drain` message itself
+  is stuck behind a pile of pre-`Drain` batches. The `TODO(slice-2)`
+  comment in `drain_and_join_at_mshutdown` is removed. See
+  forward-looking design decision C-17 above for the full rationale.
 - **SEH-10 (minor) — follow-ups queued.** The five `stub-ingest-*`
   follow-ups (above, in deferred list) record the 7.5–7.10
   deferrals from this slice's `tasks.md` so the deferred state is
