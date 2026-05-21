@@ -27,6 +27,20 @@ secrecy = "0.10"
 thiserror = "2"
 # `url` parses and validates `server_url` (must be `http://` or `https://`).
 url = "2"
+# `rustc_hash::FxHashMap` is the hash builder for the recorder's
+# function dictionary (`recorder::dictionary::Dictionary`). Small
+# composite keys, trusted inputs — SipHash's DoS resistance is wasted
+# and its cost is measurable. We use `rustc-hash` (the rust-lang
+# maintained fork of the older `fxhash` crate) because it has zero
+# transitive dependencies; the older `fxhash` pulls `byteorder`.
+rustc-hash = "2"
+# `libc` exposes `clock_gettime`, `getrusage`, `CLOCK_MONOTONIC`,
+# `CLOCK_REALTIME`, `RUSAGE_SELF`, and `timeval` — everything the
+# recorder's clock primitives need. `libc` is already a transitive dep
+# (build-dep of `ext-php-rs-bindgen`), so listing it directly costs zero
+# new crates in the lockfile. `ext-php-rs::ffi` only re-exports Zend
+# types, not POSIX clock symbols.
+libc = "0.2"
 
 [dev-dependencies]
 # Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
