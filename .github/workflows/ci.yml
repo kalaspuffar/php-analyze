@@ -78,3 +78,19 @@ jobs:
 
       - name: cargo test
         run: cargo test --all
+
+      # Keep the `recorder-dump` Cargo feature compiling. Slice 2's
+      # integration tests use it; if no CI matrix entry exercises the
+      # feature, slice-3 or later changes can accidentally break it
+      # and the breakage stays hidden until the next integration run.
+      - name: cargo build --features recorder-dump
+        run: cargo build -p php-analyze --no-default-features --features recorder-dump
+
+      # Run the slice-2 PHP integration test against the installed
+      # PHP version. The test gates on `PHP_ANALYZE_RUN_RECORDER=1`
+      # and discovers `php${{ matrix.php }}` on PATH; without the
+      # env var it skips loudly with status 0.
+      - name: cargo test --test recorder_observer
+        env:
+          PHP_ANALYZE_RUN_RECORDER: "1"
+        run: cargo test --test recorder_observer --features recorder-dump
