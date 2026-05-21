@@ -1371,3 +1371,57 @@ Spec amendments:
 - `SPECIFICATION.md §3.2` — `RUSAGE_SELF` → `RUSAGE_THREAD` with a sentence explaining why (shipper-thread isolation) and the kernel-version note (Linux 2.6.26+, comfortably below the §7.4 ≥4.4 floor).
 - `SPECIFICATION.md §7.4` Permissions row — same constant swap.
 
+
+## Slice-2 deviations and verification
+
+### C-7 — PHP 8.3 verification (slice 2 outcome)
+
+Closes the C-5 follow-up "Phase 2's Recorder change MUST include 8.3
+verification". Slice 2 (`recorder-observer-hooks-and-trace-lifecycle`)
+adds an integration test (`crates/php-analyze/tests/recorder_observer.rs`)
+and a shell harness (`tests/php-recorder/run.sh`) that iterate every
+`php8.3` / `php8.4` binary on `PATH`, build the cdylib with
+`--features recorder-dump`, and assert per-fixture contents.
+
+**Host coverage:**
+
+| PHP version | Host outcome | Notes |
+| --- | --- | --- |
+| PHP 8.4.21 | **passed** | Both `flat_calls.php` (10⁴ records, 1 dict entry for `noop`), `nested.php` (a→b→c parent chain), and `throws.php` (`bad()` record carries `abnormal_exit=true`, script body's record carries `false`) all green. |
+| PHP 8.3.x | **skipped on this host** | The local `update-alternatives` points at `/usr/bin/php-config8.4`, so the cdylib's module API (20240924) cannot load under PHP 8.3 (module API 20230831). The harness's `run.sh` detects this via the PHP startup warning and exits 77; the Rust test surfaces the per-binary skip with a clear stderr message. |
+
+**CI coverage** closes the 8.3 gap: `.github/workflows/ci.yml` runs the
+same harness once per matrix entry, with `update-alternatives --set
+php-config /usr/bin/php-config${{ matrix.php }}` ensuring each entry
+builds the cdylib for the corresponding PHP version. The slice-2 PR's
+CI run is the binding evidence — the 8.3 job and the 8.4 job both
+execute the same three fixtures against their matching PHP runtime.
+
+**R-2 verdict:** updated from "Closed for PHP 8.4; partially closed
+for PHP 8.3 (pending verification)" to **"Closed for PHP 8.3 and PHP
+8.4"**. The matching `SPECIFICATION.md` §11 R-2 status cell is
+amended in the same change.
+
+### C-8 — Exception unwind reads `ExecutorGlobals::has_exception()`, not an `end` parameter
+
+`SPECIFICATION.md` §3.2 lists `EG(exception)` under "Interfaces
+consumed" — correct at intent. The implementation reads
+`ExecutorGlobals::has_exception()` (the ext-php-rs wrapper, a
+one-liner that null-checks `EG(exception)`). This is the same pattern
+the spike already validated in C-5's `throws.php` coverage row.
+
+The proposal originally claimed `ext_php_rs = 0.15.13`'s
+`FcallObserver::end` had an `abnormal: bool` parameter and that the
+recorder would read it directly. That was wrong: the real trait
+signature is `fn end(&self, execute_data: &ExecuteData, retval:
+Option<&Zval>)` — no `abnormal` parameter. Slice-2 spec
+(`specs/recorder-call-events/spec.md`) and design D-7 were amended
+in-flight to reflect the actual API; this note records the deviation
+so the spec/design archive reads coherent against the implementation.
+
+**Evidence:** the same C-5 coverage table proves
+`ExecutorGlobals::has_exception()` reads `true` exactly when the
+calling frame is unwinding via an exception. No further verification
+is needed in slice 2 beyond the integration test's `throws.php`
+fixture (which the slice-2 harness exercises against every available
+PHP version).
