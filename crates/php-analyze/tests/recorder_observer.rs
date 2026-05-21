@@ -157,6 +157,8 @@ fn try_run_all_fixtures(runner: &Path, fixtures_dir: &Path, binary: &str) -> boo
     // Slice-3 fixtures:
     run_fixture_deep_recursion(runner, fixtures_dir, binary);
     run_fixture_cap_drops(runner, fixtures_dir, binary);
+    // Phase-4 slice 2 fixture:
+    run_fixture_threshold_flush(runner, fixtures_dir, binary);
     true
 }
 
@@ -546,6 +548,86 @@ fn run_fixture_cap_drops(runner: &Path, fixtures_dir: &Path, binary: &str) {
         noop_dict.len(),
         1,
         "{binary} cap_drops: noop appears in dict {} times (expected 1)",
+        noop_dict.len(),
+    );
+}
+
+/// Phase-4 slice 2 fixture: drive `threshold_flush.php` with
+/// `php_analyze.flush_records = 5000` over a 10_001-call workload.
+/// The cadence MUST be exactly:
+///
+/// - 2 mid-request flushes with `trigger=records record_count=5000`
+///   (records 1..=5000 and 5001..=10000).
+/// - 1 final flush with `trigger=rshutdown record_count=1` (the
+///   script-body's own end record sits in the buffer at RSHUTDOWN).
+///
+/// Plus all 10_001 `C:` records and exactly one `noop` dict entry.
+fn run_fixture_threshold_flush(runner: &Path, fixtures_dir: &Path, binary: &str) {
+    let parsed = run_fixture(
+        runner,
+        fixtures_dir,
+        binary,
+        "threshold_flush.php",
+        &[
+            ("php_analyze.flush_records", "5000".to_owned()),
+            // Disarm the bytes gate so only the records gate fires.
+            ("php_analyze.flush_bytes", "1000000000".to_owned()),
+        ],
+    );
+    assert_dropped_records(&parsed, 0, binary, "threshold_flush.php");
+
+    assert_eq!(
+        parsed.flushes.len(),
+        3,
+        "{binary} threshold_flush: expected exactly 3 F: lines, got {} ({:?})",
+        parsed.flushes.len(),
+        parsed.flushes,
+    );
+
+    // Slice-2 cadence: two records-triggered flushes followed by one
+    // rshutdown-triggered residual flush. The order in which Zend
+    // fires the script-body's begin vs. the for-loop's first noop
+    // begin is implementation-defined, but the slice-2 records-
+    // trigger fires on the 5000th and 10_000th *records*, not on
+    // any particular call site.
+    assert_eq!(
+        parsed.flushes[0].trigger, "records",
+        "{binary} threshold_flush: first flush trigger = {}",
+        parsed.flushes[0].trigger,
+    );
+    assert_eq!(parsed.flushes[0].record_count, 5000);
+    assert_eq!(
+        parsed.flushes[1].trigger, "records",
+        "{binary} threshold_flush: second flush trigger = {}",
+        parsed.flushes[1].trigger,
+    );
+    assert_eq!(parsed.flushes[1].record_count, 5000);
+    assert_eq!(
+        parsed.flushes[2].trigger, "rshutdown",
+        "{binary} threshold_flush: third flush trigger = {}",
+        parsed.flushes[2].trigger,
+    );
+    assert_eq!(
+        parsed.flushes[2].record_count, 1,
+        "{binary} threshold_flush: rshutdown flush carries one residual record \
+         (the script body's own end), got {}",
+        parsed.flushes[2].record_count,
+    );
+
+    // Total records and dict shape: 10_000 noop records + 1 script
+    // body record = 10_001 total, and `noop` appears exactly once in
+    // the dict.
+    assert_eq!(
+        parsed.calls.len(),
+        10_001,
+        "{binary} threshold_flush: expected 10_001 C: records total, got {}",
+        parsed.calls.len(),
+    );
+    let noop_dict: Vec<&ParsedDict> = parsed.dict.iter().filter(|d| d.fqn == "noop").collect();
+    assert_eq!(
+        noop_dict.len(),
+        1,
+        "{binary} threshold_flush: noop appears in dict {} times (expected 1)",
         noop_dict.len(),
     );
 }
