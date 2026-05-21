@@ -32,6 +32,7 @@ use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, ModuleEntry, SapiGlobals, S
 use ext_php_rs::{info_table_end, info_table_header, info_table_row, info_table_start};
 
 use crate::config::{initialise_from_ini, Config, DisableReason, RawIni, TokenSource};
+use crate::recorder::types::TraceLimits;
 use crate::recorder::{self, RequestIdentity};
 
 // --- Directive table -------------------------------------------------------
@@ -213,7 +214,16 @@ fn rinit_body() {
         return;
     }
     let identity = build_request_identity();
-    recorder::rinit_allocate_trace(identity);
+    // Slice-3 cap thresholds, cached onto the `Trace` so the hot path
+    // does not need to re-read `Config::global()` per call.
+    // `Config::max_depth: u16` widens losslessly to `u32` so the gate's
+    // comparison with `Trace::virtual_depth: u32` happens without a
+    // cast.
+    let limits = TraceLimits {
+        max_depth: u32::from(config.max_depth),
+        buffer_cap_bytes: config.buffer_cap_bytes,
+    };
+    recorder::rinit_allocate_trace(identity, limits);
 }
 
 /// `RSHUTDOWN` — request shutdown. Releases the recorder's per-request

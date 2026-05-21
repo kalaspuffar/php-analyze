@@ -21,6 +21,7 @@
 //! ```text
 //! D:<fn_id>:<kind>:<line>:<fqn>\t<file>
 //! C:<call_id>:<parent>:<fn_id>:<depth>:<t_in_ns>:<t_out_ns>:<cpu_u_ns>:<cpu_s_ns>:<mem_in>:<mem_out>:<abnormal>
+//! DROP: dropped_records=<N>
 //! RSHUTDOWN: dropped trace_id=<hex>
 //! ```
 //!
@@ -30,6 +31,12 @@
 //!   entry from the trace appears once.)
 //! - `C:` lines follow, in emission order (the same order
 //!   `Trace::push_record` saw).
+//! - One `DROP:` line follows the last `C:` line, summarising the
+//!   trace's cumulative drop counter at dump time. Slice 3 added
+//!   this line; the value is read via
+//!   `trace.drop_counter.load(Ordering::Acquire)`. The line is
+//!   present even when the count is `0` so the parser can assert
+//!   "no drops" deterministically.
 //! - `<kind>` is one of `function`, `method`, `closure`, `internal`.
 //! - `<abnormal>` is `true` or `false`.
 //! - The trailing `RSHUTDOWN:` line marks the end of one trace; a
@@ -43,6 +50,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use crate::recorder::types::{DictEntry, FunctionKind, Trace};
 
@@ -113,6 +121,12 @@ fn write_trace_to_path(trace: &Trace, path: &std::path::Path) -> std::io::Result
         )?;
     }
 
+    // Slice-3 `DROP:` summary. `Acquire` is overkill on a same-thread
+    // read but explicit about the Phase-4 cross-thread story the
+    // counter will inherit.
+    let dropped_records = trace.drop_counter.load(Ordering::Acquire);
+    writeln!(sink, "DROP: dropped_records={dropped_records}")?;
+
     let hex = trace
         .trace_id
         .iter()
@@ -143,6 +157,11 @@ fn write_dict_line<W: Write>(sink: &mut W, entry: &DictEntry) -> std::io::Result
 pub struct ParsedDump {
     pub dict: Vec<ParsedDict>,
     pub calls: Vec<ParsedCall>,
+    /// Slice-3 `DROP: dropped_records=<N>` summary. `None` if the
+    /// dump pre-dates the slice-3 format (defensive — every dump
+    /// produced by this slice's writer emits the line, but a stale
+    /// fixture from a previous slice's binary would not).
+    pub dropped_records: Option<u64>,
     pub rshutdown_marker_seen: bool,
 }
 
@@ -180,6 +199,7 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
     let contents = std::fs::read_to_string(path)?;
     let mut dict = Vec::new();
     let mut calls = Vec::new();
+    let mut dropped_records: Option<u64> = None;
     let mut rshutdown_marker_seen = false;
 
     for line in contents.lines() {
@@ -191,6 +211,10 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
             if let Some(parsed) = parse_call_line(rest) {
                 calls.push(parsed);
             }
+        } else if let Some(rest) = line.strip_prefix("DROP: dropped_records=") {
+            // Slice-3 `DROP:` line. The format is fixed; the entire
+            // tail is the decimal count.
+            dropped_records = rest.trim().parse().ok();
         } else if line.starts_with("RSHUTDOWN:") {
             rshutdown_marker_seen = true;
         }
@@ -199,6 +223,7 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
     Ok(ParsedDump {
         dict,
         calls,
+        dropped_records,
         rshutdown_marker_seen,
     })
 }
@@ -259,9 +284,18 @@ fn parse_call_line(rest: &str) -> Option<ParsedCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder::types::{CallRecord, FunctionKey, RequestIdentity};
+    use crate::recorder::accounting;
+    use crate::recorder::types::{CallRecord, FunctionKey, RequestIdentity, TraceLimits};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// Acquire the slice-3 accounting test-lock so the per-trace
+    /// billing through `Trace::push_record` doesn't race with sibling
+    /// tests in this binary.
+    fn account_guard() -> std::sync::MutexGuard<'static, ()> {
+        accounting::acquire_test_lock()
+    }
 
     fn stub_identity() -> RequestIdentity {
         RequestIdentity {
@@ -270,6 +304,22 @@ mod tests {
             pid: 1,
             uri_or_script: "/tmp/test.php".to_owned(),
         }
+    }
+
+    fn permissive_limits() -> TraceLimits {
+        TraceLimits {
+            max_depth: 1024,
+            buffer_cap_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    fn fresh_trace() -> Trace {
+        // Slice-3 invariant: tests that build a `Trace` and bill it
+        // through `push_record` / `push_dict_entry_via_intern` must
+        // hold the accounting test-lock for the test's duration.
+        // The lock is acquired in the test bodies that need it; this
+        // helper is just the constructor.
+        Trace::new(stub_identity(), permissive_limits())
     }
 
     fn intern_one(trace: &mut Trace, fqn: &str, file: &str, line: u32, kind: FunctionKind) -> u32 {
@@ -305,6 +355,8 @@ mod tests {
 
     #[test]
     fn dump_writes_one_d_line_per_dict_entry_and_one_c_line_per_record() {
+        let _g = account_guard();
+        accounting::reset_for_test();
         let dir = tempdir().unwrap();
         let dump_path = dir.path().join("dump.log");
         // SAFETY: setting an env var is unsafe in Rust 2024 because
@@ -317,7 +369,7 @@ mod tests {
             env::set_var(DUMP_PATH_ENV, &dump_path);
         }
 
-        let mut trace = Trace::new(stub_identity());
+        let mut trace = fresh_trace();
         let fn_id = intern_one(&mut trace, "only_me", "/x.php", 1, FunctionKind::Function);
         push_record(&mut trace, 1, 0, fn_id, false);
         push_record(&mut trace, 2, 1, fn_id, true);
@@ -336,6 +388,11 @@ mod tests {
         assert_eq!(parsed.calls[0].call_id, 1);
         assert_eq!(parsed.calls[1].call_id, 2);
         assert!(parsed.calls[1].abnormal_exit);
+        assert_eq!(
+            parsed.dropped_records,
+            Some(0),
+            "slice-3 DROP: line must be present and zero on a clean trace",
+        );
         assert!(
             parsed.rshutdown_marker_seen,
             "RSHUTDOWN: marker must close the dump",
@@ -348,7 +405,7 @@ mod tests {
         unsafe {
             env::remove_var(DUMP_PATH_ENV);
         }
-        let trace = Trace::new(stub_identity());
+        let trace = fresh_trace();
         // Should not panic and should not create any file (we can't
         // assert "no file" without a known path; the absence of a
         // panic is the contract).
@@ -357,13 +414,15 @@ mod tests {
 
     #[test]
     fn parse_dump_round_trips_a_written_dump() {
+        let _g = account_guard();
+        accounting::reset_for_test();
         let dir = tempdir().unwrap();
         let dump_path = dir.path().join("rt.log");
         unsafe {
             env::set_var(DUMP_PATH_ENV, &dump_path);
         }
 
-        let mut trace = Trace::new(stub_identity());
+        let mut trace = fresh_trace();
         let id_a = intern_one(&mut trace, "a", "/x.php", 1, FunctionKind::Function);
         let id_b = intern_one(&mut trace, "b", "/x.php", 2, FunctionKind::Method);
         push_record(&mut trace, 1, 0, id_a, false);
@@ -383,5 +442,63 @@ mod tests {
         assert_eq!(parsed.calls[1].fn_id, id_b);
         assert_eq!(parsed.calls[0].t_in_ns, 1_000_000);
         assert_eq!(parsed.calls[0].t_out_ns, 2_000_000);
+        assert_eq!(parsed.dropped_records, Some(0));
+    }
+
+    #[test]
+    fn dump_emits_drop_line_with_counter_value_zero_for_a_clean_trace() {
+        let _g = account_guard();
+        accounting::reset_for_test();
+        let dir = tempdir().unwrap();
+        let dump_path = dir.path().join("clean.log");
+        unsafe {
+            env::set_var(DUMP_PATH_ENV, &dump_path);
+        }
+
+        let mut trace = fresh_trace();
+        let fn_id = intern_one(&mut trace, "f", "/x.php", 1, FunctionKind::Function);
+        push_record(&mut trace, 1, 0, fn_id, false);
+        write_trace_if_path_set(&trace);
+        unsafe {
+            env::remove_var(DUMP_PATH_ENV);
+        }
+
+        let contents = std::fs::read_to_string(&dump_path).unwrap();
+        assert!(
+            contents.contains("\nDROP: dropped_records=0\n"),
+            "dump must contain the slice-3 DROP: line, got:\n{contents}",
+        );
+        // The line lives between the last C: and the RSHUTDOWN: line.
+        let drop_idx = contents.find("DROP: dropped_records=").unwrap();
+        let rshut_idx = contents.find("RSHUTDOWN:").unwrap();
+        assert!(
+            drop_idx < rshut_idx,
+            "DROP: line must precede RSHUTDOWN: line",
+        );
+    }
+
+    #[test]
+    fn dump_emits_drop_line_with_counter_value_after_drops() {
+        let _g = account_guard();
+        accounting::reset_for_test();
+        let dir = tempdir().unwrap();
+        let dump_path = dir.path().join("drops.log");
+        unsafe {
+            env::set_var(DUMP_PATH_ENV, &dump_path);
+        }
+
+        let trace = fresh_trace();
+        // Bump the drop counter directly — this test only exercises
+        // the dump-writer's read path. The counter is `Arc<AtomicU64>`
+        // so it does not require `mut`.
+        trace.drop_counter.fetch_add(42, Ordering::Relaxed);
+        write_trace_if_path_set(&trace);
+        unsafe {
+            env::remove_var(DUMP_PATH_ENV);
+        }
+
+        let parsed = parse_dump(&dump_path).unwrap();
+        assert_eq!(parsed.dropped_records, Some(42));
+        assert!(parsed.rshutdown_marker_seen);
     }
 }

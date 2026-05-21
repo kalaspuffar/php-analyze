@@ -14,10 +14,16 @@
 //!   the `BootObserver` dispatcher registered at `MINIT`, and the
 //!   thread-local `Trace` slot with its `RINIT` / `RSHUTDOWN` entry
 //!   points.
+//! - [`accounting`] — the process-wide `BYTES_IN_MEMORY` atomic used
+//!   by the §3.2 cap-check. Slice 3 introduces the only `add` / `sub`
+//!   sites; Phase 4 will add the shipper-side subtract.
 //!
-//! Slice 3 (`recorder-depth-and-cap-drops`) will add `max_depth` gating,
-//! `buffer_cap_bytes` accounting, and the `Arc<AtomicU64>` drop counter.
+//! Slice 3 (`recorder-depth-and-cap-drops`) added `max_depth` gating,
+//! `buffer_cap_bytes` accounting, and the per-trace `Arc<AtomicU64>`
+//! drop counter. The flush-threshold and channel-handoff paths land
+//! with the Phase-4 shipper.
 
+pub(crate) mod accounting;
 pub mod dictionary;
 #[cfg(feature = "recorder-dump")]
 pub mod dump;

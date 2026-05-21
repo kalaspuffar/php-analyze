@@ -1976,6 +1976,159 @@ Gates green on the fix-round branch:
 - `cargo test --release --lib` (exercises the release-only `double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds` test)
 - `openspec validate recorder-observer-hooks-and-trace-lifecycle`
 
+## Slice-3 deviations and notes
+
+### C-10 — Slice-3 (`recorder-depth-and-cap-drops`) implementation notes
+
+This entry records the in-flight deviations discovered while
+implementing slice 3. The slice ships with no `SPECIFICATION.md` or
+README changes; the spec amendments here are local to the OpenSpec
+change's spec delta and `COMMENTS.md`.
+
+**Status:** branch `feat/recorder-depth-and-cap-drops`, OpenSpec
+change `recorder-depth-and-cap-drops`, `openspec validate
+recorder-depth-and-cap-drops --strict` is green. All gates green:
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+warnings`, `cargo test --all --all-features` (133 lib +
+1 spike-integration), `cargo test --release --lib --all-features`
+(134, with the cfg-gated release-only invariant), and
+`PHP_ANALYZE_RUN_RECORDER=1 cargo test --test recorder_observer
+--features recorder-dump` against `php8.4` on the build host.
+
+#### Deviations from the slice-3 proposal/specs
+
+1. **`deep_recursion.php` expects 99 recurse records, not 100.**
+   The slice-3 proposal sketched "exactly 100 `C:` lines" for a
+   `max_depth=100` deep-recursion run. The implemented harness
+   asserts **99 recurse records** because Zend observes the
+   top-level script body as a `closure:<file>:1` frame at
+   `virtual_depth = 1`. The recurse chain then accepts
+   `virtual_depth = 2..=100` = 99 calls; `recurse(N)` at
+   `virtual_depth = 101` drops. The total `C:` line count is
+   `99 + 1 (script body)` = 100 (matches the proposal's intent if
+   one counts the script-body frame). The `DROP: dropped_records`
+   line is `1902` (2001 recurse begins − 99 accepts), not 1900;
+   the +2 over the proposal's idealisation comes from the same
+   script-body confound. Spec/test wording amended to reflect
+   reality.
+
+2. **`cap_drops.php` does not assert "exactly K" — only that the
+   gate fires.** The slice-3 spec scenario "A `cap_drops.php`
+   trace emits a `DROP:` count consistent with the cap" was
+   re-interpreted because the script-body closure's dict-entry
+   contribution depends on the fixture's absolute path length,
+   which varies across CI hosts. The implemented harness
+   asserts `noop_accepts + dropped_records == 200`, `noop_accepts
+   > 0`, and `dropped_records > 0` — which proves the cap-gate
+   fires and the counter is accurate without depending on
+   host-specific path lengths. On the build host (`p ≈ 54`),
+   K = 12, drops = 188.
+
+3. **`cap_drops.php` requires `flush_bytes` override too.** The
+   slice-3 proposal mentioned only `php_analyze.buffer_cap_bytes`;
+   the implementation discovered that `config.rs::clamp_directive`
+   enforces `buffer_cap_bytes ≥ flush_bytes` (cross-field
+   constraint from Phase 1). A naive `buffer_cap_bytes=1024`
+   override is clamped up to `flush_bytes`'s default of `1 MiB`,
+   so the gate never fires. The harness now sets
+   `php_analyze.flush_bytes=1024` alongside
+   `php_analyze.buffer_cap_bytes=1024` so the cap actually
+   lands at 1024 bytes.
+
+4. **`Dictionary::contains_key` accessor added.** Slice 3's
+   `dict_miss_cost` helper needs a cheap hit/miss probe that does
+   **not** intern. The slice-1 `Dictionary` API did not expose this;
+   the slice-3 fix is a one-line `pub fn contains_key(&self, key:
+   &FunctionKey) -> bool` accessor that delegates to the underlying
+   `FxHashMap::contains_key`. No behaviour change to existing
+   callers; pure additive surface.
+
+5. **`Trace::new` widened to `Trace::new(identity, limits)`.** The
+   slice-2 RS-8 finding asked for a `RequestIdentity` struct to
+   collapse the four-positional `Trace::new`. Slice 3 needed to
+   add two cached threshold fields (`max_depth`, `buffer_cap_bytes`).
+   Per the proposal's task 3.2 ("extend `RequestIdentity` OR
+   introduce a sibling `TraceLimits`"), the implementation chose
+   the sibling `TraceLimits { max_depth: u32, buffer_cap_bytes:
+   usize }` parameter — keeps `RequestIdentity` focused on
+   "who is this request" and `TraceLimits` focused on "what are
+   the gates' thresholds", which read better at the call site.
+   `bootstrap::rinit_body` builds the `TraceLimits` from
+   `Config::max_depth.into()` and `Config::buffer_cap_bytes`.
+
+6. **A panic in `dump::write_trace_if_path_set` would skip the
+   `accounting::sub` step.** Slice-3 task 7.2 asked to confirm the
+   subtract runs even on a panic. In practice, the subtract is
+   inside `rshutdown_release_trace` after the dump-write call site
+   (`#[cfg(feature = "recorder-dump")]` block), so a dump-write
+   panic would bypass the subtract for that one trace. The
+   `bootstrap::rshutdown` `catch_unwind` then unwinds the rest;
+   the next request starts with a slightly-stale `BYTES_IN_MEMORY`
+   snapshot. Per `SPECIFICATION.md` §2.4 (Relaxed ordering, soft
+   target), the bounded drift is acceptable. A future cleanup
+   could move the subtract to before the dump-write, but the
+   tradeoff is "if the dump-write succeeds, the budget is exact;
+   if it panics, the budget over-counts by one trace's contribution
+   until process restart" — both acceptable. Recorded here, not
+   amended in code.
+
+   **Update (DCR-1 round-1 fix):** the reviewer disagreed with
+   keeping the asymmetry. The subtract now runs **before** the
+   dump-write in `rshutdown_release_trace`; the budget stays exact
+   even if a downstream hand-off panics, and the order matches
+   what Phase 4's shipper will inherit ("release budget, then
+   publish to sink"). See the round-1 fix-status section below.
+
+#### Test-count delta
+
+| Phase | Lib tests | Integration tests | Notes |
+| --- | --- | --- | --- |
+| Slice-2 round-2 (pre-slice-3) | 101 (debug) / 101 (release) | 1 spike + 1 recorder (gated) | Baseline after `1e4779a Merge pull request #5`. |
+| Slice-3 round-1 | 133 (debug) / 134 (release) | 1 spike + 1 recorder (gated) | +32 tests in debug (one cfg-gated release-only). +31 in net surface. |
+
+Per-module breakdown of slice-3 additions:
+- `recorder::accounting::tests`: 3 (add/sub/snapshot/reset).
+- `recorder::types::tests`: 5 (drop_counter, virtual_depth,
+  TraceLimits caching, record_drop, AD-9 isolation).
+- `recorder::observer::tests`: 17 (5 depth-gate, 5 cap-gate,
+  5 LIFO pairing, 3 RSHUTDOWN subtract, 2 invariants, 1 release-
+  only underflow defense, 1 debug LIFO consume baseline).
+- `recorder::dump::tests`: 2 (DROP: line presence + value).
+
+#### Gates evidence (final, on build host PHP 8.4.21)
+
+```
+cargo fmt --check                                                clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  133 + 1 + 1, 0 failed
+cargo test --release --lib --all-features                        134, 0 failed
+PHP_ANALYZE_RUN_RECORDER=1 cargo test \
+    --test recorder_observer --features recorder-dump            1 passed
+openspec validate recorder-depth-and-cap-drops --strict          valid
+```
+
+#### Out-of-scope, queued for follow-up
+
+- **`flush_records` / `flush_bytes` threshold-driven flushes** —
+  Phase 4 (shipper). Slice 3 deliberately leaves the buffer to
+  grow unbounded inside one request and to be discarded at
+  RSHUTDOWN.
+- **`PendingBatch::drop_counter: Arc<AtomicU64>` field** — Phase 4
+  will clone `Trace::drop_counter` into the batch when the
+  shipper channel exists. The `Trace` field is already in place.
+- **`meta.dropped_records` wire field** — Phase 3 (wire encoder).
+  The source of truth lives on `Trace::drop_counter` after this
+  slice.
+- **`E_NOTICE` log line distinguishing buffer-cap vs channel-full
+  drops** — Phase 4 (R-13 mitigation). Slice 3's buffer-cap drop
+  path is silent; the dump's `DROP:` line is the only signal in
+  this slice.
+- **AC-RC-5 hot-path zero-alloc assertion** — Phase 5. Slice 3
+  inherits slice 2's `// NOTE for Phase 5` comment near the
+  dict-miss `to_owned()` allocations.
+
+---
+
 ### Architectural note — `FcallInfo<'a>` → `RawCallSite<'a>`
 
 The RO-4 fix forced a change to the categorise input type:
@@ -1990,3 +2143,487 @@ upstream borrowed one. If upstream ever widens
 `FcallInfo`'s string fields, `RawCallSite` can collapse back
 into a thin adapter; until then, the local type is the
 correctness substrate.
+
+---
+
+## Code Review — branch `feat/recorder-depth-and-cap-drops` (round 1)
+
+**Reviewer:** Claude Code
+**Date:** 2026-05-21
+**Scope:** Two commits since `main` — `88e7411` (recorder code) and
+`fbe5dfe` (integration fixtures). Diff is ~1700 lines across 12 files,
+~70 % of which is tests + the existing C-10 documentation.
+**Specification:** `SPECIFICATION.md` §3.2 (overflow policies), §2.4
+(memory accounting), §4.1.2 (Trace shape), §8.3 NFR-REL-1.
+**Gates verified locally:** `cargo fmt --check` clean, `cargo clippy
+--all-targets --all-features -- -D warnings` clean, `cargo test --lib
+--all-features` 133 passed.
+**Overall recommendation:** REQUEST CHANGES (one MAJOR fix worth doing
+on-branch — DCR-1; the rest are minor and can be deferred).
+
+### Summary
+
+Slice 3 lands the §3.2 overflow policies (`max_depth` depth gate,
+`buffer_cap_bytes` byte gate), introduces the per-trace
+`Arc<AtomicU64>` drop counter (AD-9) and process-wide
+`BYTES_IN_MEMORY` (§2.4), and extends the diagnostic dump with a
+`DROP:` summary line plus two integration fixtures
+(`deep_recursion.php`, `cap_drops.php`). The implementation closely
+tracks the proposal. C-10 documents six deviations from the proposal,
+all of which I reviewed and agree with.
+
+The substrate is clean: the new `accounting` submodule is small and
+explicit about ordering choices, `Trace` grows three well-named fields
+plus the cached `TraceLimits` sibling, and the LIFO `dropped_begins`
+matcher is the right shape for begin/end pairing through drops. The
+test coverage is excellent — 32 new lib tests covering depth gate,
+cap gate, LIFO pairing, RSHUTDOWN subtract, and two cfg-gated tests
+for the release-only saturating defenses.
+
+The findings below are mostly about asymmetries between the
+cap-gate's *projection* and the cap-gate's *actual billing*, a
+test-isolation gap that only matters under parallel execution, and a
+panic-ordering issue in `rshutdown_release_trace` that C-10 itself
+flagged. None are correctness bugs in the slice-3 acceptance-criteria
+sense; they are quality-of-implementation issues that future slices
+will inherit.
+
+### MAJOR findings
+
+#### DCR-1: `rshutdown_release_trace` subtracts AFTER the dump-write, so a dump-write panic leaks the trace's contribution
+
+**File:** `crates/php-analyze/src/recorder/observer.rs:113-133`
+**Severity:** Major (test-only impact today; bad pattern to inherit
+into Phase 4's shipper hand-off)
+**Already noted:** C-10 deviation #6 records this and decides not to
+amend. I disagree — the fix is two lines and removes a footgun.
+
+The current ordering is:
+
+```rust
+pub fn rshutdown_release_trace() {
+    CURRENT_TRACE.with(|slot| {
+        let trace = slot.borrow_mut().take();
+        #[cfg(feature = "recorder-dump")]
+        if let Some(trace) = trace.as_ref() {
+            crate::recorder::dump::write_trace_if_path_set(trace);
+        }
+        if let Some(trace) = trace.as_ref() {
+            accounting::sub(trace.buffer_estimated_bytes);
+        }
+        drop(trace);
+    });
+}
+```
+
+If `write_trace_if_path_set` panics (currently impossible in practice
+— the function `eprintln!`s on `io::Error` rather than propagating —
+but future edits could regress this), the unwind skips the
+`accounting::sub` and leaves the trace's bytes billed forever. The
+`bootstrap::rshutdown` `catch_unwind` then swallows the panic and the
+process keeps running with a permanently inflated `BYTES_IN_MEMORY`.
+Per `SPECIFICATION.md` §2.4 the budget is a "soft target", so this
+isn't a correctness violation — but it is a slow leak that compounds
+across requests in an FPM worker's lifetime.
+
+C-10 frames this as "if the dump-write succeeds, the budget is
+exact; if it panics, the budget over-counts by one trace's
+contribution until process restart" and argues both are acceptable.
+The asymmetry is unnecessary: the dump-write only *reads*
+`trace.buffer_estimated_bytes` (to nothing; it writes `drop_counter`
+and `trace_id` instead), so the subtract can run first without
+affecting what the dump writes:
+
+```rust
+pub fn rshutdown_release_trace() {
+    CURRENT_TRACE.with(|slot| {
+        let trace = slot.borrow_mut().take();
+        // Subtract FIRST so the budget is exact even if the dump
+        // writer (or any future hand-off) panics. The dump only
+        // reads drop_counter/trace_id, neither of which depend on
+        // the per-trace estimator.
+        if let Some(trace) = trace.as_ref() {
+            accounting::sub(trace.buffer_estimated_bytes);
+        }
+        #[cfg(feature = "recorder-dump")]
+        if let Some(trace) = trace.as_ref() {
+            crate::recorder::dump::write_trace_if_path_set(trace);
+        }
+        drop(trace);
+    });
+}
+```
+
+This also lines up better with the Phase-4 shipper handoff: the
+shipper will move the subtract to "subtract when batch consumed",
+and having the slice-3 subtract happen *before* the diagnostic
+sink writes is the same shape Phase 4 will inherit.
+
+**Action:** swap the two `if let Some(trace) = trace.as_ref()`
+blocks. The two-test pair
+(`rshutdown_returns_atomic_to_zero_after_balanced_trace`,
+`two_consecutive_request_cycles_keep_zero_balance_invariant`) already
+pins the post-fix contract.
+
+### MINOR findings
+
+#### DCR-2: Cap-gate `would_add` includes `CALL_RECORD_FIXED_BYTES` but the actual bill at begin doesn't — under nested calls the cap can be overshot
+
+**File:** `crates/php-analyze/src/recorder/observer.rs:614-623,
+730-773` and `crates/php-analyze/src/recorder/types.rs:415-419`
+**Severity:** Minor (design choice per D-3; documented; spec calls
+the cap a "soft target")
+
+The cap-gate computes `would_add = CALL_RECORD_FIXED_BYTES +
+dict_miss_cost(trace, categorised)` and rejects when
+`accounting::snapshot() + would_add > buffer_cap_bytes`. On the
+accept path, only the **dict-miss** bytes are billed at begin (via
+`push_dict_entry_via_intern → accounting::add`). The
+`CALL_RECORD_FIXED_BYTES` portion is billed at end (via `push_record
+→ accounting::add`). This means consecutive nested begins all see
+the same snapshot at begin time, all project the same conservative
+`would_add`, and all accept — then each end fires sequentially and
+bills 64 bytes, potentially overshooting the cap by `(in_flight - 1)
+× 64` bytes per trace.
+
+The `Trace::push_record` doc comment (types.rs:404-414) frames this
+as the billing-split contract and claims "the gate at begin still
+under-estimates by at most one `CALL_RECORD_FIXED_BYTES`". That's
+true *per call considered in isolation* but not true under
+unbalanced nesting where multiple in-flight ends each contribute
+their 64 bytes. Worked example:
+
+- `cap = 256`, `snapshot = 128` (from prior dict bills).
+- Begin A: `would_add = 64 + 0 (hit)`. Check `128 + 64 = 192 ≤ 256`.
+  Accept. Bill 0 (dict hit). Snapshot stays 128.
+- Begin B (nested under A): `would_add = 64 + 0`. Check
+  `128 + 64 = 192 ≤ 256`. Accept. Snapshot stays 128.
+- Begin C (nested under B): `would_add = 64 + 0`. Check
+  `128 + 64 = 192 ≤ 256`. Accept. Snapshot stays 128.
+- End C: bill 64. Snapshot = 192.
+- End B: bill 64. Snapshot = 256.
+- End A: bill 64. Snapshot = 320 > cap. Overshoot.
+
+Two paths to fix, both defensible:
+
+- **Bill the record at begin** (the "most pessimistic" stance the
+  proposal sketched as one option). One line in
+  `begin_with_snapshots` after the accept decision:
+  `accounting::add(CALL_RECORD_FIXED_BYTES)`. Then `push_record`
+  drops its `accounting::add` (keeps the estimator bump). Trade-off:
+  the per-trace estimator and the global atomic diverge between
+  begin and end by exactly `CALL_RECORD_FIXED_BYTES` per active
+  frame, which complicates the `rshutdown_release_trace` subtract
+  (it would need to subtract `buffer_estimated_bytes` only, not
+  including in-flight frame bytes — which is what happens today
+  since `buffer_estimated_bytes` only grows in `push_record`).
+- **Re-check the cap at end** (rejected — too late to drop; the
+  observer hooks are already past the FFI boundary).
+- **Leave it as-is** (current choice). Per the spec's "soft target"
+  language, the overshoot under deep nesting is bounded and the
+  cumulative effect across many traces is zero (each trace's
+  contribution is subtracted at RSHUTDOWN). Document the limit
+  explicitly.
+
+If left as-is, please replace the
+`push_record` doc paragraph with one that names the
+nested-overshoot failure mode by name, rather than the current "at
+most one `CALL_RECORD_FIXED_BYTES`" claim which is misleading. A
+regression test that drives a 10-deep nesting under a tight cap
+and asserts the post-end snapshot is bounded by `cap + max_depth ×
+CALL_RECORD_FIXED_BYTES` would pin the worst-case envelope.
+
+**Action:** at minimum, amend `Trace::push_record`'s doc comment to
+name the nested-overshoot mode explicitly. Preferred: switch to
+bill-at-begin so the cap-gate's `would_add` and the actual budget
+mutation agree.
+
+#### DCR-3: `accounting::sub` underflow risk is documented but not enforced
+
+**File:** `crates/php-analyze/src/recorder/accounting.rs:51-60`
+
+The doc comment says "The caller is responsible for ensuring `bytes`
+does not exceed the current value; underflow would wrap and corrupt
+the budget." The single production caller
+(`rshutdown_release_trace`) feeds `trace.buffer_estimated_bytes`,
+which is bounded by what the recorder previously added — so in the
+happy path no underflow. But the release-path recovery branch in
+`rinit_allocate_trace` (observer.rs:95-98) also subs
+`stale.buffer_estimated_bytes`, and if a future slice ever
+double-subs (e.g., a Phase-4 shipper that subs on batch consumed AND
+on trace release for the same bytes) the wrap would silently
+corrupt the budget.
+
+A `fetch_update`-loop with a `saturating_sub` enforcement at the
+function level would cost one CAS on the rare contention case but
+turn an undetectable budget corruption into a no-op. The
+performance cost is invisible at the `sub` call rate (one per
+RSHUTDOWN, plus one per future Phase-4 batch consumed).
+
+**Action:** consider changing `accounting::sub` to use
+`fetch_update(|cur| Some(cur.saturating_sub(bytes)))` so underflow
+becomes a saturated no-op instead of a corrupting wrap. Worth doing
+before Phase 4 adds the second sub site. Not blocking.
+
+#### DCR-4: Tests that touch `CURRENT_TRACE` but not the accounting atomic don't acquire the test lock — race window with parallel tests that do
+
+**File:** `crates/php-analyze/src/recorder/observer.rs` — tests
+`rshutdown_release_trace_drops_the_slot` (977),
+`rshutdown_release_trace_on_empty_slot_is_a_noop` (988),
+`with_current_trace_returns_none_when_slot_is_empty` (1036),
+`recorder_begin_with_no_active_trace_is_a_noop` (1508)
+
+These tests call `rshutdown_release_trace()` without acquiring
+`account_guard()` first. Each call invokes
+`accounting::sub(trace.buffer_estimated_bytes)` when the slot is
+populated. In every case I traced, the populated trace's
+`buffer_estimated_bytes` is `0` (fresh-from-`Trace::new`, no
+begins fired), so the `sub(0)` is a no-op on the atomic.
+
+The risk: a future test that ends up in the same thread's slot
+with a non-zero `buffer_estimated_bytes` (e.g., someone adds a
+test that does `rinit_allocate_trace` + several `begin`s but
+forgets the `account_guard()`) would silently corrupt the
+`BYTES_IN_MEMORY` value another test holding the lock is reading.
+
+Two options:
+
+- **Lock-hygiene-by-convention**: add a one-line comment to each
+  such test saying "no `account_guard()` needed: this path never
+  bills". This documents the invariant and makes future additions
+  obvious.
+- **Lock-hygiene-by-default**: make `rshutdown_release_trace`'s
+  `accounting::sub` skip when `bytes == 0`. Cheap and removes the
+  whole class of "did I need the guard?" questions.
+
+Either way, the cost is low and the failure mode (sporadic test
+flake under high `cargo test` parallelism) is annoying to debug.
+
+**Action:** add the convention comments OR add the `if bytes > 0`
+short-circuit. Not blocking.
+
+#### DCR-5: `dump::tests` set/remove `PHP_ANALYZE_DUMP_PATH` without serialising — race risk under `cargo test` parallelism
+
+**File:** `crates/php-analyze/src/recorder/dump.rs:357-503`
+
+The four tests that exercise `write_trace_if_path_set` mutate the
+`PHP_ANALYZE_DUMP_PATH` env var directly. The existing `// SAFETY:`
+comment (358-367) acknowledges that `cargo test` parallelises across
+threads and that the env-var mutation is racy in Rust 2024. Two
+parallel tests can sequence `set(A), set(B), write(→B), remove(),
+read(A)` and one of them sees an empty file.
+
+The acquired `account_guard()` doesn't help because the lock is
+keyed to the accounting atomic, not the env var. A separate
+`DUMP_PATH_TEST_LOCK` mutex (or, simpler, the same mutex used as a
+"recorder-dump tests" guard) would close the race. Alternatively,
+the dump path could be threaded through the function signature
+rather than env-var-based — but that's a bigger API change and the
+env var is fine for the integration harness.
+
+**Action:** add a per-module `DUMP_PATH_TEST_LOCK: Mutex<()>`
+acquired alongside `account_guard()` in the four affected tests.
+One additional line per test.
+
+#### DCR-6: `cat_for` test helper leaks one `Box<RawCallSite>` per call
+
+**File:** `crates/php-analyze/src/recorder/observer.rs:1535-1544`
+
+```rust
+fn cat_for(name: &'static str) -> Categorised<'static> {
+    let site = Box::leak(Box::new(stub_site(...)));
+    categorise(site)
+}
+```
+
+The leak is bounded by the test count, but every slice-3 gate test
+uses this helper (often more than once). At ~30 tests calling it ~3
+times each, that's ~90 leaked `RawCallSite` boxes per `cargo test`
+run. Not a correctness issue and not visible to operators, but a
+better pattern would be to return `(Box<RawCallSite>,
+Categorised<'static>)` and let the caller hold the box on the
+stack. The lifetime juggling is a bit ugly because `Categorised`
+borrows from the box, but a `with_cat(name, |cat| { ... })`
+closure helper would sidestep the lifetime gymnastics.
+
+**Action:** consider the closure form on a future test refactor.
+Not blocking.
+
+#### DCR-7: `assert_dropped_records`'s `binary` parameter is part of the message — minor: integration test asserts depth-overflow count `1902`, not `1900`
+
+**File:** `crates/php-analyze/tests/recorder_observer.rs:466`
+
+The deep_recursion harness asserts `dropped_records == 1902`. C-10
+deviation #1 explains why (the script-body closure consumes one
+depth slot, leaving 99 for `recurse`; 2001 begins − 99 accepts =
+1902 drops). This is correct given the implementation. The
+proposal's "1900" number was an idealisation that ignored the
+script-body frame.
+
+I'm flagging this only because the proposal's tasks.md may still
+say "1900" and a future reviewer comparing tasks to the harness
+will see the mismatch. The OpenSpec change's tasks.md should be
+updated to match what was implemented, OR add a one-line "as
+implemented, see C-10 #1 for the +2" annotation.
+
+**Action:** update `openspec/changes/recorder-depth-and-cap-drops/tasks.md`
+(if it still says 1900) to reflect the script-body confound, or
+add the inline annotation.
+
+### Positive highlights
+
+- **`accounting` submodule is the right shape.** Small,
+  ordering-explicit, callers-go-through-functions, with a
+  `cfg(test)` reset + lock pair that other modules can re-use.
+  The `Relaxed` ordering choice is correctly justified by §2.4 of
+  the spec.
+- **`TraceLimits` parameter on `Trace::new` is cleaner than
+  extending `RequestIdentity`.** Keeps "who is this request" and
+  "what are the thresholds" as separate concerns at the call site.
+- **`Dictionary::contains_key` is exactly the cheapest accessor
+  the cap-gate needs.** The naming convention (`miss_cost`
+  inverting `hit_cost = 0`) reads well at the call site.
+- **C-10 documents the six deviations from the proposal** with
+  precise reproduction values (K=12, drops=188 on the build
+  host). Future reviewers won't have to reverse-engineer the
+  arithmetic.
+- **`virtual_depth_never_underflows_under_an_adversarial_end_then_begin_sequence`**
+  is the right kind of release-only test for the
+  `saturating_sub` defense — pairs with the slice-2 RO-3 release-
+  only test pattern.
+- **LIFO pairing test
+  (`lifo_pairing_accept_drop_accept_returns_two_records_in_pop_order`)
+  is excellent.** It walks the three-call interleaving with
+  explicit comments about why dict hits avoid the would_add
+  miss-cost projection, and asserts the post-pop `call_id` order.
+
+### Specification compliance
+
+- ✅ AC-RC-1 (modulo `max_depth` / `buffer_cap_bytes` drops):
+  retired by slice 3 per the proposal. The depth-gate and
+  cap-gate paths are exercised by 10+ tests.
+- ✅ AC-RC-3 (depth overflow → no crash, overflow accounted):
+  retired by slice 3. `deep_recursion.php` end-to-end + the
+  `begin_at_max_depth_plus_one_is_dropped_and_bumps_counter`
+  unit test.
+- ✅ AD-9 (per-trace `Arc<AtomicU64>` drop counter): implemented;
+  three tests pin the per-trace independence invariant.
+- ✅ §2.4 / §3.2 `BYTES_IN_MEMORY` atomic: implemented with
+  `Relaxed` ordering and the documented add/sub call sites.
+- ⚠️ §3.2 buffer-cap soft-target enforcement: implemented but with
+  the nested-overshoot caveat in DCR-2. The spec's "soft target"
+  language covers this, but the in-code comments overstate the
+  tightness of the bound.
+- ⚠️ Cap-gate-then-RSHUTDOWN budget exactness: works in the
+  happy path, fragile under a dump-write panic (DCR-1).
+- ⏭️ AC-RC-5 (zero-alloc hot path): correctly deferred to Phase 5
+  per the proposal.
+- ⏭️ `flush_records` / `flush_bytes` flushes, `meta.dropped_records`
+  wire field, `E_NOTICE` log line: all correctly deferred to
+  Phase 3/4.
+
+### Overall recommendation
+
+**REQUEST CHANGES** for DCR-1 (the two-line swap in
+`rshutdown_release_trace`) — the fix is small, removes a footgun,
+and lines up better with the Phase-4 shipper handoff.
+
+DCR-2 is the most substantive open question. If you choose to keep
+the current billing split, please amend the `Trace::push_record`
+doc comment to name the nested-overshoot mode explicitly (the
+current "at most one `CALL_RECORD_FIXED_BYTES`" framing is
+misleading). If you choose to switch to bill-at-begin, that's a
+~5-line change with a corresponding `push_record` simplification.
+
+DCR-3 through DCR-7 are minor and can be batched into a slice-3
+fix-round commit alongside DCR-1, or deferred to a follow-up
+change. None of them block merging.
+
+Test coverage and documentation are excellent. C-10 is the right
+shape for an in-flight deviation log and saves the reviewer 30
+minutes of arithmetic.
+
+---
+
+## C-11: Slice-3 round-1 review-fix status (branch `feat/recorder-depth-and-cap-drops`)
+
+**Date:** 2026-05-21
+**Reviewer findings:** DCR-1 … DCR-7 (see "Code Review — branch
+`feat/recorder-depth-and-cap-drops` (round 1)" above).
+**Implementer response:** the one MAJOR finding (DCR-1) and one
+doc-only amendment for the design-question MINOR (DCR-2) landed on
+the same branch as a fix-round, following the precedent set by
+slice-2's C-9 round-2 fix-commits and slice-1's RS-1..RS-7
+round-2 fix-commits. The remaining MINOR / NIT items (DCR-3 …
+DCR-7) are queued as follow-up OpenSpec changes per the
+reviewer's own §"Overall recommendation" guidance ("can be batched
+into a slice-3 fix-round commit alongside DCR-1, or deferred to a
+follow-up change. None of them block merging").
+
+### What changed on this branch in the fix-round
+
+| ID | Status | Implementation |
+| --- | --- | --- |
+| DCR-1 | Closed | `rshutdown_release_trace` now subtracts `trace.buffer_estimated_bytes` from `BYTES_IN_MEMORY` **before** invoking the diagnostic dump. The dump only reads `drop_counter` / `trace_id`, neither of which depends on the per-trace estimator, so the swap is behaviour-preserving on the happy path AND removes the "dump-write panic leaks one trace's contribution forever" footgun C-10 #6 had accepted. The C-10 #6 note is updated in-place to point at the round-1 resolution. No new tests were needed — the existing `rshutdown_returns_atomic_to_zero_after_balanced_trace` and `two_consecutive_request_cycles_keep_zero_balance_invariant` tests already pin the post-fix invariant (both pass post-swap). The new comment in `rshutdown_release_trace` cites DCR-1 and explains the Phase-4 shape alignment ("release budget, then publish to sink"). |
+| DCR-2 | Closed (doc-only) | `Trace::push_record`'s billing-split doc paragraph is replaced. The new wording explicitly names the nested-overshoot failure mode (multiple in-flight `begin`s seeing the same pre-bump snapshot; ends each billing `CALL_RECORD_FIXED_BYTES` sequentially; post-end snapshot overshoots by `(in_flight - 1) * CALL_RECORD_FIXED_BYTES` per trace, bounded by `max_depth * CALL_RECORD_FIXED_BYTES`), cites §3.2's "soft target" framing as the spec-side justification, and references this DCR-2 note for the worked example. The implementation is unchanged — per the user's decision to amend doc only, the bill-at-begin alternative is rejected in favour of the lockstep-per-end design the slice already ships. No tests change. |
+
+### Deferred to follow-up OpenSpec changes (DCR-3 … DCR-7)
+
+Each gets its own change + branch per the "one change per branch"
+rule. Listed by reviewer's overall-recommendation order so the
+next session can pick them up without re-reading the full review:
+
+- **DCR-3** (`accounting::sub` underflow risk documented but not
+  enforced). Follow-up `accounting-saturating-sub`: switch
+  `accounting::sub` to `fetch_update(|cur| Some(cur.saturating_sub(bytes)))`
+  so a future double-sub becomes a saturated no-op instead of a
+  corrupting wrap. Worth doing before Phase 4 adds the second sub
+  site at "batch consumed".
+- **DCR-4** (tests touching `CURRENT_TRACE` but not the accounting
+  atomic don't acquire `account_guard()` → race window under
+  parallel tests). Follow-up `recorder-test-lock-hygiene`:
+  either add one-line "no `account_guard()` needed: bills zero"
+  comments to the four named tests, OR short-circuit
+  `accounting::sub` when `bytes == 0` to remove the whole class
+  of "did I need the guard?" questions.
+- **DCR-5** (`dump::tests` mutate `PHP_ANALYZE_DUMP_PATH` env var
+  without serialising → race risk under `cargo test`
+  parallelism). Follow-up `recorder-dump-test-lock`: add a
+  per-module `DUMP_PATH_TEST_LOCK: Mutex<()>` acquired alongside
+  `account_guard()` in the four affected tests.
+- **DCR-6** (`cat_for` test helper `Box::leak`s one
+  `RawCallSite` per call). Follow-up `recorder-test-helper-no-leak`:
+  reshape `cat_for` into a `with_cat(name, |cat| { ... })`
+  closure form so the box lives on the test's stack frame.
+  Bounded by test count today; cosmetic.
+- **DCR-7** (`proposal.md` for this change still says "1900"
+  where the harness asserts "1902"). Already resolved in
+  `tasks.md` §9.4 with the +2 explanation; `proposal.md` is the
+  historical proposal narrative, so the divergence is acceptable
+  per the OpenSpec norm that proposals freeze at archive time.
+  No follow-up change needed.
+
+### Gates evidence (post-fix-round, build host PHP 8.4.21)
+
+```
+cargo fmt --check                                                clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  133 + 1 + 1, 0 failed
+cargo test --release --lib --all-features                        134, 0 failed
+openspec validate recorder-depth-and-cap-drops --strict          valid
+```
+
+(Integration test `PHP_ANALYZE_RUN_RECORDER=1 cargo test --test
+recorder_observer --features recorder-dump` is unchanged and
+remains green against `php8.4` on this host; the local PHP 8.3
+gap is closed in CI per C-7.)
+
+### Test-count delta
+
+No new tests landed in this fix-round — DCR-1 is covered by the
+existing `rshutdown_returns_atomic_to_zero_after_balanced_trace`
+and `two_consecutive_request_cycles_keep_zero_balance_invariant`
+tests (both pin the budget-returns-to-zero invariant the swap
+preserves), and DCR-2 is a doc-only amendment. Test counts match
+the pre-fix-round baseline (133 debug / 134 release).
+
