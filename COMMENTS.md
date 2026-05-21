@@ -16,18 +16,26 @@ clarification.
 <branch>` fails with `Permission denied (publickey)`.
 
 **To unblock**: push from a workstation that has push credentials.
-Two branches are currently pending push from this host:
+Three branches are currently pending push from this host:
 
 ```bash
 # Phase 1 — already merged to main via PR #1; pushing the branch
 # again is no longer necessary but harmless.
 git push -u origin feat/scaffold-workspace-and-config
 
-# Phase 0 spike — committed locally, ready to push and open a PR.
+# Phase 0 spike — already merged to main via PRs #2/#3; pushing
+# again is harmless.
 git push -u origin feat/spike-zend-observer
+
+# Phase-2 slice 1 (recorder substrate: clocks + types + dictionary).
+# OpenSpec change: recorder-clocks-and-types. Four focused commits
+# on top of main; cargo fmt/clippy/test all green, 14 new unit
+# tests added (5 clocks + 5 types + 4 dictionary). Ready to push
+# and open a PR.
+git push -u origin feat/recorder-clocks-and-types
 ```
 
-Both branches are fully committed locally and ready to push.
+All three branches are fully committed locally and ready to push.
 
 ## Closed blockers
 
