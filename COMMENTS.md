@@ -3856,3 +3856,230 @@ plus a doc-string rewrite — both targeting the reviewer's
 explicit "before slice 2 lands" wording, with no behaviour change
 visible to existing tests.
 
+## Slice-4-shipper-producer-wiring deviations and notes
+
+### C-15 — Slice-4 slice-2 (`recorder-flushes-into-shipper`) implementation notes
+
+This entry records the in-flight deviations discovered while
+implementing Phase 4 slice 2 — the Recorder→Shipper producer
+wiring. The slice ships no `SPECIFICATION.md` or README changes;
+the deviations below are local to the OpenSpec change's specs
+and to this file.
+
+**Status:** branch `feat/recorder-flushes-into-shipper`, OpenSpec
+change `recorder-flushes-into-shipper`, `openspec validate
+recorder-flushes-into-shipper --strict` is green. All gates green:
+`cargo fmt --all --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test --all --all-features` (195 lib + 1 spike + 1
+recorder-integration (gated) + 12 stub round-trip = 209, 0 failed),
+`cargo test --release --lib --all-features` (196), and
+`PHP_ANALYZE_RUN_RECORDER=1 cargo test --test recorder_observer
+--features recorder-dump` against `php8.4` on the build host.
+
+#### Deviations from the slice-4 slice-2 proposal / specs
+
+1. **`Trace::flush_into_pending_batch` is `pub(crate)`, not
+   `pub`.** The accessor is called from `recorder::observer` (the
+   end-handler accept tail and `rshutdown_release_trace`) and
+   from `recorder::flush::tests`, both inside the crate. A `pub`
+   visibility would expose the post-take invariant
+   (`buffer_estimated_bytes = 0`, `buffer/new_entries` emptied) to
+   downstream callers that the slice does not contract for. The
+   `pub(crate)` keeps the surface inside the crate without
+   weakening the invariant. The corresponding spec wording uses
+   `pub(crate)` already; this is a wording-match, not a
+   deviation per se — recorded so future readers don't grep for
+   "pub fn flush_into_pending_batch".
+
+2. **No-Sender arm uses `debug_assert!(false, ...)` rather than
+   `debug_assert!(<condition>, ...)`.** Clippy's
+   `clippy::assertions_on_constants` is happy with the form;
+   the slice-1 `unreachable!` precedent uses the same shape for
+   "this branch should never be reached in tests". Production
+   builds compile the assert out, so the no-Sender arm reduces
+   to `accounting::sub + return`. The `#[cfg(not(debug_assertions))]`
+   release-only test (`try_send_batch_no_sender_arm_subtracts_without_counter_bump`)
+   exercises the release shape directly.
+
+3. **`recorder::dump::record_flush` writes the `F:` block to disk
+   in real time, not via a thread-local accumulator.** Task §7.2
+   sketched a `trace.dump_log: Vec<DumpLine>` field for the
+   producer paths to append to and `write_trace_if_path_set` to
+   flush. The implemented design instead writes each flush block
+   (the `F:` line + the batch's `D:` and `C:` lines) directly to
+   the dump file at flush time; `write_trace_if_path_set` then
+   writes only the trailing `DROP:` / `RSHUTDOWN:` lines. This
+   keeps the `recorder-dump` feature gate hermetic (no production
+   field on `Trace`, no `#[cfg(feature = "recorder-dump")]`
+   field-bearing struct) and works correctly with multiple
+   batches per request — the dump's call ordering already matches
+   the wire ordering the Phase-4-slice-3 encoder will inherit.
+   The trade is one extra file-open per flush in dump-enabled
+   runs; for diagnostic-only fixtures (default flush_records
+   ~10⁴, so at most a handful of flushes per request) this is
+   invisible.
+
+4. **`TraceLimits::from(&Config)` is a `From` impl, not a
+   constructor.** Task §1.4 said "if no such impl exists, add
+   one alongside the existing plumbing"; the choice between
+   `impl From<&Config>` and a free `fn from_config(...) ->
+   TraceLimits` is stylistic. The `From` impl is idiomatic Rust
+   ("convert a `&Config` into a `TraceLimits`") and keeps the
+   call site (`TraceLimits::from(config)`) self-documenting at
+   the bootstrap layer.
+
+5. **Two slice-3 RSHUTDOWN tests had to install a test channel and
+   inline-emulate the Section-6 shipper subtract** to keep the
+   slice-3 "atomic returns to zero at RSHUTDOWN" invariant.
+   `rshutdown_returns_atomic_to_zero_after_balanced_trace` and
+   `two_consecutive_request_cycles_keep_zero_balance_invariant`
+   were authored before the producer wiring existed and ran
+   `RINIT → accepts → RSHUTDOWN` with no Sender installed. After
+   slice 2, RSHUTDOWN's flush attempts to `try_send` and trips
+   the no-Sender `debug_assert!`. The fix is mechanical: each
+   test installs a `bounded(8)` channel into the shipper's
+   `SENDER_SLOT` via `shipper::install_test_sender`, runs the
+   workload, then drains the queued batches and subtracts each
+   batch's `size_estimate` from accounting to emulate the
+   shipper's consume-path subtract. The invariant ("atomic
+   returns to zero across the full request cycle") survives the
+   producer-wiring change.
+
+6. **`threshold_flush.php` integration fixture asserts the
+   script-body residual lands as the RSHUTDOWN flush.** The
+   fixture runs `noop()` 10 000 times under
+   `flush_records = 5000`. The slice-2 cadence is exactly:
+   - mid-request flush of 5000 noop records (records-trigger)
+   - mid-request flush of 5000 noop records (records-trigger)
+   - RSHUTDOWN flush of 1 record (the script body's own `end` —
+     observed as `closure:<file>:1` per C-5 #2) — rshutdown-trigger
+
+   Total: 3 `F:` lines, 10 001 `C:` records. This is the first
+   integration test that pins the slice-2 cadence end-to-end
+   against a real PHP process; the unit tests in
+   `recorder::observer::tests` cover the predicate in
+   isolation, and the harness fixture covers the full
+   `RINIT → accepts → RSHUTDOWN` round-trip.
+
+#### Manual host verification (build host PHP 8.4.21)
+
+The §10 manual checks reproduce the spec scenarios at the OS
+level. All runs commit to the same `target/release/libphp_analyze.so`
+built at HEAD.
+
+```
+$ cargo build --release -p php-analyze       → libphp_analyze.so (~8 MB)
+
+$ php8.4 -d extension=$PWD/target/release/libphp_analyze.so \
+       -d php_analyze.server_url=http://localhost:8888 \
+       -d php_analyze.auth_token=dummy --ri php_analyze
+  → Status: enabled (true); all 14 directive rows render (incl.
+    flush_records, flush_bytes); auth_token redacted as ***; one
+    startup E_WARNING for http:// URL (TLS-recommendation).
+
+$ time php8.4 ... -r '<100 noop calls>'
+  → real 0m0.061s — well below the 5200 ms (shutdown_grace + 200 ms)
+    envelope (AC-PB-2 / AC-BS-4 satisfied).
+
+$ time php8.4 ... -d php_analyze.enabled=0 -r 'echo ok;'
+  → real 0m0.056s — disabled extension exits as fast as a
+    no-extension run (NFR-USE-2 satisfied).
+
+$ /proc/<pid>/task scan with extension enabled
+  → 2 threads: ['php8.4', 'php-analyze-shi']
+  with extension disabled
+  → 1 thread: ['php8.4']
+```
+
+The thread-count check satisfies AC-PB-1 (each enabled PHP
+process owns exactly one shipper thread after its first
+request) and the modified `extension-bootstrap` "Disabled
+extension spawns no background threads" scenario in one
+observation pair. The total-wall-time check satisfies
+AC-PB-2 / AC-BS-4. The slice-2 producer wiring did not
+regress any slice-1 wall-time property.
+
+#### Test-count delta
+
+| Phase | Lib tests | Integration tests | Notes |
+| --- | --- | --- | --- |
+| Slice-4 slice-1 (pre-slice-2) | 172 | 1 spike + 1 recorder + 12 stub round-trip | Baseline after `3017703 Merge PR #8`. |
+| Slice-4 slice-2 (this commit) | 195 (debug) / 196 (release) | 1 spike + 1 recorder (gated) + 12 stub round-trip | +23 lib tests. |
+
+Per-module breakdown of the 23 additions:
+- `recorder::types::tests::flush_into_pending_batch_*` and friends:
+  6 tests (the accessor + the `From<&Config>` + the new
+  `trace_new_caches_flush_thresholds_from_request_limits`).
+- `recorder::flush::tests::try_send_batch_*`: 4 tests in debug
+  (Ok / Full / Disconnected / debug_assert no-Sender); 4 in
+  release (the no-Sender debug_assert variant is replaced by the
+  no-Sender release variant — same test count per cfg).
+- `recorder::observer::tests::finish_call_record_*` and
+  `rshutdown_release_trace_*`: 7 new tests (4 for the
+  threshold predicate, 3 for the RSHUTDOWN final flush).
+- `shipper::tests::run_loop_*`: 4 new tests (the four consume-
+  path accounting balance checks, including the new
+  deadline-pass-with-no-residual variant).
+- `bootstrap::tests::trace_limits_from_resolved_config_*`: 1
+  test (the §8 plumbing assertion).
+- One slice-1 test (`run_loop_with_drain_past_deadline_abandons_queued_batches`)
+  is unchanged in count but its assertion is now sharper (the
+  batch-sum invariant survives the consume-path subtract).
+
+Release-build delta of +1 (196 vs. 195) is the slice-3 cap-gate
+test that's already feature-gated `#[cfg(not(debug_assertions))]`.
+
+#### Gates evidence (final, on build host PHP 8.4.21)
+
+```
+cargo fmt --all --check                                          clean
+cargo clippy --all-targets -- -D warnings                        clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  195 + 1 + 1 + 12 = 209, 0 failed
+cargo test --release --lib --all-features                        196, 0 failed
+PHP_ANALYZE_RUN_RECORDER=1 cargo test \
+    --test recorder_observer --features recorder-dump            1 passed (6 fixtures incl. threshold_flush.php)
+openspec validate recorder-flushes-into-shipper --strict         valid
+```
+
+#### Out-of-scope, queued for follow-up
+
+- **MessagePack encoding on the shipper thread** — next slice.
+  The current `run_loop` consumes batches and subtracts their
+  bytes from the budget but does not encode; the encoder slice
+  grows the `on_batch` step that calls `rmp_serde::to_vec_named`
+  and stamps `meta.dropped_records` from the now-shipped
+  `PendingBatch::drop_counter`.
+- **`ureq` POST (single attempt)** — subsequent slice.
+- **Retry/backoff + `E_NOTICE` log line distinguishing
+  buffer-cap vs channel-full drops** — subsequent slice. The
+  channel-full drop path is wired here; the operator-visible
+  log line awaits the retry-policy slice that also surfaces
+  retry-exhausts.
+- **R-2 (`shipper-exit-as-enum`)** — independent follow-up.
+  Slice 2 does not read `ShipperExit` from production code so
+  the struct shape stays as-is.
+- **R-4 (`startup-catch-unwind`)** — independent follow-up.
+  Slice 2 adds no new panic site to `startup` (the new
+  `TraceLimits::from(&Config)` path is panic-free by
+  construction), so R-4 stays dormant.
+- **R-5 (`spawn-failure-recovery`)** — independent follow-up.
+  Dormant in slice 2: a failed spawn at RINIT leaves
+  `SENDER_SLOT` populated, so `try_send_batch`'s Sender-present
+  arm runs; the batch lands in the channel with no reader and
+  `drain_and_join_at_mshutdown` sees a non-empty queue at the
+  deadline, which the slice-2 deadline-pass arm handles
+  correctly via the new `try_recv` drain.
+- **R-6 (`shipper-deadline-pass-integration-test`)** — partially
+  satisfied by slice 2's new `run_loop_deadline_pass_subtracts_size_estimate_for_abandoned_batches`
+  pure-Rust test; a real `run_loop`-with-slow-encoder
+  integration test arrives with the encoder slice.
+- **R-7 (`shipper-thread-name-fits-task-comm`)** — independent
+  follow-up. Manual verification confirms the truncation to
+  `php-analyze-shi`; cosmetic only.
+- **AC-RC-5 hot-path zero-alloc assertion** — Phase 5. The
+  `flush_into_pending_batch` accessor is zero-alloc by
+  construction (`mem::take` + `Arc::clone` + `MetaPartial`
+  with `Arc<str>` clones); the audit harness lands in Phase 5.
+
