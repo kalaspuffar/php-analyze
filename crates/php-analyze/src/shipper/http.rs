@@ -90,7 +90,6 @@ pub(super) fn run_with_retry(
     mut attempt: impl FnMut(u32) -> AttemptOutcome,
     mut sleep_fn: impl FnMut(Duration),
 ) -> OnBatchOutcome {
-    let mut last_reason = DropReason::Transport;
     for attempt_idx in 0..=retry_count {
         // Deadline check before launching an attempt. The slice-1
         // deadline-pass arm already drains the residual queue;
@@ -109,7 +108,6 @@ pub(super) fn run_with_retry(
                 return OnBatchOutcome::Sent;
             }
             AttemptOutcome::Failed(reason) => {
-                last_reason = reason;
                 if attempt_idx == retry_count {
                     // Final attempt failed. No more retries.
                     return OnBatchOutcome::Dropped {
@@ -122,8 +120,6 @@ pub(super) fn run_with_retry(
                 // would extend past the deadline collapses the
                 // remaining retries.
                 if let Some(d) = deadline {
-                    let wakeup = now().saturating_duration_since(Instant::now()) + sleep;
-                    let _ = wakeup; // not strictly needed but documents intent
                     if now() + sleep >= d {
                         return OnBatchOutcome::Dropped {
                             reason: DropReason::DeadlineExceeded,
@@ -135,13 +131,13 @@ pub(super) fn run_with_retry(
             }
         }
     }
-    // Unreachable: the loop returns from the inner `match` on every
-    // branch — but `for ..= retry_count` lets the compiler think the
-    // loop can finish naturally. Surface a defensive `Dropped`.
-    OnBatchOutcome::Dropped {
-        reason: last_reason,
-        attempts: retry_count + 1,
-    }
+    // `for attempt_idx in 0..=retry_count` covers every legal
+    // `attempt_idx`, and every iteration of the inner `match`
+    // returns. The compiler still requires a tail expression because
+    // it cannot prove the loop exits early; this `unreachable!`
+    // turns the invariant into a runtime panic if a future refactor
+    // breaks it.
+    unreachable!("run_with_retry's inner match returns on every branch")
 }
 
 /// Production [`OnBatch`] impl. Configured at construction with a
@@ -175,10 +171,19 @@ impl RmpEncodeAndHttpPost {
             // depend on response bodies (§5.2 explicitly disclaims).
             .build();
         let agent = ureq::Agent::new_with_config(config);
-        // Store the backoff base as `Duration`; `backoff_duration`
-        // multiplies it by `2^attempt`. Anchored in milliseconds for
-        // the `retry_backoff_ms × 2^attempt` spec wording (§5.2).
-        let retry_backoff_ms: u32 = retry_backoff.as_millis().try_into().unwrap_or(u32::MAX);
+        // `retry_backoff` is bounded by directive validation to
+        // `≤ 60_000 ms` (well within `u32`), so the `try_into` is a
+        // total conversion in practice. The `debug_assert` encodes
+        // that invariant: if future validation work raises the
+        // bound without auditing this site, a misconfigured operator
+        // would otherwise silently get a 49-day backoff after the
+        // `u32::MAX` clamp.
+        let backoff_millis = retry_backoff.as_millis();
+        debug_assert!(
+            backoff_millis <= u128::from(u32::MAX),
+            "retry_backoff_ms exceeds u32::MAX — directive validation should have caught this",
+        );
+        let retry_backoff_ms: u32 = backoff_millis.try_into().unwrap_or(u32::MAX);
         Self {
             agent,
             server_url,
@@ -203,16 +208,22 @@ impl OnBatch for RmpEncodeAndHttpPost {
         // the `set("Authorization", ...)` call inside `attempt`. No
         // logging, no error path captures it.
         let bearer = format!("Bearer {}", self.auth_token.expose_secret());
-        let url = self.server_url.as_str().to_owned();
-        let user_agent = self.user_agent.clone();
-        let agent = self.agent.clone(); // `ureq::Agent` is `Arc`-backed; clone is cheap
+        // `url`, `user_agent`, and `agent` are borrowed by the
+        // closure rather than cloned (SEH-6 round-2 fix): the closure
+        // only outlives the `handle` call below, so the borrows of
+        // `&self.*` are sound for the closure's entire lifetime and
+        // we save two `String` allocations + one `Arc` clone per
+        // batch.
+        let url = self.server_url.as_str();
+        let user_agent = self.user_agent.as_str();
+        let agent = &self.agent;
 
-        let attempt = |_attempt_idx: u32| -> AttemptOutcome {
+        let attempt = |_| -> AttemptOutcome {
             match agent
-                .post(&url)
+                .post(url)
                 .header("Authorization", bearer.as_str())
                 .header("Content-Type", wire::MEDIA_TYPE)
-                .header("User-Agent", user_agent.as_str())
+                .header("User-Agent", user_agent)
                 .send(encoded)
             {
                 Ok(_) => AttemptOutcome::Sent,
@@ -228,6 +239,17 @@ impl OnBatch for RmpEncodeAndHttpPost {
             attempt,
             thread::sleep,
         )
+    }
+
+    /// `SPECIFICATION.md` §5.2 step 4 drop-notice URL token. Returns
+    /// the configured `server_url`'s string form so the drop notice
+    /// emitted on the PHP-thread side reads `... <url> <status_or_error> ...`
+    /// for operator triage. The bearer token is held in
+    /// `self.auth_token` and is NOT exposed through this accessor —
+    /// the `Url` type has no slot for it (AC-SH-4 enforced by
+    /// construction).
+    fn server_url(&self) -> Option<&str> {
+        Some(self.server_url.as_str())
     }
 }
 
@@ -280,13 +302,27 @@ pub(crate) fn encode_and_handle(
     }
 }
 
-/// Bump the source trace's drop counter by `records_in_batch` on a
-/// retry-exhaust drop. The counter is the `Arc<AtomicU64>` carried on
-/// the `PendingBatch` per AD-9; bumping it ensures the next batch
-/// from the same trace surfaces this drop in its
-/// `meta.dropped_records` (closing the R-13 contract for HTTP-side
-/// drops the same way the recorder closes it for channel-full and
-/// buffer-cap drops).
+/// Bump the source trace's drop counter by `records_in_batch` on
+/// **every** `OnBatchOutcome::Dropped` outcome (retry-exhaust,
+/// encode-failure, deadline-exceeded). The counter is the
+/// `Arc<AtomicU64>` carried on the `PendingBatch` per AD-9; bumping
+/// it ensures the next batch from the same trace surfaces this drop
+/// in its `meta.dropped_records` (closing the R-13 contract for
+/// HTTP-side drops the same way the recorder closes it for
+/// channel-full and buffer-cap drops).
+///
+/// **Spec deviation (round-2 review SEH-5):** `SPECIFICATION.md`
+/// §5.2 step 3 names retry-exhaust as the bump trigger; this impl
+/// also bumps on `EncodeFailed` (no retry is applied — the same
+/// input would fail again) and `DeadlineExceeded` (the deadline
+/// elapsed before any attempt could complete). The records are
+/// genuinely lost in both cases, so the bump preserves the
+/// "no silent loss" invariant (OBJ-5); the deviation is to fold
+/// every drop path into a single counter rather than split into
+/// `encode_dropped` / `deadline_dropped` counters that would need
+/// new `meta.*` fields. Recorded in `COMMENTS.md` SEH-5; a follow-up
+/// `shipper-drop-counter-attribution` change can split these into
+/// separate counters if downstream operators need the distinction.
 pub(crate) fn bump_drop_counter_on_drop(batch: &PendingBatch, outcome: &OnBatchOutcome) {
     if matches!(outcome, OnBatchOutcome::Dropped { .. }) {
         batch
