@@ -7,8 +7,9 @@ contract — it accepts MessagePack-encoded `wire::Batch` payloads on
 `POST /v1/ingest`, validates the bearer token, decodes the body via
 the production crate's [`php_analyze::wire`] module (so the schema is
 single-source-of-truth), and stores accepted batches in process
-memory. Two debug endpoints (`GET /debug/batches`, `POST
-/debug/reset`) let integration tests inspect and isolate scenarios.
+memory. Two debug endpoints (`GET /debug/batches` and
+`POST /debug/reset`) let integration tests inspect and isolate
+scenarios.
 
 It is **not** a production ingest server. There is no TLS, no
 gzip, no body-size cap, and the bearer comparison is non-constant-
@@ -60,8 +61,13 @@ process's lifetime.
 | Method | Path | Status codes | Effect |
 | --- | --- | --- | --- |
 | `POST` | `/v1/ingest` (configurable via `--path`) | `200`, `401`, `415`, `400`, `405` | Validate bearer + content-type, decode the MessagePack body via `wire::Batch`, push onto the in-memory store. |
-| `GET` | `/debug/batches` | `200` | Return the in-memory store as JSON (`Vec<wire::Batch>`). `Content-Type: application/json`. |
-| `POST` | `/debug/reset` | `200` | Empty the in-memory store. |
+| `GET` | `/debug/batches` | `200` | Return the in-memory store as JSON (`Vec<wire::Batch>`). `Content-Type: application/json`. **No auth.** |
+| `POST` | `/debug/reset` | `200` | Empty the in-memory store. **No auth.** |
+
+The `/debug/*` paths are unauthenticated — they are debug surfaces
+accessible only on the loopback bind, and integration tests use
+them to inspect and isolate scenarios. The bearer requirement
+applies to the ingest path only.
 
 Status-code semantics for `POST /v1/ingest`:
 
