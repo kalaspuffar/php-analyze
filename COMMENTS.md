@@ -561,6 +561,37 @@ items that need new infrastructure are queued in the
   `attempt` closure is now `|_| -> AttemptOutcome` (the unused
   `_attempt_idx: u32` parameter is dropped).
 
+### Phase 4 — slice-4 (`shipper-deadline-at-recv-loop-head`) round-1 fix status
+
+Recorded on branch `feat/shipper-deadline-at-recv-loop-head`. Same
+precedent as the SEH-* / PF-* / C-* slices above: blocking findings
+land on this branch as additional commits under the
+`shipper-deadline-at-recv-loop-head` OpenSpec change.
+
+- **DRL-1 (critical) — fixed.** Local cargo test runs were green
+  but CI (and local stress runs at `--test-threads=8`) tripped
+  `debug_assert_eq!(deadline, drain_msg_deadline)` inside
+  `run_drain_phase` for two slice-3 tests
+  (`run_loop_with_drain_future_deadline_finishes_queued_batches`
+  and `run_loop_with_drain_past_deadline_abandons_queued_batches`).
+  Root cause: `run_loop` now reads the process-global
+  `DRAIN_DEADLINE` cell on every pre-drain iteration. The nine
+  pre-existing `run_loop_*` tests used local channels and did
+  not acquire the shipper test lock (they did not need to, before
+  the cell existed). Under parallel test execution, one of the
+  new cell-publish tests could leave the cell in `Some(_)` mid-
+  flight (between `set_drain_deadline_for_test` and
+  `reset_for_test`), and a concurrent `run_loop_*` test would
+  read the stale value, enter `run_drain_phase` with a deadline
+  that did not match its own in-channel `Drain` message, and
+  trip the debug assert. Fix: every `run_loop_*` test now
+  acquires `let _guard = lock();` and brackets its body with
+  `reset_for_test()` — the standard pattern for any test that
+  observes process-global state. The debug assert itself is
+  load-bearing (catches a future refactor that publishes the
+  cell from a code path other than `drain_and_join_at_mshutdown`)
+  and stays. Stress run: 5 × `--test-threads=8` passes green.
+
 ## Phase 5 anchor — AC-RC-5 zero-alloc audit harness
 
 The `flush_into_pending_batch` accessor is zero-alloc by

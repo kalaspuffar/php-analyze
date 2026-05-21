@@ -834,6 +834,12 @@ mod tests {
 
     #[test]
     fn run_loop_drains_three_batches_and_exits_cleanly_on_channel_close() {
+        // `run_loop` reads the process-global `DRAIN_DEADLINE` cell;
+        // hold the test lock and reset state so a concurrent test
+        // that publishes the cell cannot leak its deadline into our
+        // recv-loop. Same pattern below for every `run_loop_*` test.
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -850,10 +856,13 @@ mod tests {
                 batches_abandoned_at_deadline: 0,
             }
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_drain_future_deadline_finishes_queued_batches() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -880,10 +889,13 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "exit should not wait for the 5s deadline; took {elapsed:?}"
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_drain_past_deadline_abandons_queued_batches() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(128);
         for _ in 0..100 {
             tx.send(dummy_batch()).unwrap();
@@ -915,10 +927,13 @@ mod tests {
         // Now drop the sender so the test doesn't keep the channel
         // alive past the function.
         drop(tx);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_exits_cleanly_on_channel_close_without_a_drain() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -928,10 +943,13 @@ mod tests {
         assert!(exit.drain_completed);
         assert_eq!(exit.batches_drained, 1);
         assert_eq!(exit.batches_abandoned_at_deadline, 0);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_empty_channel_and_immediate_close_returns_zero_counts() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -945,13 +963,16 @@ mod tests {
                 batches_abandoned_at_deadline: 0,
             }
         );
+        reset_for_test();
     }
 
     // --- Phase-4 slice 2: consume-path accounting subtract --------------
 
     #[test]
     fn run_loop_pre_drain_subtracts_size_estimate_for_each_consumed_batch() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
 
         // Seed the budget with the sum of three batches' size_estimates.
@@ -975,11 +996,14 @@ mod tests {
             0,
             "every consumed batch's size_estimate is returned to the budget",
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_drain_phase_subtracts_size_estimate_for_future_deadline() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
         crate::recorder::accounting::add(500);
 
@@ -1005,11 +1029,14 @@ mod tests {
             0,
             "both pre-drain and drain-phase consumes subtract from the budget",
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_deadline_pass_subtracts_size_estimate_for_abandoned_batches() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
         crate::recorder::accounting::add(1_000);
 
@@ -1044,11 +1071,14 @@ mod tests {
             "deadline-pass arm must drain residual batches and subtract their bytes",
         );
         drop(tx);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_deadline_pass_with_no_residual_returns_zero_abandoned() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
 
         let (tx, rx) = bounded::<ShipperMessage>(8);
@@ -1073,6 +1103,7 @@ mod tests {
         );
         assert_eq!(crate::recorder::accounting::snapshot(), 0);
         drop(tx);
+        reset_for_test();
     }
 
     // --- install_channel_at_minit --------------------------------------
