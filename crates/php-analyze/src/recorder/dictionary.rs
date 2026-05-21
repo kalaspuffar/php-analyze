@@ -59,7 +59,17 @@ impl Dictionary {
         }
 
         let fn_id = self.next_fn_id;
-        self.next_fn_id += 1;
+        // `checked_add` rather than `+= 1`: a `+=` would panic in debug
+        // and **silently wrap to 0** in release, breaking the "0 is the
+        // no-function sentinel" contract documented on `new()`. Four
+        // billion distinct functions in one trace is unreachable for any
+        // realistic PHP workload, but the invariant should not depend on
+        // workload — and the `expect` is one branch on a path that
+        // already does a hashmap insert, so the cost is invisible.
+        self.next_fn_id = self
+            .next_fn_id
+            .checked_add(1)
+            .expect("fn_id counter overflowed u32 — 2^32 distinct functions in a single trace");
         self.intern.insert(key, fn_id);
         self.new_entries.push(build(fn_id));
         fn_id

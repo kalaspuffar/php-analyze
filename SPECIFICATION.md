@@ -208,7 +208,7 @@ Per REQ §4.2 and §7.10:
 
 **Clock sources**:
 - Wall time (`t_in`, `t_out`): `clock_gettime(CLOCK_MONOTONIC, …)`.
-- CPU time: `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, …)` split into user/sys via `getrusage(RUSAGE_SELF)` deltas — **caveat**: `getrusage` granularity is coarse (typically microseconds). See §11 R-PERF for the trade-off; default implementation uses `getrusage` deltas and exposes the granularity in the README.
+- CPU time: `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, …)` split into user/sys via `getrusage(RUSAGE_THREAD)` deltas — **caveat**: `getrusage` granularity is coarse (typically microseconds). See §11 R-PERF for the trade-off; default implementation uses `getrusage` deltas and exposes the granularity in the README. `RUSAGE_THREAD` (Linux 2.6.26+) returns CPU time for the calling thread only — required because the Recorder runs on the PHP request thread and the Phase-4 shipper runs on a separate thread; a `RUSAGE_SELF` reading would conflate the two and inflate per-call CPU deltas under load.
 - Memory: PHP `zend_memory_usage(true)` (real usage, including allocator overhead).
 - `start_time` (per-trace metadata only): `clock_gettime(CLOCK_REALTIME, …)`.
 
@@ -656,7 +656,7 @@ A PECL package recipe is **SHOULD-not-MUST** (REQ R-8); if PECL packaging proves
 | SAPIs | `cli`, `fpm-fcgi`. Other SAPIs may work but are unsupported. |
 | Memory | Default 64 MiB extension buffer; add to PHP's `memory_limit` budget. |
 | Network | Outbound TCP to `server_url`; TLS preferred. |
-| Permissions | `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and `getrusage(RUSAGE_SELF)` are unprivileged. No CAP_SYS_* needed. |
+| Permissions | `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and `getrusage(RUSAGE_THREAD)` are unprivileged. No CAP_SYS_* needed. |
 
 ### 7.5 Scaling
 

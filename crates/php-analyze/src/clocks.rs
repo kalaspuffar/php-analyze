@@ -7,9 +7,13 @@
 //!   two reads never yields a negative duration even if the wall clock is
 //!   stepped backwards mid-trace.
 //! - [`cpu_times_now_ns`]    backs `CallRecord::cpu_u_ns` / `cpu_s_ns` (via
-//!   per-call deltas). `getrusage(RUSAGE_SELF)` returns `timeval`s whose
+//!   per-call deltas). `getrusage(RUSAGE_THREAD)` returns `timeval`s whose
 //!   resolution is typically microseconds; sub-microsecond calls may read `0`
 //!   on either component. R-11 in `SPECIFICATION.md` §11 accepts this.
+//!   The `RUSAGE_THREAD` (Linux 2.6.26+) choice — rather than `RUSAGE_SELF`
+//!   — scopes the CPU accounting to the calling thread, so the Phase-4
+//!   shipper thread's CPU does not bleed into the request thread's per-call
+//!   deltas. See `SPECIFICATION.md` §3.2 for the spec amendment.
 //! - [`realtime_now_ns`]     backs `Trace::start_time_realtime_ns` and the
 //!   corresponding `MetaPartial` field. **Anchor only** — never participates
 //!   in subtraction; the recorder uses [`monotonic_now_ns`] for durations.
@@ -67,24 +71,43 @@ pub fn realtime_now_ns() -> i64 {
     clock_gettime_ns(libc::CLOCK_REALTIME)
 }
 
-/// Per-process CPU consumption (user + system), in nanoseconds.
+/// Per-thread CPU consumption (user + system), in nanoseconds.
 ///
-/// Backed by `getrusage(RUSAGE_SELF, …)`. Each `timeval` field
+/// Backed by `getrusage(RUSAGE_THREAD, …)`. Each `timeval` field
 /// (`ru_utime`, `ru_stime`) is converted to nanoseconds as
 /// `tv_sec * 1_000_000_000 + tv_usec * 1_000`.
+///
+/// ## Why `RUSAGE_THREAD` and not `RUSAGE_SELF`
+///
+/// `RUSAGE_SELF` sums CPU across every thread of the process. Once the
+/// Phase-4 shipper thread exists, that would mean a `cpu_u/s_ns` delta
+/// computed around a PHP call includes whatever CPU the shipper consumed
+/// during the same interval — inflating per-call CPU readings under load.
+/// `RUSAGE_THREAD` (Linux 2.6.26+) accounts only the calling thread; the
+/// recorder runs on the PHP request thread, which is the only thread whose
+/// CPU is meaningful for `(t_in, t_out)`-scoped CPU measurement. The spec
+/// was amended in lockstep (`SPECIFICATION.md` §3.2 / §7.4).
 ///
 /// **Granularity caveat** (R-11 in `SPECIFICATION.md` §11): `getrusage`
 /// typically reports microseconds, so a `CallRecord` whose entire body runs
 /// in under a microsecond will see `cpu_u_ns == 0` and/or `cpu_s_ns == 0`.
 /// This is acceptable for staging-level profiling per the spec.
 pub fn cpu_times_now_ns() -> CpuTimes {
-    // Safety: `getrusage` writes into `usage`; `RUSAGE_SELF` is always a
-    // valid `who` argument. The call cannot fail on a process that is alive
-    // (which we are, by virtue of running this function), but we still
-    // assert the return code to surface kernel weirdness loudly in debug.
+    // Safety: `getrusage` writes into `usage`; `RUSAGE_THREAD` is a valid
+    // `who` argument on Linux 2.6.26+ (kernel ≥ 4.4 is required per §7.4,
+    // so this is unconditionally available on the supported target).
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-    debug_assert_eq!(rc, 0, "getrusage(RUSAGE_SELF) is documented infallible");
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+    // Hard-assert rather than debug-assert: a non-zero return (EINVAL on
+    // an unknown `who` constant, EFAULT on a bad pointer) is impossible on
+    // the supported target with a valid stack pointer, but if it ever
+    // happens we want a loud panic, not a zero-filled `rusage` that
+    // silently becomes a bogus `CpuTimes` written into a `CallRecord`.
+    assert!(
+        rc == 0,
+        "getrusage(RUSAGE_THREAD) is infallible on Linux x86_64 for the \
+         supported `who` constant with a valid pointer; got rc={rc}"
+    );
 
     CpuTimes {
         user_ns: timeval_to_ns(usage.ru_utime),
@@ -120,7 +143,10 @@ pub fn cpu_times_now_ns() -> CpuTimes {
 /// our `.so`.
 #[cfg(not(test))]
 pub fn memory_usage_real_bytes() -> i64 {
-    extern "C" {
+    // `unsafe extern "C"` (rather than the older bare `extern "C"`) is
+    // the form Rust 2024 requires; it is accepted on edition 2021 as
+    // well, so adopting it now keeps the future edition upgrade silent.
+    unsafe extern "C" {
         fn zend_memory_usage(real_usage: bool) -> usize;
     }
     // Safety: `zend_memory_usage` is a leaf Zend function with no
@@ -150,9 +176,15 @@ fn clock_gettime_ns(clock_id: libc::clockid_t) -> i64 {
     // assert the return code in debug to surface unexpected EINVAL loudly.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(clock_id, &mut ts) };
-    debug_assert_eq!(
-        rc, 0,
-        "clock_gettime with a built-in clock_id is infallible"
+    // Hard-assert rather than debug-assert: a non-zero return (EINVAL on
+    // an unknown `clockid_t`, EFAULT on a bad pointer) cannot happen for
+    // the two clock IDs this module passes in (`CLOCK_MONOTONIC`,
+    // `CLOCK_REALTIME`) on the supported target. If it ever does, we
+    // want to panic loudly rather than silently emit a zero-filled
+    // timestamp that downstream code reads as 1970-01-01.
+    assert!(
+        rc == 0,
+        "clock_gettime with a built-in clock_id is infallible; got rc={rc}"
     );
 
     // `tv_sec` is `time_t` (i64 on Linux x86_64); `tv_nsec` is `c_long`
@@ -193,15 +225,19 @@ mod tests {
         assert!(b >= a, "monotonic clock must not decrease: a={a}, b={b}");
 
         // A 2 ms sleep must elapse at least 1 ms in clock time (the kernel
-        // is allowed to round down) and at most 100 ms (loaded CI hosts can
-        // be slow, but not 50× slow). A return in nanoseconds will sit
-        // comfortably in this range; a return in microseconds (×1000 too
-        // small) or milliseconds (×1_000_000 too small) will not.
+        // is allowed to round down). A return in nanoseconds will sit
+        // above 1 ms; a return in microseconds (×1000 too small) or
+        // milliseconds (×1_000_000 too small) will not. There is
+        // deliberately **no** upper bound here: a paged-out or `nice`d CI
+        // runner can pause a thread for hundreds of milliseconds without
+        // that being a unit-conversion bug, and `b >= a` already proves
+        // monotonicity. The 1 ms lower bound is the only assertion that
+        // earns its place.
         let delta = b - a;
         assert!(
-            (1_000_000..=100_000_000).contains(&delta),
-            "monotonic delta {delta}ns is outside the [1ms, 100ms] sanity \
-             window — likely a unit-conversion bug"
+            delta >= 1_000_000,
+            "monotonic delta {delta}ns is below 1 ms — likely a \
+             unit-conversion bug (µs or ms instead of ns)"
         );
     }
 

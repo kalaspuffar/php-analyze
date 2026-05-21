@@ -154,12 +154,46 @@ pub struct MetaPartial {
 /// exist yet either (Phase 4), so the type is currently unused at
 /// runtime; it ships now so the substrate is feature-complete for the
 /// next slice's needs.
+///
+/// **Invariant**: `size_estimate` is always
+/// [`estimate_batch_bytes`]`(&dict, &calls)`. Constructing a `PendingBatch`
+/// directly bypasses that invariant, which is why slice-3 callers should
+/// prefer the future `Trace::flush_into_batch` accessor (not yet present)
+/// over the field-level constructor.
 #[derive(Debug)]
 pub struct PendingBatch {
     pub meta_partial: MetaPartial,
     pub dict: Vec<DictEntry>,
     pub calls: Vec<CallRecord>,
     pub size_estimate: usize,
+}
+
+/// `SPECIFICATION.md` §3.2 size-estimate constants.
+///
+/// The estimate is an over-approximation tuned to bound real-memory
+/// headroom for the `flush_bytes` / `buffer_cap_bytes` thresholds. Exact
+/// bytes are known only after wire encoding (shipper, Phase 3+).
+///
+/// Both constants are `pub(crate)` so the slice-3 invariant
+/// (`buffer_estimated_bytes == estimate_batch_bytes(...)` for the current
+/// pending contents) can be enforced from `Trace`'s accessor methods
+/// without bleeding the magic numbers across the call sites.
+pub(crate) const CALL_RECORD_FIXED_BYTES: usize = 64;
+pub(crate) const DICT_ENTRY_FIXED_BYTES: usize = 24;
+
+/// Size-estimate for a batch as specified by §3.2:
+/// `64 bytes/call + (24 + len(fqn) + len(file)) per dict entry`.
+///
+/// Free function (not a method) so the same formula is reachable from
+/// `Trace::push_record` / `push_dict_entry_via_intern` for the
+/// incremental case and from `PendingBatch` construction for the
+/// whole-batch case, without either having to know about the other.
+pub fn estimate_batch_bytes(dict: &[DictEntry], calls: &[CallRecord]) -> usize {
+    let dict_bytes: usize = dict
+        .iter()
+        .map(|entry| DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len())
+        .sum();
+    dict_bytes + calls.len() * CALL_RECORD_FIXED_BYTES
 }
 
 /// Messages from the recorder to the shipper.
@@ -188,6 +222,28 @@ pub enum ShipperMessage {
 /// than only on `MetaPartial`; they are cheap to carry (Arc clones) and
 /// the alternative would force the recorder to plumb them in at flush
 /// time, which is the kind of error that survives review.
+///
+/// ## Field visibility and the size-estimate invariant
+///
+/// The mutable state fields (`stack`, `buffer`, `dictionary`,
+/// `buffer_estimated_bytes`, `call_id_seq`) are `pub(crate)`, not `pub`.
+/// External callers go through the accessor methods ([`push_record`],
+/// [`push_dict_entry_via_intern`], [`next_call_id`]) so the invariant
+/// can be enforced:
+///
+/// **Invariant**: `buffer_estimated_bytes` is always
+/// [`estimate_batch_bytes`]`(&dictionary.new_entries, &buffer)`.
+///
+/// Slice 3 (`recorder-depth-and-cap-drops`) extends this invariant to
+/// include the in-progress dictionary and to drive the `flush_bytes` /
+/// `buffer_cap_bytes` thresholds. Phase-2 slice 2's observer wiring
+/// touches the state only through the accessors below, so an
+/// independently-evolved hot-path cannot desync the estimator from the
+/// buffer contents.
+///
+/// [`push_record`]: Self::push_record
+/// [`push_dict_entry_via_intern`]: Self::push_dict_entry_via_intern
+/// [`next_call_id`]: Self::next_call_id
 #[derive(Debug)]
 pub struct Trace {
     pub trace_id: [u8; 16],
@@ -196,11 +252,18 @@ pub struct Trace {
     pub pid: u32,
     pub sapi: Arc<str>,
     pub uri_or_script: String,
-    pub call_id_seq: u64,
-    pub stack: Vec<CallFrame>,
-    pub buffer: Vec<CallRecord>,
-    pub dictionary: Dictionary,
-    pub buffer_estimated_bytes: usize,
+    pub(crate) call_id_seq: u64,
+    // Slice 2 (`recorder-observer-hooks-and-trace-lifecycle`) is the
+    // first non-test reader: the begin handler pushes a `CallFrame` on
+    // entry, the end handler pops on exit. Until then dead-code
+    // analysis would flag the field — but removing it would force a
+    // slice-2 type-shape change, which is exactly what this substrate
+    // slice exists to avoid.
+    #[allow(dead_code)]
+    pub(crate) stack: Vec<CallFrame>,
+    pub(crate) buffer: Vec<CallRecord>,
+    pub(crate) dictionary: Dictionary,
+    pub(crate) buffer_estimated_bytes: usize,
 }
 
 impl Trace {
@@ -225,6 +288,51 @@ impl Trace {
             dictionary: Dictionary::new(),
             buffer_estimated_bytes: 0,
         }
+    }
+
+    /// Allocate the next `call_id`. Call IDs are monotonic from 1 within
+    /// a trace; `0` is the "no parent" sentinel per `SPECIFICATION.md`
+    /// §4.1.2 and never returned by this method.
+    ///
+    /// `checked_add` matches the dictionary's `fn_id` overflow stance:
+    /// 2^64 calls in a single trace is unreachable, but the contract
+    /// should not depend on workload.
+    pub fn next_call_id(&mut self) -> u64 {
+        self.call_id_seq = self
+            .call_id_seq
+            .checked_add(1)
+            .expect("call_id counter overflowed u64 — 2^64 calls in a single trace");
+        self.call_id_seq
+    }
+
+    /// Push a completed `CallRecord` into the pending buffer and update
+    /// the size-estimate by exactly the §3.2 per-record contribution.
+    ///
+    /// This is the only sanctioned way to grow `buffer`; going through
+    /// the accessor keeps `buffer_estimated_bytes` aligned with the
+    /// invariant documented on [`Trace`].
+    pub fn push_record(&mut self, record: CallRecord) {
+        self.buffer.push(record);
+        self.buffer_estimated_bytes += CALL_RECORD_FIXED_BYTES;
+    }
+
+    /// Intern a function key and update the size-estimate by the §3.2
+    /// per-dict-entry contribution on a dictionary miss. On a hit, the
+    /// estimate is unchanged because no new `DictEntry` is staged.
+    ///
+    /// Mirrors [`Dictionary::intern`]'s lazy-allocate contract: the
+    /// `build` closure runs at most once, only on a miss.
+    pub fn push_dict_entry_via_intern(
+        &mut self,
+        key: FunctionKey,
+        build: impl FnOnce(u32) -> DictEntry,
+    ) -> u32 {
+        let estimate = &mut self.buffer_estimated_bytes;
+        self.dictionary.intern(key, |fn_id| {
+            let entry = build(fn_id);
+            *estimate += DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len();
+            entry
+        })
     }
 }
 
@@ -351,6 +459,105 @@ mod tests {
             },
         );
         assert_eq!(id, 1, "a fresh dictionary must start fn_ids at 1");
+    }
+
+    #[test]
+    fn trace_next_call_id_is_monotonic_from_one() {
+        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+        let ids: Vec<u64> = (0..5).map(|_| trace.next_call_id()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(trace.call_id_seq, 5);
+    }
+
+    #[test]
+    fn trace_push_record_appends_to_buffer_and_bumps_the_estimate_by_64() {
+        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+        let before = trace.buffer_estimated_bytes;
+        trace.push_record(sample_call_record());
+        assert_eq!(trace.buffer.len(), 1, "buffer must hold the new record");
+        assert_eq!(
+            trace.buffer_estimated_bytes - before,
+            CALL_RECORD_FIXED_BYTES,
+            "estimate must grow by exactly the §3.2 per-record constant"
+        );
+    }
+
+    #[test]
+    fn trace_push_dict_entry_via_intern_bumps_estimate_only_on_a_miss() {
+        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+
+        let key = FunctionKey::Internal {
+            name: Arc::from("strlen"),
+        };
+
+        // Miss: estimate grows by `24 + len("internal:strlen") + len("")`.
+        let estimate_before_miss = trace.buffer_estimated_bytes;
+        let fqn = "internal:strlen".to_owned();
+        let file = String::new();
+        let expected_dict_contribution = DICT_ENTRY_FIXED_BYTES + fqn.len() + file.len();
+        let first = trace.push_dict_entry_via_intern(key.clone(), |fn_id| DictEntry {
+            fn_id,
+            fqn: fqn.clone(),
+            file: file.clone(),
+            line: 0,
+            kind: FunctionKind::Internal,
+        });
+        assert_eq!(first, 1, "first miss assigns fn_id 1");
+        assert_eq!(
+            trace.buffer_estimated_bytes - estimate_before_miss,
+            expected_dict_contribution,
+            "miss must grow estimate by the §3.2 per-dict-entry formula"
+        );
+
+        // Hit: estimate must not change, build closure must not run.
+        let estimate_before_hit = trace.buffer_estimated_bytes;
+        let mut build_ran = false;
+        let second = trace.push_dict_entry_via_intern(key, |fn_id| {
+            build_ran = true;
+            DictEntry {
+                fn_id,
+                fqn: "should-not-build".to_owned(),
+                file: String::new(),
+                line: 0,
+                kind: FunctionKind::Internal,
+            }
+        });
+        assert_eq!(second, first, "hit returns the existing fn_id");
+        assert!(!build_ran, "build closure must not run on a hit");
+        assert_eq!(
+            trace.buffer_estimated_bytes, estimate_before_hit,
+            "hit must leave the estimate unchanged"
+        );
+    }
+
+    #[test]
+    fn estimate_batch_bytes_matches_the_spec_3_2_formula() {
+        let calls = vec![sample_call_record(), sample_call_record()];
+        let dict = vec![
+            DictEntry {
+                fn_id: 1,
+                fqn: "ns\\foo".to_owned(),
+                file: "/a.php".to_owned(),
+                line: 1,
+                kind: FunctionKind::Function,
+            },
+            DictEntry {
+                fn_id: 2,
+                fqn: "C::m".to_owned(),
+                file: String::new(),
+                line: 0,
+                kind: FunctionKind::Method,
+            },
+        ];
+
+        let expected = 2 * CALL_RECORD_FIXED_BYTES
+            + (DICT_ENTRY_FIXED_BYTES + "ns\\foo".len() + "/a.php".len())
+            + (DICT_ENTRY_FIXED_BYTES + "C::m".len());
+        assert_eq!(estimate_batch_bytes(&dict, &calls), expected);
+
+        // Empty inputs collapse to zero — the §3.2 formula has no
+        // constant offset beyond what each entry contributes.
+        assert_eq!(estimate_batch_bytes(&[], &[]), 0);
     }
 
     #[test]
