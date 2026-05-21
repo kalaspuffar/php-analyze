@@ -117,6 +117,67 @@ Behaviour:
 - **HTTP warning.** `http://` URLs are accepted but emit one `E_WARNING`
   noting the lack of TLS. Production deployments should use `https://`.
 
+## Spike mode (developer-only)
+
+> **Do not enable spike mode in production.** It writes one log line
+> per PHP function call to the configured destination. It is slow,
+> unbounded, and exists only to validate the `zend_observer`
+> integration before the real Recorder lands. Phase 2's Recorder
+> change removes the two directives below.
+
+Two additional `PHP_INI_SYSTEM` directives gate the Phase-0 spike:
+
+| Directive | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `php_analyze.spike_observer` | bool | `0` | When `1` *and* the extension is enabled, install an `FcallObserver` that writes one line per function entry / exit. |
+| `php_analyze.spike_log_path` | string | *(empty)* | Where the spike writes. Empty = stderr; an absolute path = open-create-append to that file (`LineWriter`-buffered so one flush per line). |
+
+When spike mode is on, `php --ri php_analyze` shows a red-flag
+banner row:
+
+```
+spike-mode => ENABLED (DEVELOPMENT-ONLY; do not enable in production)
+```
+
+Log line shape:
+
+```
+entry: <fqn>
+exit: <fqn> (abnormal=<true|false>)
+```
+
+where `<fqn>` is one of `internal:<name>`, `method:<Class>::<name>`,
+`closure:<file>:<line>`, or `function:<file>:<line>:<name>`.
+
+Worked example invocation (assumes the cdylib is built and at
+`target/debug/libphp_analyze.so`):
+
+```bash
+cat >/tmp/spike.ini <<'EOF'
+extension=/abs/path/to/target/debug/libphp_analyze.so
+php_analyze.enabled              = 1
+php_analyze.server_url           = "https://spike.invalid/ingest"
+php_analyze.auth_token           = "not-a-real-token"
+php_analyze.spike_observer       = 1
+php_analyze.spike_log_path       = "/tmp/spike.log"
+EOF
+
+php -n -c /tmp/spike.ini -r '
+  function only_me(): void {}
+  only_me();
+  array_map(fn ($x) => $x + 1, [1, 2]);
+'
+head /tmp/spike.log
+```
+
+Known limitations of the spike's coverage (Phase-0 evidence in
+`COMMENTS.md` C-5):
+
+- PHP 8.x opcode-specialises a small set of internals (notably
+  `strlen` when called with a constant argument). The observer
+  surface does NOT see those calls. Other internals (`array_map`,
+  `json_encode`, `preg_match`, …) are observed normally.
+
 ## Development
 
 The mandatory pre-commit checklist; CI enforces all three:

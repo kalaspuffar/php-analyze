@@ -115,6 +115,20 @@ const DIRECTIVES: &[Directive] = &[
         default: "8",
         redact_display: false,
     },
+    // Spike-mode directives (Phase-0 `spike-zend-observer` change). Both
+    // default to off so a production `php.ini` that does not mention them
+    // exhibits no spike-mode behaviour. Removed in the same change that
+    // lands Phase 2's Recorder.
+    Directive {
+        name: "php_analyze.spike_observer",
+        default: "0",
+        redact_display: false,
+    },
+    Directive {
+        name: "php_analyze.spike_log_path",
+        default: "",
+        redact_display: false,
+    },
 ];
 
 // --- Lifecycle hooks -------------------------------------------------------
@@ -279,6 +293,8 @@ fn raw_ini_from_ini_map(ini: &HashMap<String, Option<String>>) -> RawIni {
         http_timeout_ms: lookup_int("php_analyze.http_timeout_ms"),
         shutdown_grace_ms: lookup_int("php_analyze.shutdown_grace_ms"),
         shipper_queue_depth: lookup_int("php_analyze.shipper_queue_depth"),
+        spike_observer: lookup_bool("php_analyze.spike_observer"),
+        spike_log_path: lookup_str("php_analyze.spike_log_path"),
     }
 }
 
@@ -324,9 +340,10 @@ impl PhpInfoRenderer {
         let Some(c) = config else {
             return vec![("Status".to_owned(), "MINIT has not run".to_owned())];
         };
-        let mut rows = Vec::with_capacity(15);
+        let mut rows = Vec::with_capacity(17);
         rows.push(("Status".to_owned(), Self::status_row(c)));
         Self::push_directive_rows(c, &mut rows);
+        Self::push_spike_rows(c, &mut rows);
         rows
     }
 
@@ -402,6 +419,30 @@ impl PhpInfoRenderer {
             "php_analyze.shipper_queue_depth".to_owned(),
             c.shipper_queue_depth.to_string(),
         ));
+    }
+
+    /// Render the spike-mode directive rows. When the spike is off (the
+    /// production default), we still surface the two directive values so
+    /// operators can confirm they read what they wrote — but no banner.
+    /// When the spike is on, a third row appears as a red-flag warning so
+    /// the operator can spot it in a wall of `phpinfo()` output.
+    fn push_spike_rows(c: &Config, rows: &mut Vec<(String, String)>) {
+        rows.push((
+            "php_analyze.spike_observer".to_owned(),
+            if c.spike_observer { "On" } else { "Off" }.to_owned(),
+        ));
+        let path = c
+            .spike_log_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(stderr)".to_owned());
+        rows.push(("php_analyze.spike_log_path".to_owned(), path));
+        if c.spike_observer {
+            rows.push((
+                "spike-mode".to_owned(),
+                "ENABLED (DEVELOPMENT-ONLY; do not enable in production)".to_owned(),
+            ));
+        }
     }
 }
 
@@ -772,5 +813,97 @@ mod tests {
                 d.name, count
             );
         }
+    }
+
+    // --- spike-mode rendering ----------------------------------------------
+
+    fn enabled_config_with_spike(observer_on: bool, path: Option<&str>) -> Config {
+        let raw = RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some("token".to_owned()),
+            spike_observer: Some(observer_on),
+            spike_log_path: path.map(str::to_owned),
+            ..RawIni::default()
+        };
+        Config::from_ini_values(&raw).0
+    }
+
+    #[test]
+    fn rows_hide_the_spike_mode_banner_when_spike_observer_is_off() {
+        let config = enabled_config_with_spike(false, None);
+        let rows = PhpInfoRenderer::rows(Some(&config));
+        // The two directive rows are always present (operators want to
+        // confirm the resolved value of what they wrote).
+        let observer = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.spike_observer")
+            .expect("spike_observer row");
+        assert_eq!(observer.1, "Off");
+        let path = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.spike_log_path")
+            .expect("spike_log_path row");
+        assert_eq!(path.1, "(stderr)");
+        // But the red-flag banner is absent.
+        assert!(
+            !rows.iter().any(|(l, _)| l == "spike-mode"),
+            "spike-mode banner must NOT appear when spike is off"
+        );
+    }
+
+    #[test]
+    fn rows_show_the_spike_mode_banner_when_spike_observer_is_on() {
+        let config = enabled_config_with_spike(true, Some("/tmp/spike.log"));
+        let rows = PhpInfoRenderer::rows(Some(&config));
+        let observer = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.spike_observer")
+            .expect("spike_observer row");
+        assert_eq!(observer.1, "On");
+        let path = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.spike_log_path")
+            .expect("spike_log_path row");
+        assert_eq!(path.1, "/tmp/spike.log");
+        let banner = rows
+            .iter()
+            .find(|(l, _)| l == "spike-mode")
+            .expect("spike-mode banner");
+        assert_eq!(
+            banner.1,
+            "ENABLED (DEVELOPMENT-ONLY; do not enable in production)"
+        );
+    }
+
+    #[test]
+    fn rows_redact_auth_token_even_when_spike_is_enabled() {
+        // R-3 from the Phase-0 review pattern: the spike module is the
+        // newest entry in the crate; future readers must be reassured
+        // that turning the spike on does not somehow weaken the token
+        // redaction guarantee.
+        let token = "spike-not-secret-zzz";
+        let raw = RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some(token.to_owned()),
+            spike_observer: Some(true),
+            spike_log_path: Some("/tmp/spike.log".to_owned()),
+            ..RawIni::default()
+        };
+        let config = Config::from_ini_values(&raw).0;
+        let rows = PhpInfoRenderer::rows(Some(&config));
+        for (label, value) in &rows {
+            assert!(!label.contains(token), "token leaked into label: {label:?}");
+            assert!(
+                !value.contains(token),
+                "token leaked into value: ({label:?}, {value:?})"
+            );
+        }
+        let token_row = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.auth_token")
+            .expect("auth_token row");
+        assert_eq!(token_row.1, "***");
     }
 }

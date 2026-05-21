@@ -56,6 +56,16 @@ pub struct Config {
     pub http_timeout: Duration,
     pub shutdown_grace: Duration,
     pub shipper_queue_depth: usize,
+    /// Phase-0 spike: when `true` AND `enabled` is `true`, the spike
+    /// module registers an `FcallObserver` that writes one log line per
+    /// `begin`/`end` event. Default `false`; removed when Phase 2's
+    /// Recorder lands. See `openspec/changes/spike-zend-observer/`.
+    pub spike_observer: bool,
+    /// Phase-0 spike: destination for the spike's log output. `None`
+    /// means "use stderr". An absolute path means "create / append to
+    /// this file"; the file is opened once at `MINIT` (when the spike
+    /// is active) and held for the process lifetime.
+    pub spike_log_path: Option<PathBuf>,
 }
 
 /// Where the resolved bearer token came from. Rendered in `MINFO` (the
@@ -118,6 +128,8 @@ pub struct RawIni {
     pub http_timeout_ms: Option<i64>,
     pub shutdown_grace_ms: Option<i64>,
     pub shipper_queue_depth: Option<i64>,
+    pub spike_observer: Option<bool>,
+    pub spike_log_path: Option<String>,
 }
 
 /// Observation emitted while resolving a [`Config`]. The bootstrap layer
@@ -222,6 +234,12 @@ impl Config {
             http_timeout: Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS as u64),
             shipper_queue_depth: DEFAULT_SHIPPER_QUEUE_DEPTH as usize,
+            // Spike directives default to off regardless of why the
+            // extension is disabled; nothing about a disabled pool
+            // makes the spike useful. Phase 2's Recorder change deletes
+            // these fields.
+            spike_observer: false,
+            spike_log_path: None,
         }
     }
 
@@ -363,6 +381,20 @@ impl Config {
 
         let enabled = disable_reason.is_none();
 
+        // Spike directives: bool defaults to false; path defaults to None.
+        // No range validation — the bool is a bool, and the path is
+        // validated at file-open time inside the spike module (not here).
+        // Untrimmed/empty paths are already filtered to `None` by the
+        // bootstrap-layer `read_raw_ini` adapter, so `Some("")` is not
+        // reachable here in practice.
+        let spike_observer = raw.spike_observer.unwrap_or(false);
+        let spike_log_path = raw
+            .spike_log_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         let config = Self {
             enabled,
             disable_reason,
@@ -378,6 +410,8 @@ impl Config {
             http_timeout: Duration::from_millis(http_timeout_ms as u64),
             shutdown_grace: Duration::from_millis(shutdown_grace_ms as u64),
             shipper_queue_depth: shipper_queue_depth as usize,
+            spike_observer,
+            spike_log_path,
         };
 
         (config, warnings)
@@ -884,6 +918,71 @@ mod tests {
             })
             .collect();
         assert_eq!(disable_warnings.len(), 1, "got {warnings:?}");
+    }
+
+    // --- spike directives --------------------------------------------------
+
+    #[test]
+    fn spike_directives_default_to_off_when_absent() {
+        let (config, _warnings) = Config::from_ini_values(&minimal_valid_raw());
+        assert!(!config.spike_observer);
+        assert!(config.spike_log_path.is_none());
+    }
+
+    #[test]
+    fn spike_observer_on_with_inline_path_populates_both_fields() {
+        let raw = RawIni {
+            spike_observer: Some(true),
+            spike_log_path: Some("/tmp/php-analyze-spike.log".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert!(config.enabled, "{warnings:?}");
+        assert!(config.spike_observer);
+        assert_eq!(
+            config.spike_log_path.as_deref(),
+            Some(std::path::Path::new("/tmp/php-analyze-spike.log"))
+        );
+    }
+
+    #[test]
+    fn spike_directives_are_off_under_master_switch_off() {
+        // R-5 short-circuit: when the master switch is off, ALL spike
+        // configuration is moot. The disabled config carries
+        // spike_observer = false regardless of what the operator set.
+        let raw = RawIni {
+            enabled: Some(false),
+            spike_observer: Some(true),
+            spike_log_path: Some("/tmp/x.log".to_owned()),
+            ..RawIni::default()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        assert!(!config.enabled);
+        assert!(
+            !config.spike_observer,
+            "spike must be off when master switch is off"
+        );
+        assert!(config.spike_log_path.is_none());
+    }
+
+    #[test]
+    fn spike_log_path_whitespace_is_trimmed_to_none_when_empty() {
+        // The bootstrap-layer `raw_ini_from_ini_map` already filters
+        // empty/whitespace strings to `None`, but the `from_ini_values`
+        // layer is also robust: a `Some("   ")` (which shouldn't reach
+        // here from the bootstrap path, but might from a test or future
+        // caller) is treated as "not set".
+        let raw = RawIni {
+            spike_observer: Some(true),
+            spike_log_path: Some("   ".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        assert!(config.spike_observer);
+        assert!(
+            config.spike_log_path.is_none(),
+            "whitespace-only path must resolve to None (= stderr)"
+        );
     }
 
     #[test]
