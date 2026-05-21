@@ -232,7 +232,14 @@ pub struct RequestIdentity {
     pub host: Arc<str>,
     pub sapi: Arc<str>,
     pub pid: u32,
-    pub uri_or_script: String,
+    /// Carried as `Arc<str>` so the eventual `MetaPartial`-construction
+    /// site (`Trace::flush_into_pending_batch`) clones the `Arc` rather
+    /// than allocating a fresh slice per flush. The `Arc::from(&str)`
+    /// allocation happens **once per request** at
+    /// `bootstrap::request_identity_from_sapi`, paid alongside the
+    /// `host` / `sapi` allocations, instead of once per flush. See
+    /// review finding PF-1 in `COMMENTS.md`.
+    pub uri_or_script: Arc<str>,
 }
 
 /// Per-trace cap and flush thresholds, plumbed from `Config` into
@@ -333,7 +340,12 @@ pub struct Trace {
     pub host: Arc<str>,
     pub pid: u32,
     pub sapi: Arc<str>,
-    pub uri_or_script: String,
+    /// `Arc<str>` so [`Self::flush_into_pending_batch`] can clone the
+    /// `Arc` into [`MetaPartial::uri_or_script`] without allocating.
+    /// The matching allocation happens once per request at
+    /// `bootstrap::request_identity_from_sapi`. See PF-1 in
+    /// `COMMENTS.md` for the worked rationale.
+    pub uri_or_script: Arc<str>,
 
     /// Per-trace `Arc<AtomicU64>` drop counter (AD-9). Phase 4 clones
     /// the `Arc` into `PendingBatch::drop_counter` so the shipper
@@ -539,8 +551,12 @@ impl Trace {
     /// Steady-state cost: two `Vec::new()` swaps (`mem::take`), one
     /// `Arc::clone` (atomic increment), one `MetaPartial` construct.
     /// **No allocations on this path** — the `Vec`-and-`Arc::clone`
-    /// triple is constant-time; the `MetaPartial` carries `Arc<str>`
-    /// clones, not owned strings.
+    /// triple is constant-time; the `MetaPartial` carries three
+    /// `Arc<str>` clones (`host`, `sapi`, `uri_or_script`), not owned
+    /// strings. PF-1 (`COMMENTS.md`) records the round-1 fix that
+    /// lifted `Trace::uri_or_script` from `String` to `Arc<str>` so
+    /// the third clone is also a refcount bump rather than a fresh
+    /// `Arc::from(&str)` allocation per flush.
     ///
     /// // NOTE for Phase 5 (AC-RC-5 zero-alloc audit): this is the
     /// // only non-Drop hot path that produces a `PendingBatch`. The
@@ -578,7 +594,7 @@ impl Trace {
             pid: self.pid,
             start_time_realtime_ns: self.start_time_realtime_ns,
             sapi: Arc::clone(&self.sapi),
-            uri_or_script: Arc::from(self.uri_or_script.as_str()),
+            uri_or_script: Arc::clone(&self.uri_or_script),
         };
 
         let batch = PendingBatch {
@@ -698,7 +714,7 @@ mod tests {
             host: Arc::from(host),
             sapi: Arc::from(sapi),
             pid,
-            uri_or_script: uri_or_script.to_owned(),
+            uri_or_script: Arc::from(uri_or_script),
         }
     }
 
@@ -749,7 +765,7 @@ mod tests {
         assert_eq!(trace.pid, 12345);
         assert_eq!(&*trace.host, "host.example");
         assert_eq!(&*trace.sapi, "cli");
-        assert_eq!(trace.uri_or_script, "/path/to/script.php");
+        assert_eq!(&*trace.uri_or_script, "/path/to/script.php");
         assert_eq!(trace.call_id_seq, 0);
         assert!(trace.stack.is_empty(), "fresh stack must be empty");
         assert!(trace.buffer.is_empty(), "fresh buffer must be empty");
@@ -909,14 +925,14 @@ mod tests {
             host: Arc::from("worker-42.prod"),
             sapi: Arc::from("fpm-fcgi"),
             pid: 4242,
-            uri_or_script: "/srv/app/index.php?route=/api/v1/users".to_owned(),
+            uri_or_script: Arc::from("/srv/app/index.php?route=/api/v1/users"),
         };
         let trace = Trace::new(identity.clone(), permissive_limits());
 
         assert_eq!(&*trace.host, &*identity.host);
         assert_eq!(&*trace.sapi, &*identity.sapi);
         assert_eq!(trace.pid, identity.pid);
-        assert_eq!(trace.uri_or_script, identity.uri_or_script);
+        assert_eq!(&*trace.uri_or_script, &*identity.uri_or_script);
     }
 
     // --- Slice-3 tests ------------------------------------------------

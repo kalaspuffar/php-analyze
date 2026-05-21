@@ -1,7 +1,9 @@
 <?php
 // Phase-4 slice 2 fixture (`recorder-flushes-into-shipper`):
-// 10_000 calls to one user function, run with
-// `php_analyze.flush_records = 5000` and a very large
+// 10_000 calls to one user function (`noop`). The recorder also
+// observes the script body itself as a closure, so the dump ends
+// up with 10_001 `C:` records total (10_000 noop + 1 script body).
+// Run with `php_analyze.flush_records = 5000` and a very large
 // `php_analyze.flush_bytes` so only the records-trigger fires
 // during the request. The harness asserts the dump contains:
 //   - exactly 3 `F:` lines

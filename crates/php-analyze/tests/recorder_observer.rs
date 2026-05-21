@@ -157,8 +157,9 @@ fn try_run_all_fixtures(runner: &Path, fixtures_dir: &Path, binary: &str) -> boo
     // Slice-3 fixtures:
     run_fixture_deep_recursion(runner, fixtures_dir, binary);
     run_fixture_cap_drops(runner, fixtures_dir, binary);
-    // Phase-4 slice 2 fixture:
+    // Phase-4 slice 2 fixtures:
     run_fixture_threshold_flush(runner, fixtures_dir, binary);
+    run_fixture_empty_request(runner, fixtures_dir, binary);
     true
 }
 
@@ -629,5 +630,62 @@ fn run_fixture_threshold_flush(runner: &Path, fixtures_dir: &Path, binary: &str)
         1,
         "{binary} threshold_flush: noop appears in dict {} times (expected 1)",
         noop_dict.len(),
+    );
+}
+
+/// Phase-4 slice-2 fixture (PF-7 spec-parity follow-up in
+/// `COMMENTS.md`): the minimal observable request. The script body
+/// itself produces one observed call (the implicit top-level closure;
+/// `COMMENTS.md` C-5). With default flush thresholds — both gates set
+/// to values much larger than 1 — no mid-request `F:` line can fire,
+/// and the `RSHUTDOWN`-final flush carries exactly that one record.
+///
+/// The unit test
+/// `rshutdown_release_trace_with_empty_buffer_does_not_flush` covers
+/// the empty-buffer arm directly (it constructs a `Trace` with no
+/// pushed records and asserts no batch lands on the channel). This
+/// fixture pins the *production* counterpart: when a real PHP run
+/// stays comfortably below both gates, the only flush is the
+/// `RSHUTDOWN`-triggered residual.
+fn run_fixture_empty_request(runner: &Path, fixtures_dir: &Path, binary: &str) {
+    let parsed = run_fixture(
+        runner,
+        fixtures_dir,
+        binary,
+        "empty_request.php",
+        // No INI overrides — exercise the harness-default flush
+        // thresholds. Slice-2 directive defaults: `flush_records =
+        // 10_000`, `flush_bytes = 8_388_608` — both unreachable from
+        // a one-record body.
+        &[],
+    );
+    assert_dropped_records(&parsed, 0, binary, "empty_request.php");
+
+    assert_eq!(
+        parsed.flushes.len(),
+        1,
+        "{binary} empty_request: expected exactly 1 F: line (the \
+         RSHUTDOWN residual), got {} ({:?})",
+        parsed.flushes.len(),
+        parsed.flushes,
+    );
+    assert_eq!(
+        parsed.flushes[0].trigger, "rshutdown",
+        "{binary} empty_request: the sole flush must be RSHUTDOWN-triggered, got {}",
+        parsed.flushes[0].trigger,
+    );
+    assert_eq!(
+        parsed.flushes[0].record_count, 1,
+        "{binary} empty_request: the residual flush carries the script-body \
+         record, got record_count={}",
+        parsed.flushes[0].record_count,
+    );
+    assert_eq!(
+        parsed.calls.len(),
+        1,
+        "{binary} empty_request: the script body produces exactly one C: \
+         record, got {} ({:?})",
+        parsed.calls.len(),
+        parsed.calls,
     );
 }

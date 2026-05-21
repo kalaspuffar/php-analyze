@@ -372,7 +372,11 @@ fn request_identity_from_sapi(
 ) -> RequestIdentity {
     let host: Arc<str> = Arc::from(hostname.unwrap_or("(unknown-host)"));
     let sapi: Arc<str> = Arc::from(sapi_name);
-    let uri_or_script = request_uri.unwrap_or("(unknown-uri)").to_owned();
+    // Allocated once per request; the matching `Trace::uri_or_script`
+    // field then carries the same `Arc<str>` for the trace's lifetime,
+    // and `flush_into_pending_batch` clones it into every `MetaPartial`
+    // it produces. See PF-1 in `COMMENTS.md`.
+    let uri_or_script: Arc<str> = Arc::from(request_uri.unwrap_or("(unknown-uri)"));
     RequestIdentity {
         host,
         sapi,
@@ -1094,7 +1098,7 @@ mod tests {
             Some("worker-7.prod"),
         );
         assert_eq!(&*id.sapi, "fpm-fcgi");
-        assert_eq!(id.uri_or_script, "/api/v1/users?page=2");
+        assert_eq!(&*id.uri_or_script, "/api/v1/users?page=2");
         assert_eq!(&*id.host, "worker-7.prod");
         assert_eq!(id.pid, std::process::id());
     }
@@ -1110,7 +1114,7 @@ mod tests {
             Some("dev-laptop"),
         );
         assert_eq!(&*id.sapi, "cli");
-        assert_eq!(id.uri_or_script, "/usr/local/bin/my-script.php");
+        assert_eq!(&*id.uri_or_script, "/usr/local/bin/my-script.php");
     }
 
     #[test]
@@ -1120,7 +1124,7 @@ mod tests {
         // strings the wire format would have to special-case later).
         let id = request_identity_from_sapi("apache2handler", None, None);
         assert_eq!(&*id.sapi, "apache2handler");
-        assert_eq!(id.uri_or_script, "(unknown-uri)");
+        assert_eq!(&*id.uri_or_script, "(unknown-uri)");
         assert_eq!(&*id.host, "(unknown-host)");
     }
 

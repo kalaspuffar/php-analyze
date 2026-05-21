@@ -32,6 +32,21 @@
 //!   or `rshutdown`. A trace may produce zero or more `F:` blocks
 //!   depending on the configured `flush_records` / `flush_bytes` and
 //!   the workload.
+//!
+//!   **Diagnostic semantics (PF-7 in `COMMENTS.md`):** the `F:` line
+//!   records what the **recorder believed it flushed** at the moment
+//!   of the boundary — it does NOT promise the batch reached the
+//!   shipper. A channel-full (`SPECIFICATION.md` §5.3 R-13),
+//!   disconnected, or no-Sender `try_send_batch` will still emit the
+//!   `F:` line; the batch is then dropped and the channel-full arm
+//!   bumps the `drop_counter` by `batch.calls.len()`. A reader
+//!   reconciling delivery against the dump SHOULD cross-reference the
+//!   trailing `DROP:` line, which carries the cumulative drop count at
+//!   trace end. The diagnostic is "attempted flushes" rather than
+//!   "delivered flushes" because it sits in front of `try_send_batch`
+//!   — moving it inside the `Ok(())` arm would lose the
+//!   "recorder produced N batches" signal the slice-2 fixtures
+//!   rely on.
 //! - `D:` lines list dictionary entries new to this batch
 //!   (`Dictionary::take_new_entries`'s output). A function seen in
 //!   batch N keeps its `fn_id` in batch N+1 but does not appear in
@@ -429,7 +444,7 @@ mod tests {
             host: Arc::from("test-host"),
             sapi: Arc::from("cli"),
             pid: 1,
-            uri_or_script: "/tmp/test.php".to_owned(),
+            uri_or_script: Arc::from("/tmp/test.php"),
         }
     }
 

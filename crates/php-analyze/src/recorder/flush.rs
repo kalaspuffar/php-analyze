@@ -34,20 +34,25 @@ use crate::recorder::accounting;
 use crate::recorder::types::{PendingBatch, ShipperMessage};
 use crate::shipper;
 
-/// Hand a freshly-flushed [`PendingBatch`] to the shipper. The four arms
+/// Hand a freshly-flushed [`PendingBatch`] to the shipper. The arms
 /// are listed in design.md §D-4 / §D-7; the spec wording is reproduced
 /// here so a future reader can audit the implementation against the
 /// requirement without leaving the file.
 ///
-/// 1. **No-Sender arm** (silent-disable / never-installed): subtract
-///    `batch.size_estimate` from [`accounting::BYTES_IN_MEMORY`], drop
-///    the batch, return. The drop counter SHALL NOT be bumped — the
-///    batch's records were never visible to any future encoder, and
-///    bumping the counter would attribute the drop to a batch that
-///    will never exist. A `debug_assert!` fires in tests so a future
-///    regression that wires the observer without a Sender surfaces at
-///    `cargo test` time. The slot is checked *here* (not in the
-///    end-handler) so the predicate site stays a pure field-load.
+/// 1. **No-Sender arm** (silent-disable / never-installed): a
+///    `debug_assert!` fires **first** — this branch indicates a
+///    bootstrap bug (the observer ran but no Sender was ever installed)
+///    and we want it loud at `cargo test` time. The panic propagates
+///    to the FFI `catch_unwind` frame in `bootstrap::rshutdown`, which
+///    silently disables the rest of the request. In a release build the
+///    assertion is a no-op; the function then subtracts
+///    `batch.size_estimate` from [`accounting::BYTES_IN_MEMORY`], drops
+///    the batch, and returns. The drop counter SHALL NOT be bumped on
+///    either path — the batch's records were never visible to any
+///    future encoder, and bumping the counter would attribute the drop
+///    to a batch that will never exist. The slot is checked *here*
+///    (not in the end-handler) so the predicate site stays a pure
+///    field-load.
 /// 2. **Sender-present, `Ok(())`**: the channel now owns the bytes.
 ///    The producer SHALL NOT subtract from
 ///    [`accounting::BYTES_IN_MEMORY`]; the shipper's consume-path
@@ -64,6 +69,14 @@ use crate::shipper;
 ///    shipper exited mid-request (only possible after `MSHUTDOWN`
 ///    started draining; not a steady-state condition). Subtract, drop,
 ///    no counter bump — the batch never reaches an encoder.
+/// 5. **Structurally unreachable fall-through** — `try_send` only ever
+///    returns the variant we sent (always `Batch(_)`), so the
+///    `Err(Full(_) | Disconnected(_))` arm whose payload is not a
+///    `Batch` cannot fire today. It is kept as defense-in-depth: a
+///    future refactor that routes a different [`ShipperMessage`]
+///    variant through this helper will trip a `debug_assert!` (with
+///    the budget subtract still happening) instead of silently
+///    leaking `size_estimate` bytes. See PF-4 in `COMMENTS.md`.
 pub(crate) fn try_send_batch(batch: PendingBatch) {
     let Some(sender) = shipper::clone_canonical_sender() else {
         // No-Sender arm. See design D-7.
@@ -75,6 +88,12 @@ pub(crate) fn try_send_batch(batch: PendingBatch) {
         return;
     };
 
+    // Capture the budget contribution before the move into
+    // `ShipperMessage::Batch`. The fall-through `Err(_)` arm below
+    // cannot read it from the moved-out batch, so a local copy is the
+    // only way to keep that arm's `accounting::sub` accurate. See PF-4
+    // in `COMMENTS.md`.
+    let size_estimate = batch.size_estimate;
     match sender.try_send(ShipperMessage::Batch(batch)) {
         Ok(()) => {
             // Bytes now belong to the channel. The shipper's
@@ -86,12 +105,13 @@ pub(crate) fn try_send_batch(batch: PendingBatch) {
             // first so the atomic invariant holds continuously, then
             // bump the counter, then let the batch drop.
             accounting::sub(batch.size_estimate);
-            // Saturating cast: `batch.calls.len()` is `usize` and
-            // bounded by the recorder's `flush_records` (max 10⁹) so
-            // a u64 widen is lossless. `as u64` rather than `try_into`
-            // because the bound is enforced by directive validation —
-            // a panic here would surprise an operator who tweaked
-            // `flush_records` for a tight test.
+            // Lossless `usize → u64` widen: `batch.calls.len()` is
+            // `usize` and bounded by the recorder's `flush_records`
+            // (max 10⁹ per `config.rs::RANGE_FLUSH_RECORDS`), so the
+            // cast can never overflow a `u64`. `as u64` rather than
+            // `try_into` because the bound is enforced by directive
+            // validation — a panic here would surprise an operator
+            // who tweaked `flush_records` for a tight test.
             batch
                 .drop_counter
                 .fetch_add(batch.calls.len() as u64, Ordering::Release);
@@ -106,12 +126,20 @@ pub(crate) fn try_send_batch(batch: PendingBatch) {
             accounting::sub(batch.size_estimate);
             drop(batch);
         }
-        Err(TrySendError::Full(other)) | Err(TrySendError::Disconnected(other)) => {
-            // try_send only ever returns the message variant we sent,
-            // i.e. `Batch(_)`. This arm is reachable only if a future
-            // refactor sends a different variant through this helper.
-            unreachable!(
-                "try_send_batch sent a Batch but try_send returned a non-Batch message: {other:?}",
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            // try_send only ever returns the message variant we sent
+            // (`Batch(_)`), so this arm is structurally unreachable
+            // today. Kept as defense-in-depth (PF-4): if a future
+            // refactor routes a non-`Batch` variant through this
+            // helper, `accounting::sub` still balances the budget and
+            // the `debug_assert!` surfaces the bug at test time.
+            // Release builds keep the silent-disable posture instead
+            // of leaking `size_estimate` bytes for the rest of the
+            // request.
+            accounting::sub(size_estimate);
+            debug_assert!(
+                false,
+                "try_send_batch sent a Batch but try_send returned a non-Batch message variant",
             );
         }
     }
