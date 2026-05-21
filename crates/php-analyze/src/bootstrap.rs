@@ -22,14 +22,17 @@
 //!   PHP-internal paths (e.g. `display_ini_entries`) cannot leak it.
 
 use std::collections::HashMap;
+use std::ffi::CStr;
+use std::sync::Arc;
 
 use ext_php_rs::error::php_error;
 use ext_php_rs::ffi::{php_printf, zend_ini_entry};
 use ext_php_rs::flags::{ErrorType, IniEntryPermission};
-use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, ModuleEntry};
+use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, ModuleEntry, SapiGlobals, SapiModule};
 use ext_php_rs::{info_table_end, info_table_header, info_table_row, info_table_start};
 
 use crate::config::{initialise_from_ini, Config, DisableReason, RawIni, TokenSource};
+use crate::recorder::{self, RequestIdentity};
 
 // --- Directive table -------------------------------------------------------
 
@@ -165,33 +168,124 @@ pub unsafe extern "C" fn mshutdown(_type_: i32, _module_number: i32) -> i32 {
     0
 }
 
-/// `RINIT` — request startup. Short-circuits when the extension is
-/// disabled. No per-request work in this change.
+/// `RINIT` — request startup. Allocates the per-request `Trace` in the
+/// recorder's thread-local slot when the extension is enabled AND the
+/// spike is off. Skipped silently when the extension is disabled
+/// (silent-disable posture) or when the spike is the active observer
+/// (the spike doesn't need the recorder's trace).
 ///
 /// # Safety
 ///
 /// `C` ABI entry point called by Zend at the start of each PHP request.
 /// Reads `Config::global()` which is set during `MINIT` and is
 /// thereafter immutable for the lifetime of the process, so the read
-/// requires no locking.
+/// requires no locking. The `SapiGlobals` / `SapiModule` reads acquire
+/// short-lived `RwLock` guards via ext-php-rs.
 pub unsafe extern "C" fn rinit(_type_: i32, _module_number: i32) -> i32 {
-    if Config::global().map_or(true, |c| !c.enabled) {
+    let Some(config) = Config::global() else {
+        return 0;
+    };
+    if !config.enabled || config.spike_observer {
         return 0;
     }
+    let identity = build_request_identity();
+    recorder::rinit_allocate_trace(identity);
     0
 }
 
-/// `RSHUTDOWN` — request shutdown. Symmetric to [`rinit`].
+/// `RSHUTDOWN` — request shutdown. Releases the recorder's per-request
+/// `Trace`. The recorder's helper is a no-op when the slot is empty,
+/// so this is safe to call regardless of whether `RINIT` allocated.
 ///
 /// # Safety
 ///
 /// `C` ABI entry point called by Zend at the end of each PHP request.
-/// Same `Config::global()` invariant as [`rinit`].
 pub unsafe extern "C" fn rshutdown(_type_: i32, _module_number: i32) -> i32 {
-    if Config::global().map_or(true, |c| !c.enabled) {
-        return 0;
-    }
+    recorder::rshutdown_release_trace();
     0
+}
+
+/// Build a [`RequestIdentity`] from live SAPI state. Reads the SAPI
+/// name, the request URI (FPM-family SAPIs) or argv-script (CLI),
+/// the PID, and the host name. The PHP-touching reads are
+/// short-scoped; the resulting strings are owned (so the
+/// `RequestIdentity` can outlive the SAPI guards).
+fn build_request_identity() -> RequestIdentity {
+    let sapi_name = {
+        let module = SapiModule::get();
+        // `_sapi_module_struct::name` is a `*mut c_char` (bindgen-
+        // exposed; ext-php-rs does not wrap it). On any valid SAPI the
+        // pointer is non-null and points at a NUL-terminated ASCII
+        // string ("cli", "fpm-fcgi", "apache2handler", …).
+        if module.name.is_null() {
+            String::new()
+        } else {
+            // SAFETY: pointer non-null, payload NUL-terminated and
+            // valid for the duration of the read (the SAPI module
+            // table is initialised at PHP startup and immutable
+            // thereafter). Non-UTF-8 names fall through to an empty
+            // string, which the helper handles.
+            unsafe { CStr::from_ptr(module.name) }
+                .to_str()
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
+    let request_uri = {
+        let globals = SapiGlobals::get();
+        let info = globals.request_info();
+        info.request_uri()
+            .map(str::to_owned)
+            .or_else(|| info.argv0().map(str::to_owned))
+    };
+    let host = read_hostname();
+    request_identity_from_sapi(&sapi_name, request_uri.as_deref(), host.as_deref())
+}
+
+/// Pure helper: assemble a [`RequestIdentity`] from string inputs and
+/// the process PID. Factored out of [`build_request_identity`] so unit
+/// tests can exercise the value-building without acquiring PHP locks.
+///
+/// `request_uri` is the SAPI-resolved URI when present (FPM populates
+/// `SG(request_info).request_uri`; CLI populates `argv0`). When both
+/// are missing — exotic SAPI, or a request that hasn't reached its
+/// URI-parse stage — we fall back to a stable placeholder so the
+/// trace's `uri_or_script` is never empty.
+fn request_identity_from_sapi(
+    sapi_name: &str,
+    request_uri: Option<&str>,
+    hostname: Option<&str>,
+) -> RequestIdentity {
+    let host: Arc<str> = Arc::from(hostname.unwrap_or("(unknown-host)"));
+    let sapi: Arc<str> = Arc::from(sapi_name);
+    let uri_or_script = request_uri.unwrap_or("(unknown-uri)").to_owned();
+    RequestIdentity {
+        host,
+        sapi,
+        pid: std::process::id(),
+        uri_or_script,
+    }
+}
+
+/// Read the host name via `gethostname(3)`. Returns `None` on failure
+/// (the syscall is essentially infallible on Linux, but we soft-fail
+/// to keep the silent-disable posture intact). The returned value is
+/// the UTF-8 view of the C string; non-UTF-8 host names fall back to
+/// `None`.
+fn read_hostname() -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    // SAFETY: `gethostname` writes up to `buf.len()` bytes into `buf`
+    // and NUL-terminates the result if it fits. A non-zero return means
+    // failure (truncation, etc.). `buf` is a fresh, owned, properly-
+    // aligned `Vec<u8>` so the pointer is valid for the call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<i8>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // Find the NUL terminator the syscall wrote.
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    String::from_utf8(buf).ok()
 }
 
 /// `MINFO` — `phpinfo()` rendering. Delegates to [`PhpInfoRenderer`],
@@ -874,6 +968,65 @@ mod tests {
             banner.1,
             "ENABLED (DEVELOPMENT-ONLY; do not enable in production)"
         );
+    }
+
+    // --- request_identity_from_sapi ---------------------------------------
+
+    #[test]
+    fn request_identity_from_sapi_uses_request_uri_under_fpm_fcgi() {
+        let id = request_identity_from_sapi(
+            "fpm-fcgi",
+            Some("/api/v1/users?page=2"),
+            Some("worker-7.prod"),
+        );
+        assert_eq!(&*id.sapi, "fpm-fcgi");
+        assert_eq!(id.uri_or_script, "/api/v1/users?page=2");
+        assert_eq!(&*id.host, "worker-7.prod");
+        assert_eq!(id.pid, std::process::id());
+    }
+
+    #[test]
+    fn request_identity_from_sapi_falls_back_to_argv_under_cli() {
+        // Under CLI we pass argv0 in the `request_uri` slot per the
+        // FFI caller in `build_request_identity` (it tries
+        // `request_info.request_uri()` first then `argv0()`).
+        let id = request_identity_from_sapi(
+            "cli",
+            Some("/usr/local/bin/my-script.php"),
+            Some("dev-laptop"),
+        );
+        assert_eq!(&*id.sapi, "cli");
+        assert_eq!(id.uri_or_script, "/usr/local/bin/my-script.php");
+    }
+
+    #[test]
+    fn request_identity_from_sapi_uses_placeholders_when_inputs_are_missing() {
+        // Defensive: a non-CLI/non-FPM SAPI with no request URI must
+        // still produce a usable RequestIdentity (no panic, no empty
+        // strings the wire format would have to special-case later).
+        let id = request_identity_from_sapi("apache2handler", None, None);
+        assert_eq!(&*id.sapi, "apache2handler");
+        assert_eq!(id.uri_or_script, "(unknown-uri)");
+        assert_eq!(&*id.host, "(unknown-host)");
+    }
+
+    #[test]
+    fn request_identity_carries_the_current_pid_and_a_non_empty_host() {
+        // The host name read here is whatever `gethostname` returns
+        // on the test runner; we only assert it's populated.
+        let host = read_hostname();
+        let id = request_identity_from_sapi("cli", Some("/x.php"), host.as_deref());
+        assert_eq!(id.pid, std::process::id());
+        assert!(!id.host.is_empty(), "host must be non-empty");
+    }
+
+    #[test]
+    fn read_hostname_returns_a_non_empty_string_on_linux() {
+        // `gethostname` is effectively infallible on Linux x86_64.
+        // We don't assert a specific value (CI hosts vary), but the
+        // contract is "Some non-empty string".
+        let host = read_hostname().expect("gethostname succeeds on Linux x86_64");
+        assert!(!host.is_empty(), "host must be non-empty");
     }
 
     #[test]
