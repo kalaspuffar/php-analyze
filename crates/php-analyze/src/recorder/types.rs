@@ -407,11 +407,34 @@ impl Trace {
     /// process-wide [`accounting`] atomic. The dict-miss portion of
     /// a call's budget is billed at `begin` time (inside
     /// [`push_dict_entry_via_intern`]) so the cap-gate has the most
-    /// pessimistic projection; the record portion is billed at `end`
-    /// time (here) so the gate at begin still under-estimates by at
-    /// most one `CALL_RECORD_FIXED_BYTES`, which the gate's
-    /// `would_add = CALL_RECORD_FIXED_BYTES + dict_miss_cost`
-    /// projection compensates for.
+    /// pessimistic projection for any **single** call considered in
+    /// isolation; the record portion is billed at `end` time (here).
+    ///
+    /// ### Known imprecision: nested-overshoot under unbalanced LIFO
+    ///
+    /// The cap-gate at `begin` reads `accounting::snapshot()` and
+    /// projects `would_add = CALL_RECORD_FIXED_BYTES +
+    /// dict_miss_cost`. Under nested calls, multiple in-flight
+    /// `begin`s can all see the same pre-bump snapshot and all
+    /// accept; the matching `end`s then each bill
+    /// `CALL_RECORD_FIXED_BYTES` sequentially. The post-`end` budget
+    /// therefore overshoots `buffer_cap_bytes` by up to
+    /// `(in_flight - 1) * CALL_RECORD_FIXED_BYTES` per trace
+    /// (bounded by `max_depth * CALL_RECORD_FIXED_BYTES` in the
+    /// worst case).
+    ///
+    /// This is acceptable per `SPECIFICATION.md` §3.2 which frames
+    /// `buffer_cap_bytes` as a **soft target** — the cap gates new
+    /// admissions, it does not retroactively reject already-running
+    /// calls. The cumulative effect across traces is zero because
+    /// each trace's contribution is subtracted in
+    /// [`rshutdown_release_trace`]. The alternative (bill-at-begin,
+    /// per-record) was considered and rejected because it
+    /// complicates the rshutdown subtract — slice 3 deliberately
+    /// keeps the per-trace estimator and the process-wide atomic in
+    /// lockstep, with the per-record contribution landing on both
+    /// sides at the same point in time (here, at `end`). See
+    /// `COMMENTS.md` DCR-2 review note for the worked example.
     pub fn push_record(&mut self, record: CallRecord) {
         self.buffer.push(record);
         self.buffer_estimated_bytes += CALL_RECORD_FIXED_BYTES;

@@ -113,20 +113,28 @@ pub fn rinit_allocate_trace(identity: RequestIdentity, limits: TraceLimits) {
 pub fn rshutdown_release_trace() {
     CURRENT_TRACE.with(|slot| {
         let trace = slot.borrow_mut().take();
-        // `trace` is consumed below. Phase 4 will move the
-        // `try_send` of the constructed `PendingBatch` to this line.
-        #[cfg(feature = "recorder-dump")]
-        if let Some(trace) = trace.as_ref() {
-            crate::recorder::dump::write_trace_if_path_set(trace);
-        }
         // Slice-3 invariant: subtract this trace's contribution from
         // the process-wide budget so the atomic returns to its
         // pre-trace value at request boundary. Phase 4 will move
         // this subtract to the shipper's batch-consumed path; in
         // slice 3 the trace owns the entire bill, so the
         // rshutdown-time subtract is the only sub site.
+        //
+        // Order matters: the subtract runs **before** any diagnostic
+        // sink so the budget stays exact even if a downstream
+        // hand-off panics (DCR-1). The dump only reads
+        // `drop_counter` / `trace_id`; neither depends on the
+        // per-trace estimator, so the swap is safe. This also
+        // mirrors the shape Phase 4 will inherit: "release budget,
+        // then publish to sink".
         if let Some(trace) = trace.as_ref() {
             accounting::sub(trace.buffer_estimated_bytes);
+        }
+        // `trace` is consumed below. Phase 4 will move the
+        // `try_send` of the constructed `PendingBatch` to this line.
+        #[cfg(feature = "recorder-dump")]
+        if let Some(trace) = trace.as_ref() {
+            crate::recorder::dump::write_trace_if_path_set(trace);
         }
         drop(trace);
     });
