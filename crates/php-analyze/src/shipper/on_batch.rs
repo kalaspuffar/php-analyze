@@ -193,6 +193,132 @@ impl OnBatch for RecordingOnBatch {
     }
 }
 
+/// Test-only [`OnBatch`] that captures the exact `deadline: Option<Instant>`
+/// argument passed to each `handle` call. Sibling of
+/// [`RecordingOnBatch`]; differs only in that `RecordedBatch` stores a
+/// boolean while this fake captures the full `Instant` so a test can
+/// assert "the deadline plumbed to `handle` equals the deadline I
+/// published to `DRAIN_DEADLINE`".
+///
+/// Always returns `OnBatchOutcome::Sent`. Tests that care about the
+/// `Dropped` path reach for [`RecordingOnBatch`] with a scripted
+/// outcome instead.
+#[cfg(test)]
+pub(crate) struct DeadlineRecordingOnBatch {
+    /// The full sequence of `deadline` values seen by `handle`, in
+    /// call order. Wrapped in `Arc<Mutex<_>>` so the test thread can
+    /// read it after the shipper thread joins.
+    pub(crate) seen_deadlines: Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+}
+
+#[cfg(test)]
+impl DeadlineRecordingOnBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen_deadlines: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Convenience: clone the inner `Arc` for the test thread to
+    /// inspect after `JoinHandle::join`. The shipper thread owns the
+    /// original.
+    pub(crate) fn shared_handle(&self) -> Arc<std::sync::Mutex<Vec<Option<Instant>>>> {
+        Arc::clone(&self.seen_deadlines)
+    }
+}
+
+#[cfg(test)]
+impl OnBatch for DeadlineRecordingOnBatch {
+    fn handle(
+        &mut self,
+        _encoded: &[u8],
+        _trace_id: [u8; 16],
+        _records_in_batch: usize,
+        deadline: Option<Instant>,
+    ) -> OnBatchOutcome {
+        self.seen_deadlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(deadline);
+        OnBatchOutcome::Sent
+    }
+}
+
+/// Test-only [`OnBatch`] that sleeps a configurable `Duration` per
+/// `handle` call before returning `Sent`. Models a slow upstream
+/// (e.g. a black-holed HTTPS server) without standing up the
+/// production HTTP path. Used by the AC-BS-4 / AC-PB-2 binding tests
+/// to put real wall-clock time inside the per-batch consume step so
+/// the recv-loop-head cell-read has work to short-circuit.
+///
+/// **Deadline honouring**: if `handle` is called with `Some(deadline)`
+/// and `Instant::now() >= deadline`, the fake returns
+/// `OnBatchOutcome::Dropped { reason: DeadlineExceeded, attempts: 0 }`
+/// **without sleeping**. If the deadline would lapse mid-sleep, the
+/// fake clamps the sleep to `deadline - now` and then returns
+/// `DeadlineExceeded`. This mirrors what the production
+/// `RmpEncodeAndHttpPost` does via `run_with_retry`: every attempt
+/// honours the deadline before starting, and a backoff that would
+/// extend past the deadline collapses the remaining retries.
+#[cfg(test)]
+pub(crate) struct SlowRecordingOnBatch {
+    pub(crate) sleep_per_call: std::time::Duration,
+    /// Number of `handle` calls this fake has serviced (Sent or
+    /// Dropped). Tests assert "the shipper called handle N times"
+    /// against this.
+    pub(crate) calls: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+impl SlowRecordingOnBatch {
+    pub(crate) fn new(sleep_per_call: std::time::Duration) -> Self {
+        Self {
+            sleep_per_call,
+            calls: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn calls_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.calls)
+    }
+}
+
+#[cfg(test)]
+impl OnBatch for SlowRecordingOnBatch {
+    fn handle(
+        &mut self,
+        _encoded: &[u8],
+        _trace_id: [u8; 16],
+        _records_in_batch: usize,
+        deadline: Option<Instant>,
+    ) -> OnBatchOutcome {
+        self.calls.fetch_add(1, Ordering::Release);
+        if let Some(d) = deadline {
+            let now = Instant::now();
+            if now >= d {
+                return OnBatchOutcome::Dropped {
+                    reason: DropReason::DeadlineExceeded,
+                    attempts: 0,
+                };
+            }
+            let remaining = d - now;
+            if remaining < self.sleep_per_call {
+                // Clamp: sleep what we have, then report
+                // DeadlineExceeded so the outer loop's deadline-pass
+                // arm sees a faithful "we couldn't complete in time"
+                // signal.
+                std::thread::sleep(remaining);
+                return OnBatchOutcome::Dropped {
+                    reason: DropReason::DeadlineExceeded,
+                    attempts: 1,
+                };
+            }
+        }
+        std::thread::sleep(self.sleep_per_call);
+        OnBatchOutcome::Sent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

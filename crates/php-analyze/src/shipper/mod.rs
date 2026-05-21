@@ -134,6 +134,53 @@ static SHIPPER_SPAWNED: AtomicBool = AtomicBool::new(false);
 /// thread. Taken out at shutdown.
 static SHIPPER_HANDLE: Mutex<Option<JoinHandle<ShipperExit>>> = Mutex::new(None);
 
+/// MSHUTDOWN drain deadline, published by
+/// [`drain_and_join_at_mshutdown`] **before** the `Drain` message is
+/// sent on the channel. The shipper's pre-drain loop reads this cell
+/// at the head of each iteration; once observed as `Some(_)`, the
+/// loop transitions to the deadline-aware recv body (the same body
+/// the post-`Drain` phase uses), bounding each in-flight batch's
+/// `run_with_retry` budget by the published deadline.
+///
+/// The cell goes `None → Some(_)` exactly once per OS process.
+/// Production code never writes `None`; only test-only `reset_for_test`
+/// and the sibling `set_drain_deadline_for_test` / `clear_drain_deadline_for_test`
+/// helpers reach in to mutate it.
+///
+/// The publish-before-send ordering is what makes AC-BS-4 / AC-PB-2
+/// hold under slice-3 per-batch work (encode + POST + retry): even if
+/// the channel is saturated and the `Drain` message itself is stuck
+/// behind a pile of pre-`Drain` batches, the shipper's next loop
+/// iteration reads this cell and transitions to the deadline-aware
+/// path without waiting for the `Drain`.
+static DRAIN_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Read the MSHUTDOWN drain deadline cell. Returns `None` until
+/// [`publish_drain_deadline`] has been called. Used by [`run_loop`]'s
+/// pre-drain phase to detect MSHUTDOWN without waiting for the
+/// `Drain` message in the channel.
+pub(crate) fn drain_deadline_snapshot() -> Option<Instant> {
+    *DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Publish the MSHUTDOWN drain deadline. Called exactly once per
+/// process by [`drain_and_join_at_mshutdown`] immediately before the
+/// `Drain` message is sent and the canonical `Sender` is dropped.
+///
+/// In production the cell is `None` on entry; the `debug_assert!`
+/// catches a future refactor that double-publishes. Tests that need
+/// to model a republish (e.g. cell-cleared-between-MSHUTDOWNs) reach
+/// for [`set_drain_deadline_for_test`] instead, which has no such
+/// assertion.
+pub(crate) fn publish_drain_deadline(deadline: Instant) {
+    let mut slot = DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner());
+    debug_assert!(
+        slot.is_none(),
+        "DRAIN_DEADLINE is monotonic None → Some; production code publishes at most once per process"
+    );
+    *slot = Some(deadline);
+}
+
 /// `SPECIFICATION.md` §5.2 step 4 drop-notice queue.
 ///
 /// The shipper thread produces "one `E_NOTICE` per dropped batch"
@@ -217,13 +264,27 @@ pub(crate) fn drain_drop_notices() -> Vec<String> {
 /// reason: EncodeFailed, .. }`) bump the drop counter the same way.
 pub(crate) fn run_loop(rx: Receiver<ShipperMessage>, mut on_batch: impl OnBatch) -> ShipperExit {
     let mut batches_drained: u64 = 0;
-    let deadline: Instant = loop {
+    // Snapshot of the [`DRAIN_DEADLINE`] cell. `None` means no MSHUTDOWN
+    // deadline is in effect yet; the loop re-reads the cell at the top
+    // of each iteration. Once observed as `Some(_)`, the loop
+    // transitions to `run_drain_phase` and never re-reads the cell
+    // (the value is monotonic `None → Some` by construction).
+    let mut local_deadline: Option<Instant> = None;
+    loop {
+        if local_deadline.is_none() {
+            local_deadline = drain_deadline_snapshot();
+        }
+        if let Some(d) = local_deadline {
+            return run_drain_phase(&rx, &mut on_batch, d, batches_drained);
+        }
         match rx.recv() {
             Ok(ShipperMessage::Batch(batch)) => {
                 drained_consume(&batch, &mut on_batch, None, &mut batches_drained);
                 drop(batch);
             }
-            Ok(ShipperMessage::Drain { deadline }) => break deadline,
+            Ok(ShipperMessage::Drain { deadline }) => {
+                return run_drain_phase(&rx, &mut on_batch, deadline, batches_drained);
+            }
             Err(RecvError) => {
                 return ShipperExit {
                     batches_drained,
@@ -232,25 +293,63 @@ pub(crate) fn run_loop(rx: Receiver<ShipperMessage>, mut on_batch: impl OnBatch)
                 };
             }
         }
-    };
+    }
+}
+
+/// The shared deadline-aware recv body, entered when either the
+/// [`DRAIN_DEADLINE`] cell is observed `Some(_)` or a
+/// `ShipperMessage::Drain { deadline }` is popped from the channel.
+///
+/// `recv_deadline(deadline)` blocks until either a message arrives or
+/// the deadline lapses. Each consumed `Batch` is passed to
+/// `drained_consume(.., Some(deadline), ..)` so the per-batch
+/// `run_with_retry` budget is bounded by the same deadline. A second
+/// `Drain { .. }` message in the channel is tolerated (ignored after
+/// a `debug_assert_eq!` that its deadline agrees with the entry
+/// deadline; this is the "both signals delivered, both agree by
+/// construction" case).
+///
+/// Termination:
+///
+/// - `Err(RecvTimeoutError::Disconnected)`: the channel closed
+///   cleanly. Return `drain_completed: true`,
+///   `batches_abandoned_at_deadline: 0`.
+/// - `Err(RecvTimeoutError::Timeout)`: the deadline passed. Drain
+///   the residual queue via `try_recv` so abandoned batches return
+///   their `size_estimate` to the budget, count each abandoned
+///   batch, and return `drain_completed: false`.
+fn run_drain_phase(
+    rx: &Receiver<ShipperMessage>,
+    on_batch: &mut impl OnBatch,
+    deadline: Instant,
+    mut batches_drained: u64,
+) -> ShipperExit {
     loop {
         match rx.recv_deadline(deadline) {
             Ok(ShipperMessage::Batch(batch)) => {
-                drained_consume(&batch, &mut on_batch, Some(deadline), &mut batches_drained);
+                drained_consume(&batch, on_batch, Some(deadline), &mut batches_drained);
                 drop(batch);
             }
             // A second Drain is structurally unreachable today (only
             // `drain_and_join_at_mshutdown` sends Drain, and only
             // once), but tolerating it costs nothing and removes a
-            // future-bug class.
-            Ok(ShipperMessage::Drain { .. }) => {}
+            // future-bug class. When both signals are live, the
+            // deadlines agree by construction — both are computed
+            // from the same local in `drain_and_join_at_mshutdown`.
+            Ok(ShipperMessage::Drain {
+                deadline: drain_msg_deadline,
+            }) => {
+                debug_assert_eq!(
+                    deadline, drain_msg_deadline,
+                    "cell-published and Drain-message deadlines must agree",
+                );
+            }
             Err(RecvTimeoutError::Timeout) => {
-                // Slice-2 design D-5 (preserved through slice 3):
-                // drain the residual queue so abandoned batches
-                // return their bytes to the budget. Slice 3 does
-                // NOT encode-and-POST abandoned batches — the
-                // deadline has passed; we just balance accounting
-                // and count them.
+                // Drain the residual queue so abandoned batches
+                // return their bytes to the budget. We do NOT
+                // encode-and-POST abandoned batches — the deadline
+                // has passed; we just balance accounting and count
+                // them.
                 let mut abandoned: u64 = 0;
                 loop {
                     match rx.try_recv() {
@@ -447,7 +546,30 @@ pub(crate) fn spawn_if_needed_at_rinit_for_test() {
 /// Sender, and join the shipper thread. The `+ 200 ms` slack
 /// referenced by `SPECIFICATION.md` AC-BS-4 / AC-PB-2 is the budget
 /// for the channel-close + `recv_deadline`-loop-exit + `JoinHandle::join`
-/// overhead; slice 1 measurably stays well under it.
+/// overhead.
+///
+/// ## Two-signal protocol for the MSHUTDOWN deadline
+///
+/// 1. **Cell publish (primary)**: write `Some(deadline)` to the
+///    process-global [`DRAIN_DEADLINE`] cell. The shipper's pre-drain
+///    loop snapshots this cell at the head of each iteration; once
+///    observed as `Some(_)`, the loop transitions to the
+///    deadline-aware recv body without waiting for the `Drain`
+///    message.
+/// 2. **`Drain` message (secondary)**: send `ShipperMessage::Drain { deadline }`
+///    via `send_timeout(grace)`. Carries the same `deadline` value as
+///    the cell; serves as a redundant signal for code paths that
+///    bypass this function (tests pushing `Drain` directly into the
+///    channel).
+///
+/// The publish-before-send ordering matters: under a saturated
+/// channel with slow per-batch work (slice 3's encode + POST + retry
+/// can take `(retry_count + 1) × http_timeout_ms` per batch), the
+/// `send_timeout` may run out before the `Drain` reaches the front
+/// of the queue. The cell publish gives the shipper an out-of-band
+/// signal that the recv-loop head observes regardless of channel
+/// state. The mutex's release-on-drop semantics establish a
+/// happens-before edge with the shipper's next snapshot read.
 ///
 /// A panicking shipper thread is turned into
 /// [`JoinOutcome::Panicked`]; the function itself does not panic, so
@@ -462,27 +584,18 @@ pub(crate) fn drain_and_join_at_mshutdown(grace: Duration) -> JoinOutcome {
         return JoinOutcome::NotInstalled;
     };
     let deadline = Instant::now() + grace;
-    // `send_timeout(grace)` (not `try_send`) so the Drain message —
-    // and the deadline it carries — still reaches the shipper when
-    // the channel is momentarily full. `try_send` would silently
-    // skip the Drain on a saturated queue, and the shipper would
-    // then drain the entire backlog *without* ever seeing the
-    // deadline; in slice 1 that's harmless (each batch is a few
-    // instructions) but slice 2's encode + POST + retry per batch
-    // can blow past `shutdown_grace_ms` in the worst case. If
-    // `send_timeout` itself runs out the grace, the `drop(sender)`
-    // below closes the channel and the shipper exits via
-    // `Disconnected` — the deadline is effectively zero by then.
-    //
-    // TODO(slice-2): once `run_loop` performs real per-batch work,
-    // even a successfully-delivered Drain is not enough on its own.
-    // A full queue plus slow work blows past `grace` while the
-    // shipper is still chewing through pre-Drain batches. Slice 2
-    // must expose the deadline to the recv-loop head — e.g. a
-    // sibling `OnceLock<Instant>` or `AtomicI64`-as-`Instant` — so
-    // the loop can self-exit even before the Drain message
-    // surfaces. See `COMMENTS.md` round-1 review finding R-1 for
-    // the full rationale.
+    // Publish the deadline **before** sending the `Drain` message
+    // (and before dropping the canonical `Sender`). The shipper's
+    // next pre-drain loop iteration reads the cell and transitions
+    // to the deadline-aware path even if the `Drain` is stuck behind
+    // a saturated queue — this is what makes AC-BS-4 / AC-PB-2 hold
+    // under slice-3's per-batch encode + POST + retry work.
+    publish_drain_deadline(deadline);
+    // `send_timeout(grace)` (not `try_send`) so the Drain message
+    // also reaches the shipper when the channel is momentarily full.
+    // The cell publish above is the primary signal; the Drain is a
+    // redundant secondary so test code paths that bypass this
+    // function still observe a deadline.
     let _ = sender.send_timeout(ShipperMessage::Drain { deadline }, grace);
     // Dropping the canonical Sender (and any clones held by future
     // slice-2 producers, all of which are already gone at MSHUTDOWN
@@ -517,11 +630,31 @@ pub(crate) fn reset_for_test() {
     *SENDER_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *RECEIVER_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SHIPPER_SPAWNED.store(false, Ordering::SeqCst);
     DROP_NOTICE_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+/// Test-only: write the [`DRAIN_DEADLINE`] cell directly, bypassing
+/// the `debug_assert!(slot.is_none())` in [`publish_drain_deadline`].
+/// Tests use this seam to model "deadline published, but `Drain`
+/// message never sent" — the binding shape of the
+/// `run_loop_with_cell_publish_and_no_drain_message_*` scenarios.
+#[cfg(test)]
+pub(crate) fn set_drain_deadline_for_test(deadline: Instant) {
+    *DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = Some(deadline);
+}
+
+/// Test-only: clear the [`DRAIN_DEADLINE`] cell back to `None` without
+/// touching the other process-global slots. Sibling of
+/// [`set_drain_deadline_for_test`]; [`reset_for_test`] is the broader
+/// hammer.
+#[cfg(test)]
+pub(crate) fn clear_drain_deadline_for_test() {
+    *DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Test-only: peek the canonical Sender's `is_some()` state without
@@ -701,6 +834,12 @@ mod tests {
 
     #[test]
     fn run_loop_drains_three_batches_and_exits_cleanly_on_channel_close() {
+        // `run_loop` reads the process-global `DRAIN_DEADLINE` cell;
+        // hold the test lock and reset state so a concurrent test
+        // that publishes the cell cannot leak its deadline into our
+        // recv-loop. Same pattern below for every `run_loop_*` test.
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -717,10 +856,13 @@ mod tests {
                 batches_abandoned_at_deadline: 0,
             }
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_drain_future_deadline_finishes_queued_batches() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -747,10 +889,13 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "exit should not wait for the 5s deadline; took {elapsed:?}"
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_drain_past_deadline_abandons_queued_batches() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(128);
         for _ in 0..100 {
             tx.send(dummy_batch()).unwrap();
@@ -782,10 +927,13 @@ mod tests {
         // Now drop the sender so the test doesn't keep the channel
         // alive past the function.
         drop(tx);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_exits_cleanly_on_channel_close_without_a_drain() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -795,10 +943,13 @@ mod tests {
         assert!(exit.drain_completed);
         assert_eq!(exit.batches_drained, 1);
         assert_eq!(exit.batches_abandoned_at_deadline, 0);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_with_empty_channel_and_immediate_close_returns_zero_counts() {
+        let _guard = lock();
+        reset_for_test();
         let (tx, rx) = bounded::<ShipperMessage>(8);
         let handle =
             thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
@@ -812,13 +963,16 @@ mod tests {
                 batches_abandoned_at_deadline: 0,
             }
         );
+        reset_for_test();
     }
 
     // --- Phase-4 slice 2: consume-path accounting subtract --------------
 
     #[test]
     fn run_loop_pre_drain_subtracts_size_estimate_for_each_consumed_batch() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
 
         // Seed the budget with the sum of three batches' size_estimates.
@@ -842,11 +996,14 @@ mod tests {
             0,
             "every consumed batch's size_estimate is returned to the budget",
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_drain_phase_subtracts_size_estimate_for_future_deadline() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
         crate::recorder::accounting::add(500);
 
@@ -872,11 +1029,14 @@ mod tests {
             0,
             "both pre-drain and drain-phase consumes subtract from the budget",
         );
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_deadline_pass_subtracts_size_estimate_for_abandoned_batches() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
         crate::recorder::accounting::add(1_000);
 
@@ -911,11 +1071,14 @@ mod tests {
             "deadline-pass arm must drain residual batches and subtract their bytes",
         );
         drop(tx);
+        reset_for_test();
     }
 
     #[test]
     fn run_loop_deadline_pass_with_no_residual_returns_zero_abandoned() {
+        let _guard = lock();
         let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
         crate::recorder::accounting::reset_for_test();
 
         let (tx, rx) = bounded::<ShipperMessage>(8);
@@ -940,6 +1103,7 @@ mod tests {
         );
         assert_eq!(crate::recorder::accounting::snapshot(), 0);
         drop(tx);
+        reset_for_test();
     }
 
     // --- install_channel_at_minit --------------------------------------
@@ -1301,6 +1465,359 @@ mod tests {
             "Sent outcome must not queue a drop notice",
         );
         assert_eq!(counter, 1, "Sent outcome bumps batches_drained");
+        reset_for_test();
+    }
+
+    // --- §SEH-9 DRAIN_DEADLINE cell ------------------------------------
+
+    #[test]
+    fn drain_deadline_is_none_at_process_start() {
+        let _guard = lock();
+        reset_for_test();
+        assert!(
+            drain_deadline_snapshot().is_none(),
+            "DRAIN_DEADLINE starts None and reset_for_test clears it back to None",
+        );
+    }
+
+    #[test]
+    fn publish_drain_deadline_transitions_cell_to_some_and_reset_clears_it() {
+        let _guard = lock();
+        reset_for_test();
+        assert!(drain_deadline_snapshot().is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        set_drain_deadline_for_test(deadline);
+        assert_eq!(
+            drain_deadline_snapshot(),
+            Some(deadline),
+            "set_drain_deadline_for_test publishes the exact Instant",
+        );
+        clear_drain_deadline_for_test();
+        assert!(
+            drain_deadline_snapshot().is_none(),
+            "clear_drain_deadline_for_test returns the cell to None",
+        );
+        set_drain_deadline_for_test(deadline);
+        reset_for_test();
+        assert!(
+            drain_deadline_snapshot().is_none(),
+            "reset_for_test clears the cell alongside the other slots",
+        );
+    }
+
+    #[test]
+    fn run_loop_with_cell_publish_and_no_drain_message_still_exits_via_deadline_pass() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(400);
+
+        // Saturate the channel with 4 batches, publish a past
+        // deadline to the cell, then spawn the shipper. The shipper
+        // SHALL self-exit via the deadline-pass arm without ever
+        // popping a `Drain` message.
+        let (tx, rx) = bounded::<ShipperMessage>(16);
+        for _ in 0..4 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        set_drain_deadline_for_test(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        );
+        let start = Instant::now();
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
+        let exit = handle.join().expect("shipper joined cleanly");
+        let elapsed = start.elapsed();
+
+        assert!(
+            !exit.drain_completed,
+            "cell-published past deadline → deadline-pass exit, got {exit:?}",
+        );
+        assert_eq!(
+            exit.batches_drained + exit.batches_abandoned_at_deadline,
+            4,
+            "every batch is accounted for: {exit:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "cell-published past deadline must short-circuit promptly; took {elapsed:?}",
+        );
+        assert_eq!(
+            crate::recorder::accounting::snapshot(),
+            0,
+            "accounting balanced across pre-drain consumes and deadline-pass abandons",
+        );
+        drop(tx);
+        reset_for_test();
+    }
+
+    #[test]
+    fn run_loop_with_cell_publish_passes_some_deadline_to_drained_consume() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+
+        // Publish the cell FIRST so the recv-loop head observes it on
+        // its very first iteration; otherwise the first batch is
+        // consumed under the slice-3 `None` path and we'd assert on
+        // the second batch.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        set_drain_deadline_for_test(deadline);
+
+        let (tx, rx) = bounded::<ShipperMessage>(8);
+        tx.send(dummy_batch()).unwrap();
+        tx.send(dummy_batch()).unwrap();
+        drop(tx);
+
+        let recorder = on_batch::DeadlineRecordingOnBatch::new();
+        let shared = recorder.shared_handle();
+        let handle = thread::spawn(move || run_loop(rx, recorder));
+        let _exit = handle.join().expect("shipper joined cleanly");
+
+        let seen = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "two batches → two handle calls; got {} ({seen:?})",
+            seen.len(),
+        );
+        for (i, observed) in seen.iter().enumerate() {
+            assert_eq!(
+                *observed,
+                Some(deadline),
+                "batch {i}'s deadline must match the cell value exactly; observed {observed:?}",
+            );
+        }
+        reset_for_test();
+    }
+
+    #[test]
+    fn run_loop_with_cell_publish_and_comfortable_deadline_drains_normally() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(800);
+
+        // Publish a 10s deadline. With a fast `RecordingOnBatch`, the
+        // loop should drain all 8 batches in milliseconds — proving
+        // the cell-publish does not pessimise the happy path.
+        set_drain_deadline_for_test(Instant::now() + Duration::from_secs(10));
+
+        let (tx, rx) = bounded::<ShipperMessage>(16);
+        for _ in 0..8 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        drop(tx);
+
+        let start = Instant::now();
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
+        let exit = handle.join().expect("shipper joined cleanly");
+        let elapsed = start.elapsed();
+
+        assert!(
+            exit.drain_completed,
+            "comfortable deadline + Sender drop → clean close, got {exit:?}",
+        );
+        assert_eq!(exit.batches_drained, 8);
+        assert_eq!(exit.batches_abandoned_at_deadline, 0);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "comfortable deadline must not pessimise the happy path; took {elapsed:?}",
+        );
+        assert_eq!(crate::recorder::accounting::snapshot(), 0);
+        reset_for_test();
+    }
+
+    #[test]
+    fn drain_and_join_at_mshutdown_publishes_cell_before_send() {
+        let _guard = lock();
+        reset_for_test();
+        install_channel_at_minit(8);
+        spawn_if_needed_at_rinit_for_test();
+        assert!(drain_deadline_snapshot().is_none(), "cell starts empty",);
+        let outcome = drain_and_join_at_mshutdown(Duration::from_millis(50));
+        assert!(
+            matches!(outcome, JoinOutcome::Clean(_)),
+            "clean shutdown; got {outcome:?}",
+        );
+        assert!(
+            drain_deadline_snapshot().is_some(),
+            "drain_and_join_at_mshutdown publishes the cell before it returns",
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    fn drain_and_join_at_mshutdown_with_saturated_channel_and_slow_on_batch_returns_within_grace() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(800);
+
+        // Set up a channel + handle slot manually so we can wire a
+        // deadline-honouring SlowRecordingOnBatch (the production
+        // spawn helper would pass RmpEncodeAndHttpPost). Push 8
+        // batches before the shipper starts so the queue is
+        // saturated. Each handle call would sleep 100ms if it had
+        // time, but the fake honours `deadline` — once now ≥ deadline
+        // it returns `DropReason::DeadlineExceeded` immediately
+        // (mirroring what `run_with_retry` does between attempts in
+        // production). With a 200ms grace, only ~2 batches can
+        // complete Sent; the remaining ~6 return DeadlineExceeded
+        // and the shipper exits via the channel-close arm once the
+        // queue empties.
+        //
+        // The AC-BS-4 / AC-PB-2 binding invariants are:
+        //   1. elapsed time ≤ grace + 200ms slack.
+        //   2. accounting balanced (every batch's size_estimate
+        //      returned to the budget, regardless of Sent vs
+        //      DeadlineExceeded).
+        //   3. every batch was passed to `handle` (the `calls`
+        //      counter equals 8).
+        //
+        // The `drained` / `abandoned` / `deadline-exceeded` split is
+        // timing-dependent (depends on how fast the test host
+        // services the queue) and does not bind the AC; we do NOT
+        // assert on `drain_completed` or the split between
+        // `batches_drained` and `batches_abandoned_at_deadline`.
+        let (tx, rx) = bounded::<ShipperMessage>(16);
+        for _ in 0..8 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        install_test_sender(tx);
+
+        let slow = on_batch::SlowRecordingOnBatch::new(Duration::from_millis(100));
+        let calls = slow.calls_handle();
+        let join_handle = thread::Builder::new()
+            .name("php-analyze-shipper-slow-test".to_owned())
+            .spawn(move || run_loop(rx, slow))
+            .expect("spawn slow shipper thread");
+        *SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(join_handle);
+
+        let start = Instant::now();
+        let outcome = drain_and_join_at_mshutdown(Duration::from_millis(200));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, JoinOutcome::Clean(_)),
+            "expected Clean, got {outcome:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "AC-BS-4 / AC-PB-2 bound: grace (200ms) + 200ms slack; took {elapsed:?}",
+        );
+        let observed_calls = calls.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            observed_calls, 8,
+            "every batch was passed to handle (some Sent, rest DeadlineExceeded); \
+             observed {observed_calls}",
+        );
+        assert_eq!(
+            crate::recorder::accounting::snapshot(),
+            0,
+            "every batch's size_estimate is returned to the budget",
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    fn cell_publish_mid_flight_collapses_in_progress_recv_loop() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(800);
+
+        // 8 batches with a SlowRecordingOnBatch that sleeps 50ms per
+        // call (and honours the deadline). Spawn the shipper, let it
+        // start consuming, then publish a near-future deadline from
+        // the test thread. The shipper SHALL pick up the cell on its
+        // next recv-loop iteration and bound the remaining batches
+        // to the published deadline.
+        //
+        // Binding invariants (same shape as the AC-BS-4 test above):
+        //   1. elapsed bounded by deadline + slack.
+        //   2. every batch was passed to handle (`calls` == 8).
+        //   3. accounting balanced.
+        // The `drained` / `abandoned` split is timing-dependent.
+        let (tx, rx) = bounded::<ShipperMessage>(16);
+        for _ in 0..8 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        let slow = on_batch::SlowRecordingOnBatch::new(Duration::from_millis(50));
+        let calls = slow.calls_handle();
+        let start = Instant::now();
+        let join_handle = thread::spawn(move || run_loop(rx, slow));
+
+        // Let the shipper consume one batch (~50ms), then publish a
+        // 100ms deadline. The shipper's next iteration after the
+        // current handle returns observes the cell.
+        thread::sleep(Duration::from_millis(60));
+        set_drain_deadline_for_test(Instant::now() + Duration::from_millis(100));
+
+        let exit = join_handle.join().expect("shipper joined cleanly");
+        let elapsed = start.elapsed();
+
+        // Timing budget: ~60ms (warm-up) + 100ms (deadline) +
+        // 50ms (final in-flight batch) + 200ms (test slack).
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cell publish mid-flight bounds the loop; took {elapsed:?}, exit={exit:?}",
+        );
+        let observed_calls = calls.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            observed_calls, 8,
+            "every batch was passed to handle (some Sent, rest DeadlineExceeded); \
+             observed {observed_calls}",
+        );
+        assert_eq!(crate::recorder::accounting::snapshot(), 0);
+        drop(tx);
+        reset_for_test();
+    }
+
+    #[test]
+    fn run_loop_with_drain_message_only_and_no_cell_publish_preserves_slice_3_behaviour() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(300);
+
+        // Tests that bypass `drain_and_join_at_mshutdown` (i.e.
+        // push `Drain { deadline }` directly into the channel) must
+        // continue to work — slice-3 semantics are preserved on this
+        // path. The cell stays `None` throughout.
+        assert!(drain_deadline_snapshot().is_none());
+
+        let (tx, rx) = bounded::<ShipperMessage>(8);
+        for _ in 0..3 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        tx.send(ShipperMessage::Drain {
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .unwrap();
+        drop(tx);
+
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
+        let exit = handle.join().expect("shipper joined cleanly");
+
+        assert!(exit.drain_completed, "clean close, got {exit:?}");
+        assert_eq!(exit.batches_drained, 3);
+        assert_eq!(exit.batches_abandoned_at_deadline, 0);
+        assert!(
+            drain_deadline_snapshot().is_none(),
+            "Drain-message-only path leaves the cell empty",
+        );
+        assert_eq!(crate::recorder::accounting::snapshot(), 0);
         reset_for_test();
     }
 }
