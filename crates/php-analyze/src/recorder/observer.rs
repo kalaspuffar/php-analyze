@@ -1094,6 +1094,8 @@ mod tests {
 
     #[test]
     fn rinit_allocate_trace_populates_the_slot() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let _g = TraceGuard::enter(stub_identity());
         let pid = with_current_trace(|trace| trace.pid).expect("slot must be Some after RINIT");
         assert_eq!(pid, 1);
@@ -1101,6 +1103,8 @@ mod tests {
 
     #[test]
     fn rshutdown_release_trace_drops_the_slot() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         rinit_allocate_trace(stub_identity(), permissive_limits());
         assert!(with_current_trace(|_| ()).is_some());
         rshutdown_release_trace();
@@ -1112,6 +1116,8 @@ mod tests {
 
     #[test]
     fn rshutdown_release_trace_on_empty_slot_is_a_noop() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         // Ensure the slot is empty (a previous test may have left it
         // populated; the guard's Drop handles that, but be defensive).
         rshutdown_release_trace();
@@ -1123,6 +1129,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "RINIT without RSHUTDOWN")]
     fn double_rinit_without_rshutdown_panics_in_debug_builds() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         // Debug-only invariant: the pairing failure surfaces as a
         // `debug_assert!` panic so test runs and developer rebuilds
         // catch it loudly. Release builds take the silent-recovery
@@ -1136,6 +1144,8 @@ mod tests {
     #[test]
     #[cfg(not(debug_assertions))]
     fn double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         // Release-path RO-1 invariant: a `RINIT` on top of a
         // populated slot does NOT panic across the FFI boundary;
         // instead the stale `Trace` is dropped and a fresh one
@@ -1160,6 +1170,8 @@ mod tests {
 
     #[test]
     fn with_current_trace_returns_none_when_slot_is_empty() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         rshutdown_release_trace();
         assert!(with_current_trace(|_| 42).is_none());
     }
@@ -1432,6 +1444,8 @@ mod tests {
 
     #[test]
     fn begin_with_snapshots_pushes_one_frame_with_call_id_one_and_parent_zero() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let info = stub_site(Some("only_me"), None, Some("/x.php"), 3, false);
         let cat = categorise(&info);
@@ -1452,6 +1466,8 @@ mod tests {
 
     #[test]
     fn begin_then_end_emits_one_callrecord_with_matching_fields() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let info = stub_site(Some("only_me"), None, Some("/x.php"), 3, false);
         let cat = categorise(&info);
@@ -1479,6 +1495,8 @@ mod tests {
 
     #[test]
     fn nested_calls_produce_chained_parent_pointers() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
 
         // `info_*` bindings must outlive the `Categorised` values
@@ -1516,6 +1534,8 @@ mod tests {
 
     #[test]
     fn dict_miss_allocates_once_dict_hit_allocates_zero_strings() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let info = stub_site(Some("repeat"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
@@ -1542,6 +1562,8 @@ mod tests {
 
     #[test]
     fn end_with_abnormal_true_writes_abnormal_exit_true() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let info = stub_site(Some("bad"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
@@ -1555,6 +1577,8 @@ mod tests {
 
     #[test]
     fn saturating_cpu_delta_reads_as_zero_when_exit_cpu_less_than_entry_cpu() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let info = stub_site(Some("anywhere"), None, Some("/x.php"), 1, false);
         let cat = categorise(&info);
@@ -1594,6 +1618,8 @@ mod tests {
         // signal for the pairing bug in test/dev builds; this
         // helper is the recovery path the assert documents, and
         // both should be tested.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         finish_call_record(&mut trace, None, exit_snapshots(), false);
         assert!(
@@ -1609,6 +1635,8 @@ mod tests {
         // does the real work when handed `Some(frame)`. Together the
         // two tests pin both arms of the helper without depending on
         // `cfg(debug_assertions)`.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let mut trace = fresh_trace();
         let frame = CallFrame {
             call_id: 7,
@@ -1645,6 +1673,8 @@ mod tests {
         // direct way to assert "no syscall" without a mock clock,
         // so this test pins the structural smoke: the closure body
         // is never entered when the slot is empty.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         rshutdown_release_trace(); // ensure empty
         let r = Recorder;
         assert!(r.should_observe(&empty_fcall_info()));
@@ -2725,6 +2755,8 @@ mod tests {
         // Construct a `Recorder` directly (zero-size, no FFI). Its
         // `should_observe` is true regardless of the slot state — the
         // caching contract documented at the top of this module.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
         let r = BootObserver::Recorder(Recorder);
         rshutdown_release_trace();
         assert!(r.should_observe(&empty_fcall_info()));
