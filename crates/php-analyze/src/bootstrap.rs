@@ -34,13 +34,27 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// FFI-touching imports — gated to production builds because every
+// symbol they reach (`php_error_docref`, `php_printf`, `zend_*`) is
+// unresolvable at link time without a live PHP runtime. See
+// [`startup_body`]'s doc comment.
+#[cfg(not(test))]
 use ext_php_rs::error::php_error;
+#[cfg(not(test))]
 use ext_php_rs::ffi::{php_printf, zend_ini_entry};
+#[cfg(not(test))]
 use ext_php_rs::flags::{ErrorType, IniEntryPermission};
-use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef, ModuleEntry, SapiGlobals, SapiModule};
+#[cfg(not(test))]
+use ext_php_rs::zend::{ExecutorGlobals, IniEntryDef};
+use ext_php_rs::zend::{ModuleEntry, SapiGlobals, SapiModule};
 use ext_php_rs::{info_table_end, info_table_header, info_table_row, info_table_start};
 
-use crate::config::{initialise_from_ini, Config, DisableReason, RawIni, TokenSource};
+#[cfg(not(test))]
+use crate::config::initialise_from_ini;
+use crate::config::{Config, DisableReason, RawIni, TokenSource};
 use crate::recorder::types::TraceLimits;
 use crate::recorder::{self, RequestIdentity};
 use crate::shipper;
@@ -56,6 +70,9 @@ struct Directive {
     default: &'static str,
     /// If `true`, register the directive with the `***` displayer so PHP's
     /// own rendering paths cannot leak the value. Only `auth_token`.
+    /// `#[cfg_attr(test, allow(dead_code))]` because the only reader is
+    /// the `#[cfg(not(test))]`-gated `register_directives`.
+    #[cfg_attr(test, allow(dead_code))]
     redact_display: bool,
 }
 
@@ -147,11 +164,90 @@ const DIRECTIVES: &[Directive] = &[
 
 // --- Lifecycle hooks -------------------------------------------------------
 
+/// Test-only seam: when `true`, [`startup_body`] panics at the head
+/// of its body *before* any FFI call. The matching
+/// `startup_body_panic_is_contained_by_catch_unwind` and
+/// `startup_returns_zero_on_panic` tests use this to force a panic
+/// without standing up a live PHP runtime. Production builds never
+/// see this static (the `#[cfg(test)]` strips both the slot and the
+/// load inside [`startup_body`]).
+#[cfg(test)]
+static PANIC_IN_STARTUP_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
 /// `MINIT` — module startup. Wired into the `#[php_module]`-generated
-/// startup via `#[php(startup = startup)]` in `lib.rs`. Returns `0` on
-/// success per the Zend convention, and **always** returns `0` (silent-disable
-/// posture).
+/// startup via `#[php(startup = startup)]` in `lib.rs`.
+///
+/// The body runs inside `std::panic::catch_unwind` so that any panic
+/// in [`register_directives`], [`read_raw_ini`], [`initialise_from_ini`],
+/// the `php_error` warning loop, or [`install_shipper_if_enabled`] is
+/// contained at the FFI frame instead of unwinding into Zend (undefined
+/// behaviour / process abort on most builds). On a caught panic the
+/// shim still returns `0` so PHP keeps starting and the extension
+/// silent-disables — exactly the same posture every other lifecycle
+/// hook in this module follows (`mshutdown`, `rinit`, `rshutdown`).
+/// Matches `SPECIFICATION.md` §8.3 NFR-REL-1 ("never crash PHP") and
+/// AD-4 (silent-disable on misconfig).
+///
+/// Returns `0` (Zend `SUCCESS`) unconditionally. The Zend convention
+/// would normally let us signal startup failure via `-1`, but that
+/// would also surface as an operator-visible PHP startup error — the
+/// opposite of the silent-disable posture.
 pub fn startup(_type_: i32, module_number: i32) -> i32 {
+    // `module_number: i32` is `Copy + UnwindSafe`, so the closure is
+    // `UnwindSafe` by construction; no `AssertUnwindSafe` needed.
+    let _ = std::panic::catch_unwind(|| startup_body(module_number));
+    0
+}
+
+/// Pure-Rust body of [`startup`]. Factored out so the `catch_unwind`
+/// in the public shim captures every panic site downstream — including
+/// FFI calls to `IniEntryDef::register`, `ExecutorGlobals::ini_values()`,
+/// `php_error`, and the Phase-4 shipper-channel install. Returning `()`
+/// keeps the closure `UnwindSafe` without needing `AssertUnwindSafe`.
+///
+/// ## Why the FFI body lives in a `#[cfg(not(test))]` sibling
+///
+/// The `cargo test` binary links without a live PHP runtime, so
+/// every symbol the production body reaches
+/// (`php_error_docref` via `php_error`, `php_printf` via the
+/// `redact_displayer` address registered in `register_directives`,
+/// `zend_hash_*` via `ExecutorGlobals::ini_values()`'s iterator) is
+/// unresolvable at link time. Until this change the body was never
+/// reachable from test code, so DCE eliminated those references
+/// before link. The new unit tests
+/// (`startup_body_panic_is_contained_by_catch_unwind` etc.) now
+/// reference `startup_body`, which would re-introduce the
+/// references and break the test link. The fix is to cfg-gate the
+/// FFI body into [`startup_body_inner`], reachable only in
+/// production. The integration tests in
+/// `tests/recorder_observer.rs` and `tests/shipper_round_trip.rs`
+/// exercise the inner end-to-end against a real PHP runtime.
+fn startup_body(module_number: i32) {
+    // Test seam: panic before any FFI call so the unit-test build
+    // can exercise the panic-containment contract without
+    // segfaulting on `register_directives` / `read_raw_ini` /
+    // `php_error`.
+    #[cfg(test)]
+    if PANIC_IN_STARTUP_FOR_TEST.load(Ordering::Relaxed) {
+        panic!("PANIC_IN_STARTUP_FOR_TEST: deliberate panic for unit test");
+    }
+    #[cfg(not(test))]
+    startup_body_inner(module_number);
+    #[cfg(test)]
+    {
+        // Touch the parameter under `cfg(test)` to silence the
+        // unused-variable warning; in production the call to
+        // `startup_body_inner` consumes it.
+        let _ = module_number;
+    }
+}
+
+/// FFI-touching half of [`startup_body`]. Production-only — the
+/// `cargo test` binary cannot resolve the Zend symbols this reaches
+/// (see `startup_body`'s doc comment). Behaviour is identical to the
+/// pre-`bootstrap-startup-panic-safety` shape of `startup`'s body.
+#[cfg(not(test))]
+fn startup_body_inner(module_number: i32) {
     register_directives(module_number);
 
     let raw = read_raw_ini();
@@ -168,8 +264,6 @@ pub fn startup(_type_: i32, module_number: i32) -> i32 {
     // `MSHUTDOWN` work at process exit (the `shipper::*` slots remain
     // `None` / `false`).
     install_shipper_if_enabled(Config::global());
-
-    0
 }
 
 /// Pure helper: install the shipper channel iff the resolved config
@@ -476,6 +570,14 @@ pub unsafe extern "C" fn minfo(_module: *mut ModuleEntry) {
 
 // --- INI registration ------------------------------------------------------
 
+/// FFI-only: registers each `php_analyze.*` directive with Zend.
+/// `#[cfg(not(test))]` because the `cargo test` binary cannot resolve
+/// the underlying `zend_register_ini_entries_ex` symbol — the same
+/// reason [`startup_body_inner`] is cfg-gated. Test coverage for the
+/// directive-name → `Config`-field mapping lives on
+/// [`tests::raw_ini_from_ini_map_round_trips_non_default_directive_values`]
+/// and friends, which never call this function.
+#[cfg(not(test))]
 fn register_directives(module_number: i32) {
     let entries: Vec<IniEntryDef> = DIRECTIVES
         .iter()
@@ -505,6 +607,7 @@ fn register_directives(module_number: i32) {
 /// `C` ABI callback invoked by Zend's ini machinery. The `_entry`
 /// pointer is supplied by Zend and not dereferenced; the body only
 /// writes a static C string via `php_printf`.
+#[cfg(not(test))]
 unsafe extern "C" fn redact_displayer(_entry: *mut zend_ini_entry, _type_: i32) {
     // SAFETY: `c"***"` is a valid NUL-terminated C string with static
     // lifetime; `php_printf` does not retain the pointer after returning.
@@ -517,7 +620,10 @@ unsafe extern "C" fn redact_displayer(_entry: *mut zend_ini_entry, _type_: i32) 
 
 /// PHP-side adapter: snapshot the live INI store and hand it to the pure
 /// mapper. Kept as a single line so the testable surface area lives
-/// entirely in [`raw_ini_from_ini_map`].
+/// entirely in [`raw_ini_from_ini_map`]. `#[cfg(not(test))]` because
+/// `ExecutorGlobals::get().ini_values()` is unresolvable at link time
+/// without a live PHP runtime — see [`startup_body`]'s doc comment.
+#[cfg(not(test))]
 fn read_raw_ini() -> RawIni {
     let ini = ExecutorGlobals::get().ini_values();
     raw_ini_from_ini_map(&ini)
@@ -1401,5 +1507,156 @@ mod tests {
         // `TraceLimits` is caught by the same test.
         assert_eq!(limits.max_depth, u32::from(config.max_depth));
         assert_eq!(limits.buffer_cap_bytes, config.buffer_cap_bytes);
+    }
+
+    // --- startup panic-containment ----------------------------------------
+    //
+    // These tests pin the `bootstrap-startup-panic-safety` contract:
+    // the public `startup` shim wraps `startup_body` in
+    // `std::panic::catch_unwind`, so any panic in the body is contained
+    // at the FFI frame and the shim still returns `0` (silent-disable).
+    //
+    // We exercise the contract via the `#[cfg(test)] static
+    // PANIC_IN_STARTUP_FOR_TEST` seam — the only panic site inside
+    // `startup_body` reachable from the test build, because the FFI
+    // calls downstream (`register_directives`, `read_raw_ini`,
+    // `php_error`, …) are unresolvable at link time without a live
+    // PHP runtime. The seam fires before any FFI call so a tripped
+    // seam never reaches the FFI surface.
+    //
+    // The happy path (seam off) is exercised end-to-end by every
+    // integration test that loads the cdylib into a real PHP — most
+    // notably `tests/recorder_observer.rs` and
+    // `tests/shipper_round_trip.rs`. It is not unit-testable in this
+    // module by construction.
+
+    /// Acquire a process-wide mutex over the test seam so two parallel
+    /// `panic-startup` tests cannot race on `PANIC_IN_STARTUP_FOR_TEST`.
+    /// One `OnceLock` lives in `tests::lock_startup_seam` below.
+    fn lock_startup_seam() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static SEAM_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        SEAM_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Guard that flips the seam on, runs the test body, and resets
+    /// the seam on drop — so a test that panics before clearing the
+    /// seam still leaves the module in a clean state.
+    struct StartupPanicSeamGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StartupPanicSeamGuard {
+        fn arm() -> Self {
+            let lock = lock_startup_seam();
+            PANIC_IN_STARTUP_FOR_TEST.store(true, Ordering::SeqCst);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for StartupPanicSeamGuard {
+        fn drop(&mut self) {
+            PANIC_IN_STARTUP_FOR_TEST.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn startup_body_panic_is_contained_by_catch_unwind() {
+        let _seam = StartupPanicSeamGuard::arm();
+        // Direct catch_unwind around the body: this is what the
+        // public shim does, with one extra layer for the unit-test
+        // observation.
+        let outcome = std::panic::catch_unwind(|| startup_body(0));
+        assert!(
+            outcome.is_err(),
+            "seam is armed: startup_body MUST panic at its head before any FFI call"
+        );
+    }
+
+    #[test]
+    fn startup_returns_zero_on_panic() {
+        let _seam = StartupPanicSeamGuard::arm();
+        // The shim is the production-shaped surface: panic in the
+        // body, catch_unwind absorbs, return value is still 0 so
+        // PHP keeps starting (silent-disable per AD-4 / NFR-USE-2).
+        let rc = startup(0, 0);
+        assert_eq!(
+            rc, 0,
+            "even on a caught panic, MINIT MUST return 0 (Zend SUCCESS) so PHP keeps starting"
+        );
+    }
+
+    #[test]
+    fn startup_returns_zero_on_seam_off_no_panic_path() {
+        // Negative companion to the panic tests: with the seam OFF
+        // and the FFI body cfg-gated out under `#[cfg(test)]`,
+        // calling the shim runs the cfg-test stub of `startup_body`
+        // (which is empty modulo the seam check). The shim's
+        // unconditional `return 0` is what we pin here. A future
+        // refactor that changes the shim shape to ever return
+        // anything other than `0` will trip this assertion.
+        let _lock = lock_startup_seam();
+        PANIC_IN_STARTUP_FOR_TEST.store(false, Ordering::SeqCst);
+        assert_eq!(startup(0, 42), 0);
+    }
+
+    // --- cross-cutting: spawn failure × bootstrap drain ----------------
+
+    /// Pin the bootstrap × shipper interaction across the
+    /// spawn-failure boundary: after the spawn-failure recovery
+    /// path runs (`SENDER_SLOT == None`, `SHIPPER_HANDLE == None`),
+    /// `drain_shipper_if_enabled` MUST be a no-op — it cannot
+    /// panic, cannot block, and cannot leave any state behind.
+    /// The drain function's first guard (`SENDER_SLOT.take()` →
+    /// `None` → `JoinOutcome::NotInstalled`) is the load-bearing
+    /// short-circuit.
+    #[test]
+    fn bootstrap_full_lifecycle_with_spawn_failure_keeps_drain_a_noop() {
+        use std::io;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+
+        let enabled = enabled_config_for_lifecycle_tests();
+        install_shipper_if_enabled(Some(&enabled));
+        assert!(crate::shipper::sender_is_installed());
+        assert!(crate::shipper::receiver_is_installed());
+
+        // Drive the spawn-failure path via the shipper module's
+        // injectable inner helper. The recovery sequence clears
+        // SENDER_SLOT and stashes SHIPPER_SPAWN_FAILED; the
+        // following drain MUST observe that and short-circuit.
+        let invocations = Arc::new(AtomicU64::new(0));
+        let invocations_for_closure = invocations.clone();
+        crate::shipper::spawn_with_failing_factory_for_test(move |_name, _body| {
+            invocations_for_closure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(io::Error::other("test-induced spawn failure"))
+        });
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(crate::shipper::spawn_failed_flag());
+        assert!(!crate::shipper::sender_is_installed());
+        assert!(!crate::shipper::handle_is_installed());
+
+        // The bootstrap-layer drain must observe NotInstalled and
+        // return cleanly without panic or hang. We can't observe
+        // the JoinOutcome directly from this helper (it discards
+        // the outcome — see slice-1 design), but we *can* observe
+        // that the call returns and leaves the slots clean.
+        drain_shipper_if_enabled(Some(&enabled));
+        assert!(!crate::shipper::sender_is_installed(), "drain post-state");
+        assert!(!crate::shipper::handle_is_installed(), "drain post-state");
+        // Sticky flag survives the drain (no production code clears
+        // it; only `reset_for_test` does).
+        assert!(
+            crate::shipper::spawn_failed_flag(),
+            "SHIPPER_SPAWN_FAILED is sticky for the rest of the process",
+        );
+
+        crate::shipper::reset_for_test();
     }
 }
