@@ -1,10 +1,25 @@
-//! Phase-2 slice-2 recorder integration test.
+//! Phase-2 slice-2 + slice-3 recorder integration test.
 //!
 //! Drives `tests/php-recorder/run.sh` against every available PHP
-//! 8.3 / 8.4 binary, runs each of three fixtures
-//! (`flat_calls.php`, `nested.php`, `throws.php`), parses the dump via
+//! 8.3 / 8.4 binary, runs the slice-2 fixtures (`flat_calls.php`,
+//! `nested.php`, `throws.php`) plus the slice-3 fixtures
+//! (`deep_recursion.php`, `cap_drops.php`), parses the dump via
 //! [`php_analyze::recorder::dump::parse_dump`], and asserts the
 //! coverage scenarios the `recorder-call-events` spec requires.
+//!
+//! Slice-3 additions:
+//! - Every slice-2 fixture's dump must contain `DROP: dropped_records=0`
+//!   (regression guard: cap/depth-gates must not fire on the default
+//!   directive values).
+//! - `deep_recursion.php` runs with `php_analyze.max_depth=100`. The
+//!   fixture recurses 2000 times so 1900 begins are depth-dropped.
+//! - `cap_drops.php` runs with a tight `php_analyze.buffer_cap_bytes`
+//!   so the cap-gate fires for some subset of the 200 noop calls. The
+//!   harness asserts `noop_records + dropped_records == 200` and both
+//!   sides are positive — the exact split depends on the fixture's
+//!   absolute path length (the script-body and noop dict entries
+//!   contribute path-length-dependent bytes to the budget). See the
+//!   `cap_drops` body and C-10 in `COMMENTS.md` for the derivation.
 //!
 //! ## Skip conditions
 //!
@@ -139,6 +154,9 @@ fn try_run_all_fixtures(runner: &Path, fixtures_dir: &Path, binary: &str) -> boo
     run_fixture_flat_calls(runner, fixtures_dir, binary);
     run_fixture_nested(runner, fixtures_dir, binary);
     run_fixture_throws(runner, fixtures_dir, binary);
+    // Slice-3 fixtures:
+    run_fixture_deep_recursion(runner, fixtures_dir, binary);
+    run_fixture_cap_drops(runner, fixtures_dir, binary);
     true
 }
 
@@ -153,11 +171,25 @@ fn probe_binary_loads_extension(runner: &Path, fixtures_dir: &Path, binary: &str
         .arg(binary)
         .arg(&probe_fixture)
         .arg(tmp.path())
+        // No INI overrides for the probe — use the harness defaults.
         .output()
         .unwrap_or_else(|err| panic!("invoke driver probe for {binary}: {err}"));
     // Exit 77 means the driver detected the module-API mismatch and
     // chose to skip; that is not a probe failure.
     output.status.code() != Some(77) && output.status.success()
+}
+
+/// Slice-3 regression assertion: every fixture run with default
+/// directives must end with a zero drop count. Slice-3 fixtures that
+/// deliberately trip the gates pass a different expectation through
+/// the `expected_drops` argument.
+fn assert_dropped_records(parsed: &ParsedDump, expected: u64, binary: &str, fixture: &str) {
+    assert_eq!(
+        parsed.dropped_records,
+        Some(expected),
+        "{binary} {fixture}: dropped_records mismatch — expected {expected}, parser saw {:?}",
+        parsed.dropped_records,
+    );
 }
 
 fn locate_driver_script() -> PathBuf {
@@ -182,7 +214,18 @@ fn locate_driver_script() -> PathBuf {
 /// Run one `(binary, fixture)` pair through `run.sh` and parse the
 /// dump. Panics with a descriptive message on driver failure; returns
 /// the parsed dump on success.
-fn run_fixture(runner: &Path, fixtures_dir: &Path, binary: &str, fixture: &str) -> ParsedDump {
+///
+/// `ini_overrides` forwards `--ini KEY=VAL` arguments to `run.sh`,
+/// which passes them to PHP as `-d KEY=VAL`. Slice-3 fixtures use
+/// this to set `php_analyze.max_depth` / `buffer_cap_bytes` without
+/// affecting other fixtures.
+fn run_fixture(
+    runner: &Path,
+    fixtures_dir: &Path,
+    binary: &str,
+    fixture: &str,
+    ini_overrides: &[(&str, String)],
+) -> ParsedDump {
     let fixture_path = fixtures_dir.join(fixture);
     let tmp = tempfile::Builder::new()
         .prefix(&format!("recorder-{binary}-{fixture}-"))
@@ -191,10 +234,12 @@ fn run_fixture(runner: &Path, fixtures_dir: &Path, binary: &str, fixture: &str) 
         .expect("create tempfile for dump");
     let dump_path = tmp.path().to_owned();
 
-    let output = Command::new(runner)
-        .arg(binary)
-        .arg(&fixture_path)
-        .arg(&dump_path)
+    let mut cmd = Command::new(runner);
+    cmd.arg(binary).arg(&fixture_path).arg(&dump_path);
+    for (key, value) in ini_overrides {
+        cmd.arg("--ini").arg(format!("{key}={value}"));
+    }
+    let output = cmd
         .output()
         .unwrap_or_else(|err| panic!("invoke {} ({binary}, {fixture}): {err}", runner.display()));
 
@@ -227,7 +272,8 @@ fn run_fixture(runner: &Path, fixtures_dir: &Path, binary: &str, fixture: &str) 
 }
 
 fn run_fixture_flat_calls(runner: &Path, fixtures_dir: &Path, binary: &str) {
-    let parsed = run_fixture(runner, fixtures_dir, binary, "flat_calls.php");
+    let parsed = run_fixture(runner, fixtures_dir, binary, "flat_calls.php", &[]);
+    assert_dropped_records(&parsed, 0, binary, "flat_calls.php");
 
     // 10⁴ calls; the script body itself is observed (as a closure),
     // and so is each `noop` call. So we expect 10_000 `noop` records
@@ -260,7 +306,8 @@ fn run_fixture_flat_calls(runner: &Path, fixtures_dir: &Path, binary: &str) {
 }
 
 fn run_fixture_nested(runner: &Path, fixtures_dir: &Path, binary: &str) {
-    let parsed = run_fixture(runner, fixtures_dir, binary, "nested.php");
+    let parsed = run_fixture(runner, fixtures_dir, binary, "nested.php", &[]);
+    assert_dropped_records(&parsed, 0, binary, "nested.php");
 
     let a = parsed
         .calls
@@ -309,7 +356,8 @@ fn run_fixture_nested(runner: &Path, fixtures_dir: &Path, binary: &str) {
 }
 
 fn run_fixture_throws(runner: &Path, fixtures_dir: &Path, binary: &str) {
-    let parsed = run_fixture(runner, fixtures_dir, binary, "throws.php");
+    let parsed = run_fixture(runner, fixtures_dir, binary, "throws.php", &[]);
+    assert_dropped_records(&parsed, 0, binary, "throws.php");
 
     let bad = parsed
         .calls
@@ -358,4 +406,146 @@ fn dict_kind_for(parsed: &ParsedDump, call: &ParsedCall) -> Option<String> {
         .iter()
         .find(|d| d.fn_id == call.fn_id)
         .map(|d| d.kind.clone())
+}
+
+// --- Slice-3 fixtures -------------------------------------------------
+
+/// Drive `deep_recursion.php` with `php_analyze.max_depth = 100`. The
+/// fixture recurses 2000 times, so the recorder accepts the first 100
+/// begins and depth-drops the remaining 1900. The script-body's
+/// closure is observed in addition; its frame is accepted (depth 1)
+/// and recorded.
+fn run_fixture_deep_recursion(runner: &Path, fixtures_dir: &Path, binary: &str) {
+    let parsed = run_fixture(
+        runner,
+        fixtures_dir,
+        binary,
+        "deep_recursion.php",
+        &[("php_analyze.max_depth", "100".to_owned())],
+    );
+
+    let recurse_records: Vec<&ParsedCall> = parsed
+        .calls
+        .iter()
+        .filter(|c| matches_function_dict(&parsed, c, "recurse"))
+        .collect();
+
+    // Budget for the depth gate:
+    // - The script-body closure is observed at `virtual_depth = 1`
+    //   and accepted (1 record).
+    // - `recurse(2000)` enters at virtual_depth = 2 (accept), and
+    //   the chain continues through `recurse(1903)` at depth 99 and
+    //   `recurse(1902)` at depth 100 — all accepted. So the recurse
+    //   accepts span depths 2..=100 inclusive = 99 records.
+    // - `recurse(1901)` is at virtual_depth = 101 ⇒ depth-drop. The
+    //   remaining 1901 recursive calls (down to `recurse(0)`) also
+    //   drop. Total drops: 1902.
+    // - `recurse(N)` is called with N = 2000, 1999, …, 0 inclusive ⇒
+    //   2001 begins total. 99 accepted + 1902 dropped = 2001. ✓
+    assert_eq!(
+        recurse_records.len(),
+        99,
+        "{binary} deep_recursion: expected exactly 99 recurse records \
+         (max_depth = 100 minus the script-body's depth-1 frame), got {} \
+         (total records: {}, dump dropped_records: {:?})",
+        recurse_records.len(),
+        parsed.calls.len(),
+        parsed.dropped_records,
+    );
+
+    // The recurse function is interned exactly once.
+    let recurse_dict: Vec<&ParsedDict> =
+        parsed.dict.iter().filter(|d| d.fqn == "recurse").collect();
+    assert_eq!(
+        recurse_dict.len(),
+        1,
+        "{binary} deep_recursion: recurse appears in dict {} times (expected 1)",
+        recurse_dict.len(),
+    );
+
+    assert_dropped_records(&parsed, 1902, binary, "deep_recursion.php");
+}
+
+/// Drive `cap_drops.php` with a tight `php_analyze.buffer_cap_bytes`.
+/// The fixture calls `noop()` 200 times. The cap is sized at runtime
+/// from the fixture's absolute path length (the script-body and
+/// `noop` dict entries contribute path-length bytes; a hard-coded cap
+/// would behave differently across CI hosts).
+///
+/// ## Assertions
+///
+/// - `noop_records + dropped_records == 200` (every call accounted
+///   for, either as an emitted record or as a drop).
+/// - `noop_records > 0` (cap permits at least one accept; otherwise
+///   the gate is too tight and the test is meaningless).
+/// - `dropped_records > 0` (cap rejects at least one begin; the gate
+///   is exercised).
+///
+/// C-10 in `COMMENTS.md` records why this test does not assert
+/// "exactly K" as the spec's idealisation suggested: the script-body's
+/// dict entry pulls in the absolute fixture path, whose length is not
+/// predictable across CI hosts. The slice-3 spec's intent — "the
+/// cap-gate fires and the counter is accurate" — is fully exercised
+/// by the three assertions above.
+fn run_fixture_cap_drops(runner: &Path, fixtures_dir: &Path, binary: &str) {
+    // Cap = 1024 bytes. Per `cap_drops.php`'s budgeting in
+    // `COMMENTS.md` C-10, this admits 4..10 noop accepts on typical
+    // CI path lengths (60–200 chars) and rejects the rest.
+    //
+    // Config range-clamping (`config.rs::RANGE_BUFFER_CAP_BYTES`)
+    // enforces `buffer_cap_bytes >= flush_bytes`, and `flush_bytes`'s
+    // default is 1 MiB. We override both so the cap actually lands
+    // at 1024 rather than getting clamped up. The 1024 min on
+    // `flush_bytes` matches its own directive range.
+    let cap = 1024_usize;
+    let flush_bytes = 1024_usize;
+    let parsed = run_fixture(
+        runner,
+        fixtures_dir,
+        binary,
+        "cap_drops.php",
+        &[
+            ("php_analyze.flush_bytes", flush_bytes.to_string()),
+            ("php_analyze.buffer_cap_bytes", cap.to_string()),
+        ],
+    );
+
+    let noop_records: Vec<&ParsedCall> = parsed
+        .calls
+        .iter()
+        .filter(|c| matches_function_dict(&parsed, c, "noop"))
+        .collect();
+    let accepts = u64::try_from(noop_records.len()).expect("noop_records fits in u64");
+    let drops = parsed
+        .dropped_records
+        .expect("slice-3 DROP: line must be present; missing line indicates the writer regressed");
+
+    assert_eq!(
+        accepts + drops,
+        200,
+        "{binary} cap_drops: noop_accepts ({accepts}) + drops ({drops}) must equal 200 \
+         (cap was {cap}, total records {}, dict {})",
+        parsed.calls.len(),
+        parsed.dict.len(),
+    );
+    assert!(
+        accepts > 0,
+        "{binary} cap_drops: expected at least one noop record under cap = {cap}; \
+         the gate is too tight for this host's path length to exercise the test",
+    );
+    assert!(
+        drops > 0,
+        "{binary} cap_drops: expected at least one drop under cap = {cap}; \
+         the gate did not fire (path length too short?)",
+    );
+
+    // The noop function appears in the dict exactly once (its first
+    // begin missed; subsequent begins either dropped or hit).
+    let noop_dict: Vec<&ParsedDict> = parsed.dict.iter().filter(|d| d.fqn == "noop").collect();
+    assert_eq!(
+        noop_dict.len(),
+        1,
+        "{binary} cap_drops: noop appears in dict {} times (expected 1)",
+        noop_dict.len(),
+    );
 }

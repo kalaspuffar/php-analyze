@@ -8,7 +8,12 @@
 # runs one fixture, and prints the dump path to stdout. The Rust test
 # reads that path and parses the dump via `recorder::dump::parse_dump`.
 #
-# Usage: run.sh <php_binary> <fixture_path> <dump_path>
+# Usage: run.sh <php_binary> <fixture_path> <dump_path> [--ini KEY=VAL ...]
+#
+# Each `--ini KEY=VAL` argument is forwarded to PHP as `-d KEY=VAL`,
+# so per-fixture overrides (e.g. `--ini php_analyze.max_depth=100`)
+# don't affect the other fixtures. Slice-3 fixtures use this to set
+# `max_depth` / `buffer_cap_bytes` independently.
 #
 # Skips with exit 77 (autotools convention) if `<php_binary>` is not
 # executable. Returns non-zero on any real failure with diagnostics on
@@ -16,14 +21,34 @@
 
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-    echo "recorder-driver: usage: run.sh <php_binary> <fixture_path> <dump_path>" >&2
+if [[ $# -lt 3 ]]; then
+    echo "recorder-driver: usage: run.sh <php_binary> <fixture_path> <dump_path> [--ini KEY=VAL ...]" >&2
     exit 2
 fi
 
 PHP_BIN="$1"
 FIXTURE="$2"
 DUMP_PATH="$3"
+shift 3
+
+# Collect zero-or-more `--ini KEY=VAL` pairs into a PHP `-d` arg list.
+PHP_INI_OVERRIDES=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ini)
+            if [[ $# -lt 2 ]]; then
+                echo "recorder-driver: --ini requires KEY=VAL" >&2
+                exit 2
+            fi
+            PHP_INI_OVERRIDES+=("-d" "$2")
+            shift 2
+            ;;
+        *)
+            echo "recorder-driver: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -80,7 +105,8 @@ EOF
 # --- Run the fixture ---------------------------------------------------
 
 if ! PHP_ANALYZE_DUMP_PATH="$DUMP_PATH" \
-        "$PHP_BIN" -n -c "$INI_FILE" "$FIXTURE" >>"$DUMP_PATH.stdout" 2>>"$DUMP_PATH.stderr"; then
+        "$PHP_BIN" -n -c "$INI_FILE" ${PHP_INI_OVERRIDES[@]+"${PHP_INI_OVERRIDES[@]}"} "$FIXTURE" \
+            >>"$DUMP_PATH.stdout" 2>>"$DUMP_PATH.stderr"; then
     echo "recorder-driver: php exited non-zero for $FIXTURE" >&2
     echo "--- stderr ---" >&2
     cat "$DUMP_PATH.stderr" >&2

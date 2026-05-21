@@ -1921,6 +1921,76 @@ mod tests {
         assert_eq!(trace.dropped_begins, 0);
     }
 
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn virtual_depth_never_underflows_under_an_adversarial_end_then_begin_sequence() {
+        // RO-1 / NFR-REL-1 defense: even if Zend ever delivered an
+        // `end` event without a matching `begin` (a contract
+        // violation), the recorder must not underflow `virtual_depth`
+        // (an underflow wraps to `u32::MAX` and would silently
+        // depth-drop the entire next request). `saturating_sub` is
+        // the guard; this test pins it.
+        //
+        // Release-only: slice 2's `debug_assert!(popped.is_some(),
+        // …)` in `end_with_snapshots` would panic on the empty stack
+        // before our saturating_sub takes effect. Release builds
+        // skip the debug-assert, and the saturating_sub becomes the
+        // active defense. Same pattern as slice-2's RO-3
+        // `double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds`.
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        let mut trace = fresh_trace();
+
+        // Three ends without prior begins. In release each `end`
+        // saturating-subs virtual_depth and then `finish_call_record`
+        // gets a `None` pop, returning silently.
+        for _ in 0..3 {
+            end_with_snapshots(&mut trace, exit_snapshots(), false);
+        }
+        assert_eq!(
+            trace.virtual_depth, 0,
+            "saturating_sub keeps the floor at zero"
+        );
+        assert_eq!(trace.dropped_begins, 0, "no drops to consume");
+
+        // Now begin/end normally — the counter must behave as if the
+        // adversarial ends never happened.
+        let cat = cat_for("normal");
+        begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+        end_with_snapshots(&mut trace, exit_snapshots(), false);
+        assert_eq!(trace.virtual_depth, 0);
+        assert_eq!(trace.buffer.len(), 1);
+    }
+
+    #[test]
+    fn virtual_depth_returns_to_zero_after_balanced_lifo_consume_sequence() {
+        // Debug-build companion to the above: drive 4 begins under a
+        // depth-zero gate (all drop) followed by 4 ends (all LIFO
+        // consume). The saturating_sub never goes below zero because
+        // every end's decrement is matched by a prior begin's
+        // increment. This pins the LIFO branch's invariant without
+        // tripping the slice-2 debug_assert.
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        // max_depth = 0 ⇒ every begin trips the depth gate.
+        let mut trace = trace_with_max_depth(0);
+        let cat = cat_for("always_dropped");
+
+        for _ in 0..4 {
+            begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+        }
+        assert_eq!(trace.virtual_depth, 4);
+        assert_eq!(trace.dropped_begins, 4);
+        assert_eq!(trace.drop_counter.load(Ordering::Acquire), 4);
+
+        for _ in 0..4 {
+            end_with_snapshots(&mut trace, exit_snapshots(), false);
+        }
+        assert_eq!(trace.virtual_depth, 0);
+        assert_eq!(trace.dropped_begins, 0);
+        assert!(trace.buffer.is_empty(), "no records from dropped begins");
+    }
+
     // --- Slice-3 RSHUTDOWN subtract ---------------------------------------
 
     #[test]
