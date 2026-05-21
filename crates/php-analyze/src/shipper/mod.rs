@@ -41,6 +41,14 @@
 //! drops it. The "process-global Sender" spec wording is preserved;
 //! only the container type differs. Recorded in `COMMENTS.md` C-13.
 
+mod encode;
+mod http;
+mod on_batch;
+
+use crate::recorder::types::PendingBatch;
+use on_batch::{OnBatch, OnBatchOutcome};
+
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -126,6 +134,42 @@ static SHIPPER_SPAWNED: AtomicBool = AtomicBool::new(false);
 /// thread. Taken out at shutdown.
 static SHIPPER_HANDLE: Mutex<Option<JoinHandle<ShipperExit>>> = Mutex::new(None);
 
+/// `SPECIFICATION.md` §5.2 step 4 drop-notice queue.
+///
+/// The shipper thread produces "one `E_NOTICE` per dropped batch"
+/// lines, but the shipper thread is a background OS thread: calling
+/// `ext_php_rs::error::php_error` (which is the canonical
+/// `E_NOTICE` emit path used by `bootstrap::report_warning` for
+/// `E_WARNING`) from a non-PHP thread is undefined behaviour —
+/// `zend_error_va_list` reads TSRM / `EG(...)` globals that are
+/// only bound on the PHP-thread side. The queue here decouples the
+/// two: the shipper formats the spec line and pushes it onto the
+/// `Mutex<VecDeque>`; the next PHP-thread `RSHUTDOWN` (and the
+/// process-final `MSHUTDOWN`) drain it and emit each line via
+/// `php_error(E_NOTICE, ...)`.
+///
+/// Drains during `MSHUTDOWN` happen **after** the shipper join
+/// returns, so any notices pushed by the deadline-or-cleanup drain
+/// path are visible too.
+static DROP_NOTICE_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// Producer side: the shipper thread pushes a formatted drop line.
+/// Visibility is `pub(crate)` so [`drained_consume`] can call it
+/// from inside [`run_loop`].
+pub(crate) fn push_drop_notice(notice: String) {
+    let mut q = DROP_NOTICE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back(notice);
+}
+
+/// Consumer side: the bootstrap layer drains the queue on each
+/// `RSHUTDOWN` and once more during `MSHUTDOWN` after the shipper
+/// join. Returns the queued lines in push order; the caller is
+/// expected to feed each through `php_error(E_NOTICE, &line)`.
+pub(crate) fn drain_drop_notices() -> Vec<String> {
+    let mut q = DROP_NOTICE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    q.drain(..).collect()
+}
+
 // --- Pure run_loop --------------------------------------------------------
 
 /// Drain the channel until a clean termination condition.
@@ -157,17 +201,26 @@ static SHIPPER_HANDLE: Mutex<Option<JoinHandle<ShipperExit>>> = Mutex::new(None)
 ///      `batches_abandoned_at_deadline`. Return with
 ///      `drain_completed: false`.
 ///
-/// The encoder-and-POST slice (Phase-4 slice 3) will grow a fourth
-/// termination condition via an `on_batch` callback that returns an
-/// error. Slice 2 does not encode; the only side effect on consume
-/// is the accounting subtract.
-pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
+/// Slice-3 (Phase-4 `shipper-encoder-and-http`) wires the consume
+/// step to an [`OnBatch`] implementation. Each received batch is
+/// encoded (via [`http::encode_and_handle`]) and handed to
+/// `on_batch.handle`, which performs the HTTP POST + retry/backoff
+/// for production wiring or simply records the bytes for tests.
+/// The `accounting::sub` location moves from "on receive" to "after
+/// encode" per slice-3 design D-3 — the encoded bytes are
+/// short-lived and not budgeted, so the budget is released once
+/// encoding completes. A `Dropped` outcome bumps the source trace's
+/// `drop_counter` (closing the §11 R-13 contract for HTTP-side drops
+/// the same way the recorder closes it for channel-full and
+/// buffer-cap drops); only a `Sent` outcome contributes to
+/// `batches_drained`. Encode failures (`OnBatchOutcome::Dropped {
+/// reason: EncodeFailed, .. }`) bump the drop counter the same way.
+pub(crate) fn run_loop(rx: Receiver<ShipperMessage>, mut on_batch: impl OnBatch) -> ShipperExit {
     let mut batches_drained: u64 = 0;
     let deadline: Instant = loop {
         match rx.recv() {
             Ok(ShipperMessage::Batch(batch)) => {
-                crate::recorder::accounting::sub(batch.size_estimate);
-                batches_drained += 1;
+                drained_consume(&batch, &mut on_batch, None, &mut batches_drained);
                 drop(batch);
             }
             Ok(ShipperMessage::Drain { deadline }) => break deadline,
@@ -183,8 +236,7 @@ pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
     loop {
         match rx.recv_deadline(deadline) {
             Ok(ShipperMessage::Batch(batch)) => {
-                crate::recorder::accounting::sub(batch.size_estimate);
-                batches_drained += 1;
+                drained_consume(&batch, &mut on_batch, Some(deadline), &mut batches_drained);
                 drop(batch);
             }
             // A second Drain is structurally unreachable today (only
@@ -193,11 +245,12 @@ pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
             // future-bug class.
             Ok(ShipperMessage::Drain { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {
-                // Phase-4 slice 2 design D-5: drain the residual
-                // queue so abandoned batches return their bytes to
-                // the budget. Without this drain, any batch still
-                // queued at the deadline would leak its
-                // `size_estimate` until the process exits.
+                // Slice-2 design D-5 (preserved through slice 3):
+                // drain the residual queue so abandoned batches
+                // return their bytes to the budget. Slice 3 does
+                // NOT encode-and-POST abandoned batches — the
+                // deadline has passed; we just balance accounting
+                // and count them.
                 let mut abandoned: u64 = 0;
                 loop {
                     match rx.try_recv() {
@@ -227,6 +280,74 @@ pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
     }
 }
 
+/// Per-batch consume step: encode, hand to `on_batch`, bump the
+/// `drop_counter` on `Dropped`, release the budget, queue the
+/// `SPECIFICATION.md` §5.2 step-4 drop-notice line, and advance the
+/// `batches_drained` counter on `Sent`.
+///
+/// Factored out of `run_loop` so the pre-drain and post-drain
+/// branches share one expression and the slice-3 design D-3 ordering
+/// rule lives in exactly one place. The canonical order is
+/// **encode → bump drop counter → accounting::sub → format/queue
+/// notice → count**: bump the drop counter first so the cross-thread
+/// `Arc<AtomicU64>` invariant (a future batch from the same trace
+/// surfaces this drop in its `meta.dropped_records`) is established
+/// before the byte budget is released; release the budget next so a
+/// hypothetical encode-panic does not double-subtract; format and
+/// queue the notice last because it can be deferred without
+/// affecting accounting correctness.
+fn drained_consume(
+    batch: &PendingBatch,
+    on_batch: &mut impl OnBatch,
+    deadline: Option<Instant>,
+    batches_drained: &mut u64,
+) {
+    let outcome = http::encode_and_handle(batch, on_batch, deadline);
+    http::bump_drop_counter_on_drop(batch, &outcome);
+    crate::recorder::accounting::sub(batch.size_estimate);
+    if let OnBatchOutcome::Dropped { reason, attempts } = &outcome {
+        let notice = format_drop_notice(
+            batch,
+            on_batch.server_url().unwrap_or(""),
+            *reason,
+            *attempts,
+        );
+        push_drop_notice(notice);
+    }
+    if matches!(outcome, OnBatchOutcome::Sent) {
+        *batches_drained += 1;
+    }
+}
+
+/// Render the `SPECIFICATION.md` §5.2 step-4 drop line:
+///
+/// > `php-analyze: dropped <N> records from trace <uuid>: <url> <status_or_error> (attempt <K>)`
+///
+/// `<uuid>` uses the same 36-char hyphenated render as
+/// [`crate::shipper::encode::meta_partial_to_wire`] so the trace ID
+/// rendered on the wire matches the one operators see in the error
+/// log. `<status_or_error>` is the [`on_batch::DropReason`]
+/// `Display` token (`http 401`, `timeout`, `tls_error`, …); the
+/// bearer token plaintext never appears in this string because
+/// `DropReason` does not carry it (AC-SH-4 enforced by
+/// construction).
+fn format_drop_notice(
+    batch: &PendingBatch,
+    server_url: &str,
+    reason: on_batch::DropReason,
+    attempts: u32,
+) -> String {
+    let trace_id = uuid::Uuid::from_bytes(batch.meta_partial.trace_id);
+    format!(
+        "php-analyze: dropped {} records from trace {}: {} {} (attempt {})",
+        batch.calls.len(),
+        trace_id,
+        server_url,
+        reason,
+        attempts,
+    )
+}
+
 // --- Lifecycle entry points ------------------------------------------------
 
 /// Install the shipper channel into the process-global slots. Called
@@ -245,14 +366,43 @@ pub(crate) fn install_channel_at_minit(depth: usize) {
     *receiver_slot = Some(rx);
 }
 
-/// Spawn the shipper thread on the first `RINIT` per process. Guarded
-/// by an [`AtomicBool::compare_exchange`] so concurrent `RINIT`s race
-/// to a single spawn. The winner takes the receiver, spawns
-/// [`run_loop`], and stashes the [`JoinHandle`] in
-/// [`SHIPPER_HANDLE`]. If no channel was installed (disabled
-/// extension or a programming error), the winner reverts the spawn
-/// flag so a later, correctly-installed RINIT can still spawn.
-pub(crate) fn spawn_if_needed_at_rinit() {
+/// Production entry point. Spawn the shipper thread on the first
+/// `RINIT` per process with the real [`http::RmpEncodeAndHttpPost`]
+/// `OnBatch` implementation built from the supplied `Config`.
+///
+/// The bootstrap layer calls this once per process; it is idempotent
+/// via the [`SHIPPER_SPAWNED`] CAS guard.
+pub(crate) fn spawn_if_needed_at_rinit(config: &crate::config::Config) {
+    let server_url = config
+        .server_url
+        .clone()
+        .expect("Config::server_url is Some when Config::enabled is true");
+    let retry_count = u32::from(config.retry_count);
+    let retry_backoff = config.retry_backoff;
+    let http_timeout = config.http_timeout;
+    let auth_token = config.auth_token.clone();
+    spawn_with_on_batch_factory(move || {
+        http::RmpEncodeAndHttpPost::new(
+            server_url,
+            auth_token,
+            retry_count,
+            retry_backoff,
+            http_timeout,
+        )
+    });
+}
+
+/// Shared spawn machinery — does the CAS, takes the receiver, and
+/// spawns [`run_loop`] with the [`OnBatch`] produced by
+/// `make_on_batch`. The factory is invoked at most once per
+/// successful CAS; if the CAS loses or the receiver slot is empty,
+/// `make_on_batch` is never called.
+///
+/// Visibility is `pub(crate)` so tests can plumb a
+/// [`on_batch::RecordingOnBatch`] without touching `Config::global()`.
+pub(crate) fn spawn_with_on_batch_factory<O: OnBatch + Send + 'static>(
+    make_on_batch: impl FnOnce() -> O,
+) {
     // Success ordering: `Acquire`. Pairs with the install step's
     // mutex release, establishing a happens-before edge with the
     // subsequent receiver take. Failure ordering: `Relaxed`, since
@@ -274,12 +424,23 @@ pub(crate) fn spawn_if_needed_at_rinit() {
         SHIPPER_SPAWNED.store(false, Ordering::Relaxed);
         return;
     };
+    let on_batch = make_on_batch();
     let handle = thread::Builder::new()
         .name("php-analyze-shipper".to_owned())
-        .spawn(move || run_loop(rx))
+        .spawn(move || run_loop(rx, on_batch))
         .expect("OS thread spawn for the shipper failed");
     let mut handle_slot = SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
     *handle_slot = Some(handle);
+}
+
+/// Test-only shim that mirrors slice 1's parameterless
+/// `spawn_if_needed_at_rinit` shape. Spawns with an always-`Sent`
+/// [`on_batch::RecordingOnBatch`] — the slice-1 "drain silently"
+/// behaviour is preserved exactly under the new generic
+/// [`run_loop`] signature.
+#[cfg(test)]
+pub(crate) fn spawn_if_needed_at_rinit_for_test() {
+    spawn_with_on_batch_factory(|| on_batch::RecordingOnBatch::new(Vec::new()));
 }
 
 /// Send `Drain { deadline: now + grace }`, drop the canonical
@@ -357,6 +518,10 @@ pub(crate) fn reset_for_test() {
     *RECEIVER_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SHIPPER_SPAWNED.store(false, Ordering::SeqCst);
+    DROP_NOTICE_QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Test-only: peek the canonical Sender's `is_some()` state without
@@ -537,7 +702,8 @@ mod tests {
     #[test]
     fn run_loop_drains_three_batches_and_exits_cleanly_on_channel_close() {
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         for _ in 0..3 {
             tx.send(dummy_batch()).expect("send batch");
         }
@@ -556,7 +722,8 @@ mod tests {
     #[test]
     fn run_loop_with_drain_future_deadline_finishes_queued_batches() {
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         let start = Instant::now();
         tx.send(dummy_batch()).unwrap();
         tx.send(dummy_batch()).unwrap();
@@ -598,7 +765,8 @@ mod tests {
         // way the exit must come from the deadline branch, not the
         // Disconnected branch.
         let start = Instant::now();
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         let exit = handle.join().expect("shipper joined cleanly");
         let elapsed = start.elapsed();
         assert!(!exit.drain_completed, "deadline-pass exit, got {exit:?}");
@@ -619,7 +787,8 @@ mod tests {
     #[test]
     fn run_loop_exits_cleanly_on_channel_close_without_a_drain() {
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         tx.send(dummy_batch()).unwrap();
         drop(tx);
         let exit = handle.join().expect("shipper joined cleanly");
@@ -631,7 +800,8 @@ mod tests {
     #[test]
     fn run_loop_with_empty_channel_and_immediate_close_returns_zero_counts() {
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         drop(tx);
         let exit = handle.join().expect("shipper joined cleanly");
         assert_eq!(
@@ -657,7 +827,8 @@ mod tests {
         crate::recorder::accounting::add(300);
 
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         for _ in 0..3 {
             tx.send(dummy_batch_with_size(100)).unwrap();
         }
@@ -680,7 +851,8 @@ mod tests {
         crate::recorder::accounting::add(500);
 
         let (tx, rx) = bounded::<ShipperMessage>(8);
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         // Two pre-drain batches, then Drain with a comfortable
         // deadline, then a third batch the drain-phase will consume.
         tx.send(dummy_batch_with_size(100)).unwrap();
@@ -723,7 +895,8 @@ mod tests {
                 .unwrap_or_else(Instant::now),
         })
         .unwrap();
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         let exit = handle.join().expect("shipper joined cleanly");
 
         assert!(!exit.drain_completed, "deadline-pass exit");
@@ -753,7 +926,8 @@ mod tests {
         })
         .unwrap();
         let start = Instant::now();
-        let handle = thread::spawn(move || run_loop(rx));
+        let handle =
+            thread::spawn(move || run_loop(rx, on_batch::RecordingOnBatch::new(Vec::new())));
         let exit = handle.join().expect("shipper joined cleanly");
         let elapsed = start.elapsed();
 
@@ -813,7 +987,7 @@ mod tests {
         install_channel_at_minit(8);
         assert!(!spawned_flag());
         assert!(!handle_is_installed());
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         assert!(spawned_flag());
         assert!(handle_is_installed());
         // Clean up by draining + joining so the test doesn't leak a
@@ -827,9 +1001,9 @@ mod tests {
         let _guard = lock();
         reset_for_test();
         install_channel_at_minit(8);
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         // Second call must not double-spawn.
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         // The CAS guard is what enforces this — but we also assert
         // the receiver slot stays empty (the second call must not
         // somehow take it again).
@@ -844,14 +1018,14 @@ mod tests {
     fn spawn_if_needed_at_rinit_is_a_noop_when_no_channel_is_installed() {
         let _guard = lock();
         reset_for_test();
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         assert!(!spawned_flag(), "no channel → no spawn → CAS reverted");
         assert!(!handle_is_installed());
         assert!(!sender_is_installed());
         // A later, properly-installed RINIT should still be able to
         // spawn — this is what the revert is for.
         install_channel_at_minit(8);
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         assert!(spawned_flag());
         assert!(handle_is_installed());
         let _ = drain_and_join_at_mshutdown(Duration::from_millis(100));
@@ -870,7 +1044,7 @@ mod tests {
             let b = Arc::clone(&barrier);
             joiners.push(thread::spawn(move || {
                 b.wait();
-                spawn_if_needed_at_rinit();
+                spawn_if_needed_at_rinit_for_test();
             }));
         }
         for j in joiners {
@@ -897,7 +1071,7 @@ mod tests {
         let _guard = lock();
         reset_for_test();
         install_channel_at_minit(8);
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         let start = Instant::now();
         let outcome = drain_and_join_at_mshutdown(Duration::from_secs(5));
         let elapsed = start.elapsed();
@@ -919,7 +1093,7 @@ mod tests {
         let _guard = lock();
         reset_for_test();
         install_channel_at_minit(2048);
-        spawn_if_needed_at_rinit();
+        spawn_if_needed_at_rinit_for_test();
         // Push 1000 batches before the drain. The shipper will burn
         // through them very quickly (no I/O); the deadline-vs-close
         // race is essentially "whichever happens first". The point
@@ -963,6 +1137,170 @@ mod tests {
             matches!(outcome, JoinOutcome::Panicked),
             "panicking shipper → Panicked; got {outcome:?}"
         );
+        reset_for_test();
+    }
+
+    // --- §5.2 step-4 drop-notice queue ---------------------------------
+
+    fn dummy_batch_with_calls(call_count: usize) -> PendingBatch {
+        use crate::recorder::types::{CallRecord, MetaPartial, PendingBatch};
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        let calls: Vec<CallRecord> = (0..call_count)
+            .map(|i| CallRecord {
+                call_id: i as u64 + 1,
+                parent: 0,
+                fn_id: 1,
+                depth: 0,
+                t_in_ns: 0,
+                t_out_ns: 0,
+                cpu_u_ns: 0,
+                cpu_s_ns: 0,
+                mem_in_bytes: 0,
+                mem_out_bytes: 0,
+                abnormal_exit: false,
+            })
+            .collect();
+        let trace_id: [u8; 16] = [
+            0x01, 0x91, 0xff, 0xff, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0xde, 0xad, 0xbe, 0xef,
+            0xca, 0xfe,
+        ];
+        PendingBatch {
+            meta_partial: MetaPartial {
+                schema_version: 1,
+                trace_id,
+                host: Arc::from("h"),
+                pid: 1,
+                start_time_realtime_ns: 0,
+                sapi: Arc::from("cli"),
+                uri_or_script: Arc::from("/x"),
+            },
+            dict: Vec::new(),
+            calls,
+            size_estimate: 0,
+            drop_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn format_drop_notice_matches_spec_5_2_step_4_wording() {
+        let batch = dummy_batch_with_calls(7);
+        let line = format_drop_notice(
+            &batch,
+            "http://127.0.0.1:8080/v1/ingest",
+            on_batch::DropReason::HttpStatus(401),
+            4,
+        );
+        // Spec wording: `php-analyze: dropped <N> records from trace
+        // <uuid>: <url> <status_or_error> (attempt <K>)`.
+        assert_eq!(
+            line,
+            "php-analyze: dropped 7 records from trace \
+             0191ffff-0000-7000-8000-deadbeefcafe: \
+             http://127.0.0.1:8080/v1/ingest http 401 (attempt 4)",
+        );
+    }
+
+    #[test]
+    fn format_drop_notice_renders_each_drop_reason_token_per_5_2() {
+        let batch = dummy_batch_with_calls(1);
+        for (reason, expected_token) in [
+            (on_batch::DropReason::Timeout, "timeout"),
+            (on_batch::DropReason::ConnectRefused, "connect_refused"),
+            (on_batch::DropReason::TlsError, "tls_error"),
+            (on_batch::DropReason::Transport, "transport"),
+            (on_batch::DropReason::EncodeFailed, "encode_failed"),
+            (on_batch::DropReason::DeadlineExceeded, "deadline_exceeded"),
+        ] {
+            let line = format_drop_notice(&batch, "https://example.test/v1", reason, 1);
+            assert!(
+                line.contains(expected_token),
+                "DropReason::{reason:?} should render as `{expected_token}`; got: {line}",
+            );
+        }
+    }
+
+    #[test]
+    fn format_drop_notice_with_empty_server_url_renders_a_double_space() {
+        // When `OnBatch::server_url()` returns `None`, the caller
+        // passes "" — the rendered line has an empty `<url>` slot but
+        // remains parseable. This is the test-fake path; production
+        // never hits it because `RmpEncodeAndHttpPost::server_url`
+        // returns `Some(...)`.
+        let batch = dummy_batch_with_calls(1);
+        let line = format_drop_notice(&batch, "", on_batch::DropReason::Timeout, 1);
+        assert!(
+            line.contains(":  timeout"),
+            "empty server_url → consecutive spaces before status; got: {line}",
+        );
+    }
+
+    #[test]
+    fn push_and_drain_drop_notices_round_trips_in_push_order() {
+        let _guard = lock();
+        reset_for_test();
+        push_drop_notice("one".to_owned());
+        push_drop_notice("two".to_owned());
+        push_drop_notice("three".to_owned());
+        let drained = drain_drop_notices();
+        assert_eq!(drained, vec!["one", "two", "three"]);
+        assert!(
+            drain_drop_notices().is_empty(),
+            "queue is empty after the first drain",
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    fn drained_consume_pushes_a_notice_on_dropped_outcomes() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+
+        let batch = dummy_batch_with_calls(3);
+        let mut on_batch_fake =
+            on_batch::RecordingOnBatch::new(vec![on_batch::OnBatchOutcome::Dropped {
+                reason: on_batch::DropReason::HttpStatus(503),
+                attempts: 4,
+            }]);
+        let mut counter: u64 = 0;
+        drained_consume(&batch, &mut on_batch_fake, None, &mut counter);
+
+        let notices = drain_drop_notices();
+        assert_eq!(notices.len(), 1, "exactly one notice queued");
+        assert!(
+            notices[0].starts_with("php-analyze: dropped 3 records from trace "),
+            "queued line preserves spec format; got: {}",
+            notices[0],
+        );
+        assert!(
+            notices[0].contains("http 503 (attempt 4)"),
+            "queued line carries the DropReason::Display token + attempts; got: {}",
+            notices[0],
+        );
+        assert_eq!(counter, 0, "Dropped outcome does not bump batches_drained");
+        reset_for_test();
+    }
+
+    #[test]
+    fn drained_consume_does_not_push_a_notice_on_sent_outcomes() {
+        let _guard = lock();
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        reset_for_test();
+        crate::recorder::accounting::reset_for_test();
+
+        let batch = dummy_batch_with_calls(2);
+        let mut on_batch_fake =
+            on_batch::RecordingOnBatch::new(vec![on_batch::OnBatchOutcome::Sent]);
+        let mut counter: u64 = 0;
+        drained_consume(&batch, &mut on_batch_fake, None, &mut counter);
+
+        assert!(
+            drain_drop_notices().is_empty(),
+            "Sent outcome must not queue a drop notice",
+        );
+        assert_eq!(counter, 1, "Sent outcome bumps batches_drained");
         reset_for_test();
     }
 }

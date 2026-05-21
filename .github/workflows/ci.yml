@@ -94,3 +94,15 @@ jobs:
         env:
           PHP_ANALYZE_RUN_RECORDER: "1"
         run: cargo test --test recorder_observer --features recorder-dump
+
+      # Run the slice-3 (Phase-4) shipper end-to-end round-trip test.
+      # Spawns `crates/stub-ingest` against a port-zero loopback bind,
+      # runs `tests/php-shipper/noop.php` with `php_analyze.server_url`
+      # pointed at the stub, and asserts the wire `Batch` landed on
+      # `/debug/batches` with the expected shape. Gates on
+      # `PHP_ANALYZE_RUN_SHIPPER=1` and discovers `php${{ matrix.php }}`
+      # on PATH; without the env var it skips loudly with status 0.
+      - name: cargo test --test shipper_round_trip
+        env:
+          PHP_ANALYZE_RUN_SHIPPER: "1"
+        run: cargo test --test shipper_round_trip

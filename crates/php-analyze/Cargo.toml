@@ -56,6 +56,24 @@ rmp-serde = "1"
 # MSHUTDOWN drain hinges on; `std::sync::mpsc` does not offer it
 # ergonomically.
 crossbeam-channel = "0.5"
+# Phase 4 slice 3 (`shipper-encoder-and-http`): the HTTP client the
+# shipper uses to POST encoded MessagePack batches to the configured
+# `server_url`. `ureq` is blocking, single-thread-safe, and uses
+# `rustls` natively — exactly the shape our dedicated shipper thread
+# needs. `platform-verifier` uses the OS trust store (Linux: system CA
+# bundle via `rustls-native-certs`-equivalent paths; cross-platform
+# wrapper); it is the modern ureq-3.x replacement for wiring
+# `rustls-native-certs` directly per `SPECIFICATION.md` §7.4. The
+# slice's design.md D-6 and `COMMENTS.md` C-16 record the substitution.
+ureq = { version = "=3.3.0", default-features = false, features = [
+    "rustls",
+    "platform-verifier",
+] }
+# `uuid` v7 timestamps the trace at flush time. The recorder side
+# stores `[u8; 16]` (allocation-free); the shipper renders it to the
+# 36-char hyphenated wire form via `Uuid::from_bytes(...).to_string()`
+# inside `shipper::encode::encode_batch` exactly once per batch.
+uuid = { version = "=1.18.1", features = ["v7"] }
 
 [dev-dependencies]
 # Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
@@ -65,6 +83,12 @@ tempfile = "3"
 # raw-bytes encoder by hand. It is *not* part of the production crate's
 # closure — the Phase-4 shipper uses `rmp-serde` directly.
 rmpv = "1"
+# `serde_json` decodes the `/debug/batches` JSON response from
+# `stub-ingest` in the Phase-4 slice-3 integration test
+# (`tests/shipper_round_trip.rs`). The stub itself depends on
+# `serde_json` to produce that JSON; we depend on it here to consume
+# it. Not in the production closure — production uses MessagePack.
+serde_json = "1"
 
 [features]
 # Diagnostic-only: enables a `recorder::dump` module that writes the
