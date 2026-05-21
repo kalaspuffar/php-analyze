@@ -197,7 +197,7 @@ fn spawn_shipper_if_enabled(config: Option<&Config>) {
     if !config.enabled {
         return;
     }
-    shipper::spawn_if_needed_at_rinit();
+    shipper::spawn_if_needed_at_rinit(config);
 }
 
 /// `MSHUTDOWN` — module shutdown. No-op for this change; later changes

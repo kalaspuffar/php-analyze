@@ -29,14 +29,6 @@
 //! attributes plus this conversion function sees the entire
 //! recorder→wire field-name story in two adjacent places.
 
-// The encoder is wired into `run_loop`'s consume step by task 6.x of
-// the same OpenSpec change. Until that lands in the same branch, every
-// symbol here is reachable only from this module's own `#[cfg(test)]`
-// block; the `#[allow(dead_code)]` below opens the gate for `cargo
-// clippy -- -D warnings` to pass on the intermediate commit and is
-// removed by the §6 rewiring.
-#![allow(dead_code)]
-
 use std::sync::atomic::Ordering;
 
 use crate::recorder::types::{self as rec, PendingBatch};
