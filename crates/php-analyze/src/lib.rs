@@ -8,19 +8,29 @@
 //!
 //! Module map:
 //!
-//! - [`config`] — parses, validates, range-clamps, and freezes the
-//!   `php_analyze.*` directives into an immutable [`Config`] global at
-//!   `MINIT`. Pure-Rust; testable without PHP headers.
 //! - [`bootstrap`] — PHP lifecycle hooks (`MINIT`/`MSHUTDOWN`/`RINIT`/
 //!   `RSHUTDOWN`/`MINFO`) and `php.ini` directive registration via
 //!   `ext-php-rs`. The only file in the crate that depends on `ext-php-rs`.
+//! - [`clocks`] — POSIX `clock_gettime` / `getrusage` wrappers and a
+//!   Zend `zend_memory_usage` wrapper, returning `i64` nanoseconds or
+//!   bytes. Substrate for the recorder hot path; the Zend wrapper is
+//!   `cfg(test)`-stubbed so unit tests link without PHP.
+//! - [`config`] — parses, validates, range-clamps, and freezes the
+//!   `php_analyze.*` directives into an immutable [`Config`] global at
+//!   `MINIT`. Pure-Rust; testable without PHP headers.
+//! - [`recorder`] — per-trace in-memory data model (`Trace`, `CallFrame`,
+//!   `CallRecord`, `DictEntry`, …) and the function-dictionary interner
+//!   (`Dictionary`). Pure-Rust substrate; the `FcallObserver` wiring
+//!   that drives it arrives in a follow-up change.
 //! - [`spike`] — Phase-0 spike: an `FcallObserver` that logs every
 //!   begin/end event to a configurable destination. Off by default
 //!   (`php_analyze.spike_observer = 0`). Removed by Phase 2's Recorder
 //!   change.
 
 pub mod bootstrap;
+pub mod clocks;
 pub mod config;
+pub mod recorder;
 pub mod spike;
 
 pub use config::initialise_from_ini;

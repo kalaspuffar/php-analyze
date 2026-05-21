@@ -16,18 +16,26 @@ clarification.
 <branch>` fails with `Permission denied (publickey)`.
 
 **To unblock**: push from a workstation that has push credentials.
-Two branches are currently pending push from this host:
+Three branches are currently pending push from this host:
 
 ```bash
 # Phase 1 — already merged to main via PR #1; pushing the branch
 # again is no longer necessary but harmless.
 git push -u origin feat/scaffold-workspace-and-config
 
-# Phase 0 spike — committed locally, ready to push and open a PR.
+# Phase 0 spike — already merged to main via PRs #2/#3; pushing
+# again is harmless.
 git push -u origin feat/spike-zend-observer
+
+# Phase-2 slice 1 (recorder substrate: clocks + types + dictionary).
+# OpenSpec change: recorder-clocks-and-types. Four focused commits
+# on top of main; cargo fmt/clippy/test all green, 14 new unit
+# tests added (5 clocks + 5 types + 4 dictionary). Ready to push
+# and open a PR.
+git push -u origin feat/recorder-clocks-and-types
 ```
 
-Both branches are fully committed locally and ready to push.
+All three branches are fully committed locally and ready to push.
 
 ## Closed blockers
 
@@ -1150,4 +1158,216 @@ change + branch per the "one change per branch" rule.
 - **S-14** (`LocalFcallInfo::empty()` is reachable only via the
   null-`func` defensive branch and produces a silently-misleading
   fqn). Folded into `spike-tidy-fqn-and-deadcode`.
+
+## Review — `feat/recorder-clocks-and-types` (2026-05-21)
+
+Code review of the Phase-2 slice 1 substrate (`recorder-clocks-and-types`
+change). All findings prefixed **RS-N** (Recorder Substrate). The
+branch passes `cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, and `cargo test --all` (64 lib + 1
+integration test, all green). The diff is well-scoped (~880 lines
+across four new files, no edits to `bootstrap`/`config`/`spike`),
+which makes the substrate-only contract from `design.md §D-8` easy
+to verify. The findings below are issues to fix on this branch or
+fold into the next slice; severity is called out per-finding.
+
+### Issues to fix on this branch
+
+- **RS-1** — **MAJOR / spec discussion needed.** `cpu_times_now_ns`
+  uses `getrusage(RUSAGE_SELF, …)` per `SPECIFICATION.md §3.2`'s
+  literal wording. `RUSAGE_SELF` returns CPU time **summed across
+  every thread of the process**. Once the Phase-4 shipper thread
+  exists, a `cpu_u/s_ns` delta computed around a PHP call will
+  include whatever CPU the shipper consumed during that interval,
+  inflating per-call CPU readings under load. Linux 2.6.26+ exposes
+  `RUSAGE_THREAD` which gives per-thread accounting — exactly what
+  the recorder wants (the recorder runs on the PHP request thread
+  and only that thread's CPU is meaningful for `(t_in, t_out)`-
+  scoped CPU). The fix is one constant swap (`RUSAGE_SELF` →
+  `RUSAGE_THREAD`) plus a doc-comment update; ideally raise the
+  spec issue first and amend `SPECIFICATION.md §3.2` / §7.4
+  in the same change. Risk of not fixing: every `cpu_u/s_ns` field
+  in the wire format becomes noisy in a way that's only visible
+  once shippers exist (Phase 4) and is silently wrong before then.
+
+- **RS-2** — **MAJOR.** `Dictionary::next_fn_id: u32` is incremented
+  via `self.next_fn_id += 1`. After 2³² distinct `intern` calls in
+  one trace the field overflows: panics in debug, **silently wraps
+  to 0** in release, breaking the "0 is the no-function sentinel"
+  contract in `dictionary.rs:34-36`. A 4-billion-distinct-function
+  trace is unrealistic for PHP, but the contract should not depend
+  on workload. Fix options (any one): (a) `saturating_add(1)` plus
+  reject further inserts with `panic!` or `Option<u32>` return;
+  (b) `checked_add` with `expect`; (c) document the limit and
+  promote to `u64` (cheap — `fn_id` is on the wire as `u32` per
+  §4.2.2, so the dictionary-internal counter could still be `u32`
+  while the wire field caps at the same width). Recommend (b) —
+  smallest change, loud failure mode.
+
+- **RS-3** — **MAJOR.** `Trace`'s `buffer`, `buffer_estimated_bytes`,
+  `stack`, `dictionary`, `call_id_seq` are all `pub` (`types.rs:192-
+  204`). Slice 3 (`recorder-depth-and-cap-drops`) will introduce
+  the invariant that `buffer_estimated_bytes` always equals the
+  §3.2 estimator applied to `buffer`'s current contents; with `pub`
+  fields any caller can desync them by pushing to `buffer` without
+  bumping the estimate. Recommend `pub(crate)` for the mutable
+  state fields and adding the minimal accessor surface the future
+  observer needs (`push_record`, `push_dict_entry_via_intern`,
+  `next_call_id`), even if those accessors are one-liners today —
+  the type-level enforcement is the point. At minimum, add the
+  invariant to `Trace`'s doc comment so slice 3's author cannot
+  miss it.
+
+- **RS-4** — **MINOR.** The `extern "C" { fn zend_memory_usage
+  (real_usage: bool) -> usize; }` block in `clocks.rs:123-125` is
+  not marked `unsafe extern "C"`. The crate is on edition 2021 so
+  this compiles cleanly today, but Rust 2024 makes `unsafe extern`
+  mandatory on these blocks. One-character fix (`unsafe extern
+  "C"`); preserves edition-upgrade ergonomics; the function is
+  already called inside an `unsafe { … }` block, so call-site
+  semantics don't change.
+
+- **RS-5** — **MINOR.** `clock_gettime_ns` and `cpu_times_now_ns`
+  use `debug_assert_eq!(rc, 0, …)` to check the syscall return
+  code. In release builds, a non-zero return (e.g., EINVAL for an
+  unknown `clockid_t` on an exotic kernel; EFAULT if the kernel
+  rejects the pointer) silently produces a zero-filled `timespec`
+  / `rusage`, which then becomes a bogus timestamp written into a
+  `CallRecord`. The cases are very unlikely on the supported
+  target (Linux x86_64 + listed clock IDs), but the cost of a
+  hard `assert!(rc == 0)` is one branch on a path that already
+  does a syscall — invisible. Recommend hard-assert, matching the
+  doc-comment's "infallible" claim.
+
+- **RS-6** — **MINOR.** `monotonic_now_ns_is_non_decreasing_across
+  _a_two_millisecond_sleep` (`clocks.rs:188`) bounds the delta to
+  `[1ms, 100ms]`. The lower bound catches unit-conversion bugs as
+  intended. The 100ms upper bound is more fragile: a paged-out CI
+  runner or a `nice`d build agent can pause a thread for >100ms
+  without that being a unit-conversion bug. Suggest either (a)
+  raise the ceiling to `500ms` or (b) drop the upper bound — the
+  lower bound is sufficient evidence the units are nanoseconds,
+  and `b >= a` already proves monotonicity. Either avoids a future
+  flake that costs more to diagnose than the test is worth.
+
+- **RS-7** — **MINOR.** `PendingBatch` exposes `pub dict`, `pub
+  calls`, `pub size_estimate` (`types.rs:158-163`) with no
+  constructor or helper to keep `size_estimate` aligned with the
+  §3.2 estimator (`64 + len(fqn) + len(file) + 24` per dict
+  entry, `64` per call). Slice 3 introduces the estimator; adding
+  a `PendingBatch::new(meta_partial, dict, calls)` or a free
+  `estimate_batch_bytes(&[DictEntry], &[CallRecord]) -> usize`
+  function now removes the chance that slice 3's author updates
+  one place and not the other. Optional for this branch, but the
+  shape is cheaper to introduce alongside the type than retrofit
+  later.
+
+### Nitpicks (suggestions, no fix required)
+
+- **RS-8** — `Trace::new(host: Arc<str>, sapi: Arc<str>, pid: u32,
+  uri_or_script: String)` has four positional arguments with two
+  `Arc<str>` parameters surrounding a `u32` (`types.rs:214`).
+  Easy to swap `host` and `sapi` at a call site without compile-
+  time catch. Slice 2 is the first real caller; consider grouping
+  the request-identity fields into a small `RequestIdentity`
+  struct (or a `TraceParams` builder) when slice 2 lands rather
+  than now.
+
+- **RS-9** — `recorder_types_module_does_not_derive_serde_serialize`
+  (`types.rs:357`) reads `include_str!("types.rs")` and greps for
+  `Serialize`. If the file is split into `types/{mod,call,batch}.rs`
+  during a future refactor, the guard silently stops covering the
+  new files. Suggest adding the same guard to a top-level
+  `tests/no_wire_serde_in_recorder_substrate.rs` integration test
+  that walks `crates/php-analyze/src/recorder/` and asserts the
+  substring across every file. Defer to whenever the recorder
+  module grows past a single file.
+
+- **RS-10** — `cpu_times_now_ns`'s doc claims `getrusage` is
+  "documented infallible" for `RUSAGE_SELF` (`clocks.rs:87`).
+  POSIX permits `EINVAL` for unsupported `who` and `EFAULT` for
+  bad pointer; neither applies here, but "documented infallible"
+  is stronger than what POSIX actually guarantees. Soften to
+  "infallible on Linux x86_64 for `RUSAGE_SELF` with a valid
+  pointer" or similar.
+
+### Positive highlights
+
+Not all review notes are issues — a few decisions in this branch
+are notably well-shaped and worth calling out so they don't get
+undone by a future refactor:
+
+- **Lazy-allocate `intern` API**: `Dictionary::intern(key, build:
+  impl FnOnce(u32) -> DictEntry)` (`dictionary.rs:49`) is the
+  right shape — the closure only fires on a miss, so the
+  `DictEntry` (which owns two `String`s) is never built for a
+  hit. This is exactly the hot-path discipline §10 Phase 5 will
+  thank you for. Resist any future refactor that takes
+  `entry: DictEntry` eagerly.
+
+- **`cfg(test)` stub for `memory_usage_real_bytes`** (`clocks.rs:
+  121-140`) keeps `cargo test` PHP-free, preserving the crate-wide
+  invariant established by `config.rs`/`bootstrap.rs`'s shims. The
+  PHP-fixture coverage of the real symbol is correctly deferred to
+  slice 2.
+
+- **Negative-derive sentry** (`types.rs:357-376`) — using a
+  source-grep test to enforce "no `serde` derives in this slice"
+  is a creative way to keep an architectural boundary at `cargo
+  test` time without LSP / proc-macro reflection. Even with the
+  RS-9 caveat above, this is a good pattern.
+
+- **Diff size + scope** stays within CLAUDE.md's "few hundred
+  lines of meaningful diff" guidance (~880 lines including ~400
+  lines of tests across three new modules) and faithfully respects
+  the substrate-only contract from `design.md §D-8` — verified by
+  `git diff main -- '...bootstrap.rs' '...spike.rs' '...config.rs'`
+  returning empty, matching task §5.1–§5.3.
+
+### Recommendation
+
+**REQUEST CHANGES** — the branch is structurally sound and well-
+tested, but **RS-1**, **RS-2**, and **RS-3** are contracts that
+will silently fail under realistic workloads once later phases
+land; cheaper to fix here than to chase later. **RS-1** in
+particular benefits from being raised against the spec first
+(`SPECIFICATION.md §3.2` literally says `RUSAGE_SELF`), so a
+single change can amend both the spec and the wrapper. **RS-4**
+through **RS-7** are minor and can be batched into the same
+review-fix commit. **RS-8** through **RS-10** are deferrable.
+
+### Round-2 fix status — `feat/recorder-clocks-and-types` (2026-05-21)
+
+Fixes applied on the same branch, same OpenSpec change
+(`recorder-clocks-and-types`), per the precedent set by the
+bootstrap and spike branches' round-1 fix commits. All checks
+green afterwards: `cargo fmt --check`, `cargo clippy --all-
+targets --all-features -- -D warnings`, `cargo test --all`
+(68 lib tests, 4 new from this round; 1 integration test, soft-
+skipped), and `openspec validate recorder-clocks-and-types`.
+
+| ID | Severity | Outcome | Notes |
+| --- | --- | --- | --- |
+| RS-1 | MAJOR | **Fixed** | `cpu_times_now_ns` now passes `libc::RUSAGE_THREAD`. `SPECIFICATION.md §3.2` (line 211) and `§7.4` (Permissions row) amended in the same commit per the reviewer's recommendation and the user's confirmation. `clocks.rs` module doc + `cpu_times_now_ns` doc explain the choice and cite the spec amendment. |
+| RS-2 | MAJOR | **Fixed** | `Dictionary::intern` now uses `checked_add(1).expect(...)` for `next_fn_id`. The `expect` message names the 2^32 contract explicitly. |
+| RS-3 | MAJOR | **Fixed** | `Trace`'s mutable state fields (`call_id_seq`, `stack`, `buffer`, `dictionary`, `buffer_estimated_bytes`) demoted to `pub(crate)`. Added the accessor surface the reviewer asked for: `Trace::next_call_id`, `Trace::push_record`, `Trace::push_dict_entry_via_intern`. Each accessor establishes the §3.2 estimator invariant for its slice of the state (per-record `+= 64`, per-dict-miss `+= 24 + len(fqn) + len(file)`). The `stack` field is annotated `#[allow(dead_code)]` with a comment naming slice 2 as the first reader — the alternative was to add a `pop_frame` accessor in this slice, which would have been scope creep. The class-level invariant is documented on `Trace`'s doc comment so slice 3 cannot miss it. |
+| RS-4 | MINOR | **Fixed** | `extern "C" { fn zend_memory_usage … }` → `unsafe extern "C" { … }` with a comment noting Rust 2024 forward-compat. |
+| RS-5 | MINOR | **Fixed** | Both `debug_assert_eq!(rc, 0, …)` sites in `clock_gettime_ns` and `cpu_times_now_ns` promoted to `assert!(rc == 0, …)`. Comments explain the loud-failure rationale. |
+| RS-6 | MINOR | **Fixed** | `monotonic_now_ns_is_non_decreasing_across_a_two_millisecond_sleep` upper bound dropped. The 1 ms lower bound is retained because it is what catches unit-conversion bugs; `b >= a` already proves monotonicity. |
+| RS-7 | MINOR | **Fixed** | Added `pub fn estimate_batch_bytes(dict: &[DictEntry], calls: &[CallRecord]) -> usize` plus `pub(crate) const CALL_RECORD_FIXED_BYTES`/`DICT_ENTRY_FIXED_BYTES`. `PendingBatch` and `Trace`'s accessors now share the same formula source. `PendingBatch`'s doc comment documents the `size_estimate == estimate_batch_bytes(...)` invariant for slice-3's future `flush_into_batch` accessor. |
+| RS-8 | NIT | **Deferred** | Grouping `Trace::new`'s positional args into a `RequestIdentity` struct deferred to slice 2 per the reviewer's own suggestion — slice 2 is the first non-test caller. |
+| RS-9 | NIT | **Deferred** | The `recorder_types_module_does_not_derive_serde_serialize` guard's coverage only matters once `types.rs` is split into multiple files. Tracked as a Phase-3 follow-up alongside the wire-format change that would do the splitting. |
+| RS-10 | NIT | **Fixed** | `cpu_times_now_ns` doc no longer says "documented infallible"; it now says "infallible on Linux x86_64 for the supported `who` constant with a valid pointer". Done in the same edit as RS-1 because both touched the same doc paragraph. |
+
+Four new tests landed in `recorder::types::tests`:
+
+- `trace_next_call_id_is_monotonic_from_one` — exercises `Trace::next_call_id`'s monotonicity-from-1 contract.
+- `trace_push_record_appends_to_buffer_and_bumps_the_estimate_by_64` — pins the per-record estimator contribution.
+- `trace_push_dict_entry_via_intern_bumps_estimate_only_on_a_miss` — exercises the miss-vs-hit estimator contribution AND verifies the lazy-allocate hot-path discipline the reviewer asked us to keep.
+- `estimate_batch_bytes_matches_the_spec_3_2_formula` — exercises the free function with both a populated and an empty batch.
+
+Spec amendments:
+
+- `SPECIFICATION.md §3.2` — `RUSAGE_SELF` → `RUSAGE_THREAD` with a sentence explaining why (shipper-thread isolation) and the kernel-version note (Linux 2.6.26+, comfortably below the §7.4 ≥4.4 floor).
+- `SPECIFICATION.md §7.4` Permissions row — same constant swap.
 
