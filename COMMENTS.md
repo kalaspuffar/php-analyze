@@ -2627,3 +2627,574 @@ tests (both pin the budget-returns-to-zero invariant the swap
 preserves), and DCR-2 is a doc-only amendment. Test counts match
 the pre-fix-round baseline (133 debug / 134 release).
 
+---
+
+## Code Review — branch `feat/wire-types-and-stub-ingest` (round 1)
+
+**Reviewer:** Claude Code
+**Date:** 2026-05-21
+**Scope:** Two commits since `main` — `b3d0b17` (wire types + 19
+round-trip tests) and `7b556d5` (stub-ingest binary + 6
+integration tests). Diff is ~1700 lines across 8 files, ~60 % of
+which is tests + the `stub-ingest/README.md`.
+**Specification:** `SPECIFICATION.md` §4.2 (wire format), §5.2
+(egress HTTP), §1.4 OQ-2 (media type), §6.3 (token redaction).
+**OpenSpec specs:**
+`openspec/changes/wire-types-and-stub-ingest/specs/wire-format/spec.md`
+and `…/specs/stub-ingest-server/spec.md`.
+**Gates verified locally:** `cargo fmt --check` clean,
+`cargo clippy --all-targets --all-features -- -D warnings` clean,
+`cargo test --all` 147 lib + 1 spike + 0 recorder (gated) + 6
+stub round-trip = 154 passed.
+**Overall recommendation:** REQUEST CHANGES (one MAJOR ask —
+WSI-1 — covering six unimplemented spec scenarios in
+`stub-ingest-server`; the rest are minor and can be deferred).
+
+### Summary
+
+Strong slice. Both deliverables (the §4.2 wire schema and the
+`stub-ingest` test fixture) are in place, both commits are
+self-contained, `design.md` captures every non-trivial decision
+(single source-of-truth on the wire types, small-int
+`FunctionKind`, `MetaFullStrict` regression boundary, byte-equal
+bearer compare, port-0 stdout protocol), and gates are green.
+The wire module is essentially scenario-complete: 17 of 17
+`wire-format` spec scenarios map to a named test, with one
+test (`dict_entry_kind_99_decode_fails_cleanly`) carrying a
+too-loose assertion.
+
+The substantive gap is on the **`stub-ingest-server` scenario
+coverage**: of the 16 testable scenarios in that spec, **six are
+not implemented as tests** (WSI-1 below). None of the six
+exercise broken code paths — the implementation behaves
+correctly under manual inspection — but the spec mandates them
+and a round-2 reviewer would catch this. The recommended fix is
+a single fix-round commit on this branch (precedent: C-9, C-11
+fix-rounds for slices 2 and 3).
+
+Everything else (WSI-2 … WSI-10) is minor: a loosely-asserted
+test, two proposal-vs-implementation deviations (`--print-port`,
+`ureq` major version) that the `tasks.md §17.3` table doesn't
+flag, and a handful of style nits.
+
+### MAJOR findings
+
+#### WSI-1: six spec scenarios from `stub-ingest-server/spec.md` are not implemented as tests
+
+**File:** `crates/stub-ingest/tests/round_trip.rs` (the file
+where the missing tests belong)
+**Severity:** Major (spec compliance — six normative scenarios
+have no automated check)
+
+The following scenarios from
+`openspec/changes/wire-types-and-stub-ingest/specs/stub-ingest-server/spec.md`
+are not exercised anywhere in `tests/round_trip.rs` or
+elsewhere:
+
+| # | Spec Requirement | Spec Scenario | Where it would live |
+| --- | --- | --- | --- |
+| 1 | "The stub SHALL accept `--bind <ip>:<port>` …" | *"An explicit non-zero `--bind` port is honoured (or fails fast)"* | New helper `spawn_stub_at(token, port)` + one test that picks a free port via a throwaway `TcpListener::bind("127.0.0.1:0")`, drops the listener, and passes that port via `--bind`. |
+| 2 | "The stub SHALL accept `POST <path>` …" | *"Stdout stays silent after the `ready` line during request handling"* | `spawn_stub` keeps a background thread draining stdout past the `ready` line into a `Mutex<Vec<u8>>`; one test asserts the buffer is empty after 10 valid POSTs. |
+| 3 | "The stub SHALL expose `GET /debug/batches` …" | *"An empty store returns an empty JSON array"* | New `fresh_store_returns_empty_array` test: spawn, GET, parse `Vec<wire::Batch>`, assert `.is_empty()`. No POST in between. |
+| 4 | "The stub SHALL expose `GET /debug/batches` …" | *"Two posted batches appear in order"* | New `two_posted_batches_appear_in_order` test: POST `b0`, POST `b1`, GET, assert `[b0, b1]`. |
+| 5 | "The stub SHALL handle requests sequentially under a single `Mutex`" | *"Sequential POSTs from the integration test do not race"* | New `ten_sequential_posts_appear_in_order` test: POST ten distinct batches (e.g. `meta.pid = i`), GET, assert length 10 and per-element equality. |
+| 6 | "The stub SHALL document its usage in `crates/stub-ingest/README.md`" | *"README documents the three routes and the bind protocol"* | New `readme_documents_the_three_routes_and_bind_protocol` unit test (could live in `tests/round_trip.rs` or as `#[cfg(test)]` in `src/main.rs`): `include_str!("../README.md")` + five `assert!(readme.contains(_))` calls for `POST /v1/ingest`, `GET /debug/batches`, `POST /debug/reset`, `--bind`, and `bound:`. |
+
+**Why this matters:** the production code paths these scenarios
+exercise are present and (under a manual smoke test) correct.
+But the OpenSpec workflow's contract is that every `Scenario:`
+maps to a named test (the precedent set by slice-2's
+`recorder-observer-hooks-and-trace-lifecycle` and slice-3's
+`recorder-depth-and-cap-drops`). Shipping six missing tests at
+merge time creates two ongoing costs: (a) the spec drifts from
+the test suite, weakening the spec as the source of truth, and
+(b) a future regression in any of these paths goes unnoticed
+until manual inspection.
+
+**Suggestion:** add the six tests as a single fix-round commit
+on this branch, matching the precedent in `C-9` (slice-2 round-2
+fix-commits) and `C-11` (slice-3 round-1 fix-commits). Rough
+shape:
+
+```text
+crates/stub-ingest/tests/round_trip.rs
++ fn spawn_stub_at(token: &str, bind: &str) -> (ChildGuard, SocketAddr) {…}
++ fn drain_post_ready_stdout(child: &mut Child) -> Arc<Mutex<Vec<u8>>> {…}
++ #[test] fn fresh_store_returns_empty_array() {…}
++ #[test] fn two_posted_batches_appear_in_order() {…}
++ #[test] fn ten_sequential_posts_appear_in_order() {…}
++ #[test] fn stdout_stays_silent_after_ready_line() {…}
++ #[test] fn explicit_bind_port_is_honoured() {…}
++ #[test] fn readme_documents_the_three_routes_and_bind_protocol() {…}
+```
+
+Estimated +120–150 LOC of tests; no production-code change
+required. Test count would rise from 6 stub round-trip tests to
+12.
+
+### MINOR findings
+
+#### WSI-2: `dict_entry_kind_99_decode_fails_cleanly` assertion is too loose
+
+**File:** `crates/php-analyze/src/wire.rs:566-570`
+**Severity:** Minor (spec compliance — the test passes, but
+weaker than the spec mandates)
+
+The spec scenario *"A decoded byte 99 for `kind` produces a
+clean decode error"* (`wire-format/spec.md` §`FunctionKind` last
+scenario) says the error message MUST mention "an invalid
+`FunctionKind` value". The current assertion is:
+
+```rust
+assert!(
+    msg.contains("FunctionKind") || msg.contains("invalid"),
+    "decode error must mention the invalid FunctionKind; got: {msg}",
+);
+```
+
+The `||` lets the substring `"invalid"` alone pass — and many
+`rmp_serde` decode errors contain "invalid" without being about
+`FunctionKind`. If a future refactor swallows the `&'static str`
+error from `TryFrom<u8>` and substitutes a generic
+`rmp_serde::DecodeError` containing "invalid type" or "invalid
+length", the test still passes but the §4.2.2 contract is
+broken.
+
+**Suggestion:** tighten to `&&`, or (cleaner) just assert
+`msg.contains("FunctionKind")`. The `&'static str` returned by
+`TryFrom<u8>` (`"invalid FunctionKind discriminant"`) already
+contains both substrings, so the test against the current
+implementation passes either way:
+
+```rust
+assert!(
+    msg.contains("FunctionKind"),
+    "decode error must mention the invalid FunctionKind \
+     variant; got: {msg}",
+);
+```
+
+#### WSI-3: `malformed_body_returns_400_and_does_not_store` doesn't verify the stderr "one-line summary"
+
+**File:** `crates/stub-ingest/tests/round_trip.rs:248-262`
+**Severity:** Minor (spec compliance — partial coverage)
+
+The spec scenario *"A malformed body returns 400"* says: "the
+response status is `400`, the in-memory store does not gain a
+batch, **and stderr contains a one-line summary mentioning the
+decode error**." The test asserts the first two; the stderr
+check is not exercised. The implementation does write the
+expected line (`crates/stub-ingest/src/main.rs:147` —
+`eprintln!("stub-ingest: decode error: {err}");`), so this is
+purely a missing assertion.
+
+**Suggestion:** can be folded into WSI-1's
+`drain_post_ready_stdout` helper expansion — drain BOTH stdout
+(empty assertion) and stderr (contains "decode error") in a
+single background-thread pattern, and use the captured stderr
+here. ~30 additional LOC in `spawn_stub`, then `assert!` in this
+test.
+
+#### WSI-4: `tasks.md §17.3` is silent on two real proposal-vs-implementation deviations
+
+**File:** `openspec/changes/wire-types-and-stub-ingest/tasks.md:142`
+**Severity:** Minor (audit-trail hygiene)
+
+Two implementation choices diverged from `proposal.md` but are
+not flagged in `tasks.md §17.3`'s deviation note:
+
+1. **`--print-port` flag was dropped.** `proposal.md:93-95`
+   says: "`--print-port` (default `true`; on bind, write
+   `bound: <ip>:<port>\n` to stdout …)". The implementation
+   has no such flag — the `bound:` / `ready` protocol is
+   unconditional (`crates/stub-ingest/src/main.rs:43-64` shows
+   only `--bind`, `--auth-token`, `--path`). The behaviour the
+   proposal wanted is the behaviour shipped, but the CLI
+   surface differs.
+
+2. **`ureq` dev-dep is `"3"`, not `"2"`.**
+   `proposal.md:206-209` and §Impact both reference
+   `ureq = "2"`. `crates/stub-ingest/Cargo.toml:50` ships
+   `ureq = "3"`. `Cargo.lock` shows `ureq 3.3.0` was already
+   present on `main` (transitively, via `ext-php-rs`'s build
+   graph or similar), so the proposal's "zero new crates"
+   claim is preserved — but the version drift is real and
+   `tasks.md §14`'s `http_status_as_error(false)` note is
+   v3-specific API.
+
+Neither is a substantive bug. The audit-trail issue is that
+`tasks.md §17.3` explicitly says "No `C-12` entry needed — the
+in-flight deviations … are documentation-internal to the
+implementation; they match the proposal's expectations" — but
+these two deviations don't match the proposal as written.
+
+**Suggestion:** amend `tasks.md §17.3` to a short list:
+
+> Two proposal-vs-implementation deviations not requiring a
+> `COMMENTS.md` entry:
+> - **`--print-port` dropped.** The bind protocol is
+>   unconditional; no test or design path needed an opt-out.
+> - **`ureq` dev-dep pinned to `"3"`.** The version was already
+>   in the lockfile transitively via other crates; bringing it
+>   in as a direct dep at `"2"` would have added a second
+>   major version. The v3-specific `http_status_as_error(false)`
+>   API is the reason the helper exists.
+
+#### WSI-5: `spawn_stub` has no read timeout — a wedged child hangs the test thread until cargo's outer timeout
+
+**File:** `crates/stub-ingest/tests/round_trip.rs:40-70`
+**Severity:** Minor (test robustness — future-bug amplifier)
+
+`BufReader::lines()` is a blocking iterator. If the stub binary
+prints `bound:` and then wedges before `ready` (e.g. a future
+bug where `Server::http` returns but the second `writeln!` /
+`flush!` panics in a way that doesn't close stdout — currently
+impossible, but the protocol pre-`ready` runs no user code so
+the surface is tight; the post-`ready` accept loop is where
+real bugs would happen), the test blocks until cargo's outer
+timeout fires (default minutes). The `ChildGuard` Drop still
+cleans up the child, but the developer's `cargo test` round-trip
+explodes from seconds to minutes.
+
+**Suggestion:** wrap the stdout read in a background thread
+that ships completed lines down a `mpsc::sync_channel(1)`, and
+use `recv_timeout(Duration::from_secs(10))` on the main thread;
+on timeout, fail the test with a captured stderr snapshot. ~25
+LOC, makes the suite resilient to future stub-side bugs (and
+incidentally subsumes the stdout-draining helper WSI-1 #2
+needs).
+
+#### WSI-6: `validate_bearer` open-codes `&value[prefix.len()..]` instead of `str::strip_prefix`
+
+**File:** `crates/stub-ingest/src/main.rs:209-214`
+**Severity:** Nit (style)
+
+```rust
+let prefix = "Bearer ";
+if !value.starts_with(prefix) {
+    return false;
+}
+let presented = &value[prefix.len()..];
+presented.as_bytes() == configured.as_bytes()
+```
+
+The slice `&value[prefix.len()..]` is safe (ASCII prefix on a
+UTF-8 string lands on a char boundary), but a future reader has
+to verify that by hand. `str::strip_prefix` collapses the
+`starts_with` + slice into one expression and makes the
+boundary safety self-evident:
+
+```rust
+let Some(presented) = value.strip_prefix("Bearer ") else {
+    return false;
+};
+presented.as_bytes() == configured.as_bytes()
+```
+
+No behaviour change. Saves three lines.
+
+#### WSI-7: `dispatch()` eagerly computes `method_name` for paths that never use it
+
+**File:** `crates/stub-ingest/src/main.rs:117`
+**Severity:** Nit (style / micro-perf)
+
+```rust
+let method_name = request_method_name(&request);
+match (&method, path.as_str()) { … }
+```
+
+`request_method_name` is `request.method().to_string()` — a heap
+allocation per request. Only the `405` and `404` match arms use
+the value; the three happy paths (ingest, debug-batches,
+debug-reset) discard it. Under future bench workloads against
+the stub (Phase 5), this is one needless allocation per request.
+
+**Suggestion:** inline the call into the two arms that need it,
+or build it lazily:
+
+```rust
+let method_name = || request_method_name(&request);
+match (&method, path.as_str()) {
+    (Method::Post, p) if p == args.path => handle_ingest(request, args, store),
+    (Method::Get, "/debug/batches") => handle_debug_batches(request, store),
+    (Method::Post, "/debug/reset") => handle_debug_reset(request, store),
+    (_, p) if p == args.path => respond_status(request, 405, &format!("{} {p}", method_name())),
+    _ => respond_status(request, 404, &format!("{} {path}", method_name())),
+}
+```
+
+#### WSI-8: `handle_debug_batches` uses `to_vec_pretty` — pretty-print cost is paid on every test query
+
+**File:** `crates/stub-ingest/src/main.rs:176`
+**Severity:** Nit (style / micro-perf)
+
+Pretty-printing inflates the JSON body 2–3× and is non-trivial
+CPU for large batches (newlines + per-field indentation). Tests
+re-parse via `serde_json::from_slice` anyway, where pretty vs.
+compact is invisible. The README markets `curl` as the manual
+debugging path — and `curl | jq` renders pretty JSON for
+humans on demand, removing the need to pre-format.
+
+**Suggestion:** either keep `to_vec_pretty` and accept the cost
+(it's a test fixture; this is defensible), or switch to
+`to_vec`. Flagging because the choice isn't recorded in
+`design.md` — if the project later runs the stub under heavier
+bench workloads (Phase 5), this is the kind of one-line change
+that gets overlooked.
+
+#### WSI-9: README routes table doesn't note that `/debug/*` are unauthenticated
+
+**File:** `crates/stub-ingest/README.md:60-65`
+**Severity:** Nit (docs)
+
+`stub-ingest-server/spec.md §"POST /debug/reset"` Requirement
+says: "The endpoint requires no authentication — it is a
+debug-only surface accessible on the same loopback bind as
+`/v1/ingest`." The README routes table doesn't mention this
+distinction. An auditor reading the README cold might assume the
+debug endpoints share the bearer requirement.
+
+**Suggestion:** either append "(no auth)" to the
+`/debug/batches` and `/debug/reset` rows, or add a footnote
+under the table:
+
+> `/debug/*` paths are unauthenticated — they are debug
+> surfaces accessible only on the loopback bind. The bearer
+> requirement applies to the ingest path only.
+
+#### WSI-10: `dispatch()`'s `path.to_owned()` is a per-request `String` allocation
+
+**File:** `crates/stub-ingest/src/main.rs:114`
+**Severity:** Nit (style / micro-perf)
+
+```rust
+let path = request.url().split('?').next().unwrap_or("").to_owned();
+```
+
+The `.to_owned()` is required because `request.url()` borrows
+`request`, and we later move `request` into a handler. But the
+allocation can be skipped if `dispatch()` splits into two
+phases: pull the `path` and `method` into owned values *only on
+the 405/404 paths* (where the value is consumed by `format!`);
+on the happy paths, dispatch on `request.url()` directly before
+moving.
+
+Not worth the refactor cost on its own — but if WSI-7's lazy
+`method_name` lands, the same closure shape would work for
+`path` and would clean up both at once.
+
+### Positive highlights
+
+- **Module-level docs in `wire.rs:1-41`** are exemplary. They
+  call out the v1-frozen decisions, the §4.2 source-of-truth
+  claim, the trace-id-as-String tradeoff (D-3), and the
+  forward-compat rule all in one place. The
+  `SECURITY/COMPAT: never add deny_unknown_fields` block-level
+  comment at `wire.rs:59-64` is the right shape — a
+  future-contributor warning placed exactly at the point of
+  temptation.
+- **`MetaFullStrict` regression boundary (`wire.rs:582-594`)**
+  is the right pattern for pinning "default behaviour is a
+  deliberate choice, not an accident" into the test suite.
+  Catches the silent-tighten regression a stray
+  `deny_unknown_fields` would otherwise introduce.
+- **`contains_msgpack_str_key` scanner (`wire.rs:651-682`)** is
+  principled: covers all four `fixstr` / `str8` / `str16` /
+  `str32` headers even though only `fixstr` is reachable for
+  the field names today. Cheap insurance against a future
+  schema bump pushing a key past 31 bytes.
+- **`function_kind_method_encodes_as_integer_one_via_rmp_serde`
+  (`wire.rs:243-264`)** decodes the encoded bytes through
+  `rmpv::Value` rather than through the same `FunctionKind`
+  deserializer under test. That's the right way to exercise
+  "the encoder produces the int we expect" — many similar
+  test suites accidentally make this test tautological.
+- **`ChildGuard` (`tests/round_trip.rs:24-35`)** correctly
+  best-effort `kill()` + `wait()` on Drop, including on panic.
+  The `let _ = …` pattern explicitly documents the
+  swallow-errors choice on the cleanup path.
+- **`tiny_http` over `axum` (design D-5)** is the right call:
+  matches the production extension's sync model, ~10× less
+  transitive dep weight than `axum + tokio`, and the
+  three-route surface needs no router. The decision rationale
+  in `design.md` lays out the alternative considered and the
+  rejection reason — exemplary OpenSpec design-doc shape.
+- **The single-source-of-truth dependency line** (stub depends
+  on `php-analyze` via path so the wire schema is one Rust
+  type, decoded by the same module that the Phase-4 shipper
+  will encode through) is the right architectural choice and
+  the design-D-6 alternative ("factor `wire.rs` into its own
+  workspace crate") is correctly recorded as a deferred
+  follow-up if dep-graph friction shows up.
+
+### Specification compliance check
+
+**`openspec/changes/wire-types-and-stub-ingest/specs/wire-format/spec.md`** (17 of 17 scenarios mapped):
+
+- ✅ A hand-crafted Batch round-trips through MessagePack — `batch_round_trips_minimum_shape`
+- ✅ An empty `dict` and empty `calls` round-trip — `batch_round_trips_with_empty_dict_and_empty_calls`
+- ✅ MetaFull round-trips with all string fields populated — `meta_full_round_trips_with_all_fields_populated`
+- ✅ Encoded bytes contain the §4.2.1 wire field names — `meta_full_encoded_bytes_contain_all_eight_wire_keys`
+- ✅ A user-function DictEntry round-trips — `dict_entry_user_method_round_trips`
+- ✅ An internal-function DictEntry round-trips — `dict_entry_internal_round_trips_with_empty_file_and_zero_line`
+- ✅ A CallRecord round-trips with literal `"fn"` (not `"fn_id"`) — `call_record_round_trips_and_encoded_bytes_contain_literal_fn_key`
+- ✅ A CallRecord with `abnormal_exit = true` round-trips — `call_record_abnormal_exit_true_round_trips`
+- ✅ All four kinds round-trip — `realistic_shape_round_trip_succeeds`
+- ✅ `FunctionKind::Method` encodes as int `1` — `function_kind_method_encodes_as_integer_one_via_rmp_serde`
+- ⚠️ A decoded byte `99` produces a clean decode error — test runs, but assertion is too loose (WSI-2)
+- ✅ MetaFull with unknown `future_field` decodes cleanly — `meta_full_decodes_cleanly_with_unknown_extra_field`
+- ✅ `MetaFullStrict` rejects the same bytes — `meta_full_strict_rejects_the_same_unknown_field_bytes`
+- ✅ `MEDIA_TYPE` matches §1.4 OQ-2 exactly — `media_type_matches_oq_2_string_exactly`
+- ✅ `SCHEMA_VERSION` is `1` — `schema_version_is_one`
+- ✅ No `From<_> for wire::Batch` impls exist in this slice — documented in module-doc; `grep` confirms; `tasks.md §9.3`
+- ✅ A realistic-shape round-trip succeeds — `realistic_shape_round_trip_succeeds`
+
+**`openspec/changes/wire-types-and-stub-ingest/specs/stub-ingest-server/spec.md`** (10 of 16 scenarios mapped):
+
+- ✅ `cargo build -p stub-ingest` produces a binary — gates green
+- ✅ `stub-ingest` depends on `php-analyze` via path — `Cargo.toml`
+- ✅ `--bind 127.0.0.1:0` prints a non-zero bound port — `round_trip_post_and_get_debug_batches` (et al.)
+- ❌ An explicit non-zero `--bind` port is honoured (or fails fast) — **not tested (WSI-1 #1)**
+- ✅ A valid POST returns 200 and stores the batch — `round_trip_post_and_get_debug_batches`
+- ✅ A missing `Authorization` header returns 401 — `missing_bearer_returns_401_and_does_not_store`
+- ✅ A wrong bearer token returns 401 — `wrong_bearer_returns_401_and_does_not_store`
+- ✅ A wrong `Content-Type` returns 415 — `wrong_content_type_returns_415_and_does_not_store`
+- ⚠️ A malformed body returns 400 — status + store assertions present, **stderr summary assertion missing (WSI-3)**
+- ❌ Stdout stays silent after `ready` line during request handling — **not tested (WSI-1 #2)**
+- ❌ An empty store returns an empty JSON array — **not tested (WSI-1 #3)**
+- ❌ Two posted batches appear in order — **not tested (WSI-1 #4)**
+- ✅ Reset empties the store — `reset_clears_the_store_between_scenarios`
+- ❌ Sequential POSTs from the integration test do not race (10 batches) — **not tested (WSI-1 #5)**
+- ❌ README documents the three routes and the bind protocol — **not tested (WSI-1 #6)** (README content is correct on manual read; just no automated assertion)
+- ✅ The round-trip test passes against a freshly-spawned stub — `cargo test -p stub-ingest` is green
+
+### Overall recommendation
+
+**REQUEST CHANGES** — round-1 fix-round on this same branch,
+following the slice-2 (`C-9`) and slice-3 (`C-11`) precedent.
+
+WSI-1 is the substantive ask: six normative spec scenarios in
+`stub-ingest-server` are not tested. The implementation paths
+they would exercise are present and correct under manual
+inspection; the gap is purely on the automated-check surface,
+but the OpenSpec contract is that every `Scenario:` block maps
+to a named test. ~120–150 LOC of new tests in
+`crates/stub-ingest/tests/round_trip.rs`, no production-code
+change.
+
+WSI-2 and WSI-3 are small assertion tightening on existing
+tests and can be folded into the same fix-round commit (the
+WSI-3 stderr capture would naturally share infrastructure with
+WSI-1 #2's stdout-silent test).
+
+WSI-4 … WSI-10 are minor. Recommend either batching the
+documentation amendments (WSI-4, WSI-9) into the same fix-round
+commit alongside WSI-1, and queueing WSI-5 / WSI-6 / WSI-7 /
+WSI-8 / WSI-10 as follow-up OpenSpec changes (the "one change
+per branch" rule applies — none of them block merging). The
+single-largest follow-up candidate is WSI-5 (the
+`spawn_stub`-with-timeout refactor), since it also gives WSI-1
+#2 and WSI-3 the stdout/stderr-capture machinery they need.
+
+Post-fix-round expected gate state: 147 wire tests + 6 + 6 new
+stub round-trip tests = 12 stub round-trip tests; `cargo test
+--all` total rises from 154 to ~160. No new dependencies. No
+production-code behaviour change.
+
+Test coverage and module-level documentation on this slice are
+otherwise excellent, the design decisions are well-recorded,
+and the wire-side is essentially flawless. The slice is one
+fix-round away from merge-ready.
+
+---
+
+## C-12: Wire-and-stub round-1 review-fix status (branch `feat/wire-types-and-stub-ingest`)
+
+**Date:** 2026-05-21
+**Reviewer findings:** WSI-1 … WSI-10 (see "Code Review — branch
+`feat/wire-types-and-stub-ingest` (round 1)" above).
+**Implementer response:** the one MAJOR finding (WSI-1) and the
+two small assertion / doc amendments the reviewer recommended
+folding into the same fix-round commit (WSI-2, WSI-3, WSI-4,
+WSI-9) landed on this branch as a fix-round, following the
+precedent set by C-9 (slice-2 round-2 fix-commits) and C-11
+(slice-3 round-1 fix-commits). The remaining MINOR / NIT items
+(WSI-5 … WSI-8, WSI-10) are queued as follow-up OpenSpec changes
+per the reviewer's own §"Overall recommendation" guidance ("none
+of them block merging").
+
+### What changed on this branch in the fix-round
+
+| ID | Status | Implementation |
+| --- | --- | --- |
+| WSI-1 | Closed | Six previously-missing spec scenarios in `stub-ingest-server/spec.md` are now backed by named tests in `crates/stub-ingest/tests/round_trip.rs`: `fresh_store_returns_empty_array`, `two_posted_batches_appear_in_order`, `ten_sequential_posts_appear_in_order`, `stdout_stays_silent_after_ready_line`, `explicit_bind_port_is_honoured`, and `readme_documents_the_three_routes_and_bind_protocol`. The stub round-trip test count rose from 6 to 12. To support the stdout-silent and stderr-summary assertions, `ChildGuard` was reshaped to carry `Arc<Mutex<Vec<u8>>>` buffers for stdout (post-`ready`) and stderr, each drained by a background thread that exits naturally on the child's kill-on-drop. A new `spawn_stub_at(token, bind)` helper covers the explicit-port path. The README's prose-mention of `POST /debug/reset` was reflowed onto a single line (it had been line-broken across `\`POST\n/debug/reset\``); without that change `readme_documents_…` would have failed — the test caught a real documentation precision gap. |
+| WSI-2 | Closed | The `dict_entry_kind_99_decode_fails_cleanly` test in `crates/php-analyze/src/wire.rs` now asserts `msg.contains("FunctionKind")` only — dropping the `\|\| msg.contains("invalid")` fallback that would let any generic `rmp_serde::DecodeError` containing the word "invalid" pass. The `&'static str` returned by `TryFrom<u8> for FunctionKind` (`"invalid FunctionKind discriminant"`) satisfies the tightened assertion on the current implementation, and the test now fails closed if a future refactor swallows that error. A doc-comment above the assertion records the round-1 history. |
+| WSI-3 | Closed | `malformed_body_returns_400_and_does_not_store` now also asserts that the stub's stderr contains the substring `"decode error"` (the literal one-line summary `stub-ingest: decode error: <err>` the handler emits). The assertion piggy-backs on the stderr-capture machinery added for WSI-1 #2; no production-code change. |
+| WSI-4 | Closed (doc-only) | `tasks.md §17.3` is amended in-place. The previous "No `C-12` entry needed" wording is replaced with a two-bullet list naming the two real proposal-vs-implementation deviations: (a) `--print-port` was dropped (the `bound:` / `ready` protocol is unconditional — no opt-out needed) and (b) `ureq` dev-dep is pinned to `"3"`, not `"2"` (the lockfile already carried `ureq 3.3.0` transitively; a direct `"2"` dep would have added a second major version). The documentation-internal items (added `rmpv` dev-dep, `Hash` derive on `FunctionKind`, omitted `use Read`) are listed separately as "no audit-trail entry needed". |
+| WSI-9 | Closed (doc-only) | `crates/stub-ingest/README.md` routes table now flags the two `/debug/*` rows with **No auth**, and a paragraph below the table explains that the bearer requirement applies to the ingest path only — the `/debug/*` paths are debug surfaces accessible only on the loopback bind. Matches `stub-ingest-server/spec.md`'s "The endpoint requires no authentication" requirement on `POST /debug/reset`. |
+
+### Deferred to follow-up OpenSpec changes (WSI-5 … WSI-8, WSI-10)
+
+Each gets its own change + branch per the "one change per branch"
+rule. Listed by the reviewer's overall-recommendation order so
+the next session can pick them up without re-reading the full
+review:
+
+- **WSI-5** (`spawn_stub` has no read timeout — a wedged child
+  could hang the test thread until cargo's outer timeout fires).
+  Follow-up `stub-ingest-spawn-timeout`: wrap the `bound:` /
+  `ready` consumption in a background thread that ships lines
+  through a `mpsc::sync_channel(1)`, and use
+  `recv_timeout(Duration::from_secs(10))` on the main thread. On
+  timeout, fail the test with a captured stderr snapshot. The
+  fix-round here already plumbed `Arc<Mutex<Vec<u8>>>` stderr
+  capture, so the follow-up is purely the timeout wrapper.
+- **WSI-6** (`validate_bearer` open-codes `&value[prefix.len()..]`
+  instead of `str::strip_prefix`). Follow-up
+  `stub-ingest-strip-prefix-bearer`: collapse the `starts_with`
+  + slice into a `let-else strip_prefix` so the char-boundary
+  safety is self-evident at the call site. Pure style.
+- **WSI-7** (`dispatch()` eagerly computes `method_name` for
+  paths that never use it). Follow-up
+  `stub-ingest-lazy-method-name`: either inline the
+  `request_method_name(&request)` call into the two arms that
+  consume it, or wrap it as a closure. Micro-perf nit;
+  combinable with WSI-10.
+- **WSI-8** (`handle_debug_batches` uses
+  `serde_json::to_vec_pretty`). Follow-up
+  `stub-ingest-compact-json` (or kept as design choice; either
+  way needs a `design.md` note). Pretty-print is defensible for
+  a test fixture; the follow-up either switches to `to_vec` or
+  records the design intent.
+- **WSI-10** (`dispatch()`'s `path.to_owned()` is a per-request
+  `String` allocation). Follow-up `stub-ingest-dispatch-borrow`:
+  split `dispatch()` so the `path` and `method` strings are
+  only owned on the 405/404 paths (where `format!` consumes
+  them). Naturally pairs with WSI-7.
+
+### Gates evidence (post-fix-round, build host PHP 8.4.21)
+
+```
+cargo fmt --all --check                                          clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  152 + 1 + 1 + 0 + 12 = 166, 0 failed
+cargo test --release --lib --all-features                        153, 0 failed
+openspec validate wire-types-and-stub-ingest --strict            valid
+```
+
+The integration test `recorder_observer` continues to pass
+against `php8.4` on this host; the local PHP 8.3 gap is closed
+in CI per C-7.
+
+### Test-count delta
+
+- Stub round-trip tests: 6 → 12 (+6 new tests for WSI-1).
+- `php-analyze` lib tests: unchanged (WSI-2 tightened an
+  existing assertion; no new test).
+- One existing test (`malformed_body_returns_400_and_does_not_store`)
+  gained an extra stderr assertion under WSI-3.
+
+Total workspace test count delta in this fix-round: **+6**,
+matching the WSI-1 scenario count exactly. No new dependencies,
+no production-code behaviour change.
+
