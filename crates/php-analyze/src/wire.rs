@@ -564,9 +564,16 @@ mod tests {
         let err =
             rmp_serde::from_slice::<DictEntry>(&bytes).expect_err("decode must fail for kind=99");
         let msg = format!("{err}");
+        // Tightened in C-12 fix-round (was `||` against "invalid", which
+        // a future refactor that swallowed the `&'static str` from
+        // `TryFrom<u8>` could pass with any generic rmp_serde error
+        // containing "invalid type" / "invalid length"). The
+        // `&'static str` returned by `TryFrom<u8> for FunctionKind`
+        // ("invalid FunctionKind discriminant") satisfies this check
+        // on the current implementation.
         assert!(
-            msg.contains("FunctionKind") || msg.contains("invalid"),
-            "decode error must mention the invalid FunctionKind; got: {msg}",
+            msg.contains("FunctionKind"),
+            "decode error must mention the invalid FunctionKind variant; got: {msg}",
         );
     }
 
