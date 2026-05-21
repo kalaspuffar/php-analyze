@@ -133,31 +133,43 @@ static SHIPPER_HANDLE: Mutex<Option<JoinHandle<ShipperExit>>> = Mutex::new(None)
 /// State machine:
 ///
 /// 1. **Pre-drain phase**: block on [`Receiver::recv`]. Each
-///    [`ShipperMessage::Batch`] is counted and dropped. A
+///    [`ShipperMessage::Batch`] is counted, its `size_estimate` is
+///    subtracted from [`crate::recorder::accounting::BYTES_IN_MEMORY`]
+///    (the Phase-4 slice-2 second leg of the budget round-trip:
+///    the producer billed the bytes on accept, the consumer
+///    returns them on consume), and the batch is dropped. A
 ///    [`ShipperMessage::Drain`] transitions to the drain phase. An
 ///    `Err(RecvError)` (the channel closed without a `Drain`) is a
 ///    **clean close pre-drain** — return with
 ///    `drain_completed: true` and `batches_abandoned_at_deadline:
 ///    0`.
 /// 2. **Drain phase**: block on [`Receiver::recv_deadline`]. Each
-///    `Batch` is counted. A second `Drain` is tolerated (ignored).
-///    Termination conditions:
+///    `Batch` is counted **and** its `size_estimate` is subtracted
+///    from the budget atomic exactly as in the pre-drain phase. A
+///    second `Drain` is tolerated (ignored). Termination conditions:
 ///    - **Clean close post-drain**: `Err(RecvTimeoutError::Disconnected)` —
 ///      return with `drain_completed: true`,
 ///      `batches_abandoned_at_deadline: 0`.
-///    - **Deadline pass**: `Err(RecvTimeoutError::Timeout)` —
-///      return with `drain_completed: false`,
-///      `batches_abandoned_at_deadline: rx.len() as u64` (the
-///      messages still queued at the moment of timeout).
+///    - **Deadline pass**: `Err(RecvTimeoutError::Timeout)` — drain
+///      the residual queue via `try_recv` so abandoned batches do
+///      not leak their `size_estimate` across `pm.max_requests`
+///      worker recycles. Each abandoned batch contributes to
+///      `batches_abandoned_at_deadline`. Return with
+///      `drain_completed: false`.
 ///
-/// Slice 2+ will grow a fourth termination condition via an
-/// `on_batch` callback that returns an error (the encoder or HTTP
-/// client failing). Slice 1 does not have one.
+/// The encoder-and-POST slice (Phase-4 slice 3) will grow a fourth
+/// termination condition via an `on_batch` callback that returns an
+/// error. Slice 2 does not encode; the only side effect on consume
+/// is the accounting subtract.
 pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
     let mut batches_drained: u64 = 0;
     let deadline: Instant = loop {
         match rx.recv() {
-            Ok(ShipperMessage::Batch(_)) => batches_drained += 1,
+            Ok(ShipperMessage::Batch(batch)) => {
+                crate::recorder::accounting::sub(batch.size_estimate);
+                batches_drained += 1;
+                drop(batch);
+            }
             Ok(ShipperMessage::Drain { deadline }) => break deadline,
             Err(RecvError) => {
                 return ShipperExit {
@@ -170,14 +182,34 @@ pub(crate) fn run_loop(rx: Receiver<ShipperMessage>) -> ShipperExit {
     };
     loop {
         match rx.recv_deadline(deadline) {
-            Ok(ShipperMessage::Batch(_)) => batches_drained += 1,
+            Ok(ShipperMessage::Batch(batch)) => {
+                crate::recorder::accounting::sub(batch.size_estimate);
+                batches_drained += 1;
+                drop(batch);
+            }
             // A second Drain is structurally unreachable today (only
             // `drain_and_join_at_mshutdown` sends Drain, and only
             // once), but tolerating it costs nothing and removes a
             // future-bug class.
             Ok(ShipperMessage::Drain { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {
-                let abandoned = u64::try_from(rx.len()).unwrap_or(u64::MAX);
+                // Phase-4 slice 2 design D-5: drain the residual
+                // queue so abandoned batches return their bytes to
+                // the budget. Without this drain, any batch still
+                // queued at the deadline would leak its
+                // `size_estimate` until the process exits.
+                let mut abandoned: u64 = 0;
+                loop {
+                    match rx.try_recv() {
+                        Ok(ShipperMessage::Batch(batch)) => {
+                            crate::recorder::accounting::sub(batch.size_estimate);
+                            abandoned += 1;
+                            drop(batch);
+                        }
+                        Ok(ShipperMessage::Drain { .. }) => {}
+                        Err(_) => break,
+                    }
+                }
                 return ShipperExit {
                     batches_drained,
                     drain_completed: false,
@@ -363,11 +395,53 @@ pub(crate) fn receiver_is_installed() -> bool {
         .is_some()
 }
 
+/// Test-only: install a hand-built `Sender` into the canonical
+/// [`SENDER_SLOT`] so a test can wire up a channel without standing
+/// up an actual shipper thread. Used by `recorder::flush::tests` to
+/// drive `try_send_batch`'s Sender-present arms against a
+/// test-controlled `Receiver`.
+///
+/// The slot is replaced atomically under the same mutex production
+/// code uses, so a parallel test cannot observe a half-installed
+/// state.
+#[cfg(test)]
+pub(crate) fn install_test_sender(tx: Sender<ShipperMessage>) {
+    *SENDER_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+}
+
 /// Test-only: clone the canonical Sender so a test can push synthetic
 /// `Batch` / `Drain` messages through the same channel the shipper
 /// thread is reading. Returns `None` if no channel is installed.
 #[cfg(test)]
 pub(crate) fn clone_sender_for_test() -> Option<Sender<ShipperMessage>> {
+    SENDER_SLOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+}
+
+/// Production accessor used by [`recorder::flush::try_send_batch`] to
+/// reach the canonical Sender for a single `try_send` of one
+/// `PendingBatch`. Returns `None` when no channel has been installed
+/// (silent-disable or never-installed); the caller treats that as the
+/// "no-Sender" arm.
+///
+/// The clone is cheap (`crossbeam_channel::Sender` is internally an
+/// `Arc` over the shared queue) so the per-flush cost is one mutex
+/// acquire + one atomic increment; the slice-1 deviation
+/// (`Mutex<Option<Sender>>` rather than `OnceLock<Sender>`) keeps the
+/// shutdown-time drop simple at the cost of this single mutex per
+/// flush, which is bounded by `flush_records`-worth of work between
+/// flushes.
+///
+/// Mutex poisoning is treated as benign per the slice-1 pattern: a
+/// poisoned mutex still holds the canonical Sender, and the slot is
+/// only ever written under that same mutex, so reading through the
+/// poison guard is sound.
+///
+/// [`recorder::flush::try_send_batch`]: crate::recorder::flush::try_send_batch
+pub(crate) fn clone_canonical_sender() -> Option<Sender<ShipperMessage>> {
     SENDER_SLOT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -423,10 +497,22 @@ mod tests {
 
     /// Build a placeholder `PendingBatch` for tests that just need
     /// *something* of variant `Batch` to push through the channel.
-    /// Slice 1 never reads any field of a `PendingBatch`, so the
-    /// content is irrelevant; we just need the discriminant.
+    /// Slice 1 never reads any field of a `PendingBatch` beyond the
+    /// discriminant; Phase-4 slice 2 reads `size_estimate` on the
+    /// consume path to subtract from `accounting::BYTES_IN_MEMORY`, so
+    /// the variant carries a real (though tunable) value below. The
+    /// fresh `Arc<AtomicU64>` matches the slice-2 wire-shape requirement
+    /// and is otherwise inert.
     fn dummy_batch() -> ShipperMessage {
+        dummy_batch_with_size(0)
+    }
+
+    /// Sibling of [`dummy_batch`] that lets a test seed the
+    /// `size_estimate` so the post-consume `accounting::snapshot()` can
+    /// be asserted deterministically (Phase-4 slice 2 §6.5–6.8).
+    fn dummy_batch_with_size(size_estimate: usize) -> ShipperMessage {
         use crate::recorder::types::{MetaPartial, PendingBatch};
+        use std::sync::atomic::AtomicU64;
         use std::sync::Arc;
         let meta_partial = MetaPartial {
             schema_version: 1,
@@ -441,7 +527,8 @@ mod tests {
             meta_partial,
             dict: Vec::new(),
             calls: Vec::new(),
-            size_estimate: 0,
+            size_estimate,
+            drop_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -555,6 +642,130 @@ mod tests {
                 batches_abandoned_at_deadline: 0,
             }
         );
+    }
+
+    // --- Phase-4 slice 2: consume-path accounting subtract --------------
+
+    #[test]
+    fn run_loop_pre_drain_subtracts_size_estimate_for_each_consumed_batch() {
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        crate::recorder::accounting::reset_for_test();
+
+        // Seed the budget with the sum of three batches' size_estimates.
+        // Each batch carries `100` bytes; after the shipper consumes
+        // all three, the snapshot must return to zero.
+        crate::recorder::accounting::add(300);
+
+        let (tx, rx) = bounded::<ShipperMessage>(8);
+        let handle = thread::spawn(move || run_loop(rx));
+        for _ in 0..3 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        drop(tx);
+        let exit = handle.join().expect("shipper joined cleanly");
+
+        assert_eq!(exit.batches_drained, 3);
+        assert!(exit.drain_completed);
+        assert_eq!(
+            crate::recorder::accounting::snapshot(),
+            0,
+            "every consumed batch's size_estimate is returned to the budget",
+        );
+    }
+
+    #[test]
+    fn run_loop_drain_phase_subtracts_size_estimate_for_future_deadline() {
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(500);
+
+        let (tx, rx) = bounded::<ShipperMessage>(8);
+        let handle = thread::spawn(move || run_loop(rx));
+        // Two pre-drain batches, then Drain with a comfortable
+        // deadline, then a third batch the drain-phase will consume.
+        tx.send(dummy_batch_with_size(100)).unwrap();
+        tx.send(dummy_batch_with_size(100)).unwrap();
+        tx.send(ShipperMessage::Drain {
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .unwrap();
+        tx.send(dummy_batch_with_size(300)).unwrap();
+        drop(tx);
+        let exit = handle.join().expect("shipper joined cleanly");
+
+        assert_eq!(exit.batches_drained, 3);
+        assert!(exit.drain_completed);
+        assert_eq!(
+            crate::recorder::accounting::snapshot(),
+            0,
+            "both pre-drain and drain-phase consumes subtract from the budget",
+        );
+    }
+
+    #[test]
+    fn run_loop_deadline_pass_subtracts_size_estimate_for_abandoned_batches() {
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        crate::recorder::accounting::reset_for_test();
+        crate::recorder::accounting::add(1_000);
+
+        let (tx, rx) = bounded::<ShipperMessage>(16);
+        // Send 10 batches @ 100 bytes each (total 1000) BEFORE
+        // spawning the shipper so the queue is saturated when the
+        // loop starts; then send a past-deadline Drain so the
+        // shipper exits via the deadline-pass arm. The arm's
+        // try_recv drain must subtract every abandoned batch.
+        for _ in 0..10 {
+            tx.send(dummy_batch_with_size(100)).unwrap();
+        }
+        tx.send(ShipperMessage::Drain {
+            deadline: Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        })
+        .unwrap();
+        let handle = thread::spawn(move || run_loop(rx));
+        let exit = handle.join().expect("shipper joined cleanly");
+
+        assert!(!exit.drain_completed, "deadline-pass exit");
+        assert_eq!(
+            exit.batches_drained + exit.batches_abandoned_at_deadline,
+            10,
+            "every batch is accounted for: {exit:?}",
+        );
+        assert_eq!(
+            crate::recorder::accounting::snapshot(),
+            0,
+            "deadline-pass arm must drain residual batches and subtract their bytes",
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn run_loop_deadline_pass_with_no_residual_returns_zero_abandoned() {
+        let _account_guard = crate::recorder::accounting::acquire_test_lock();
+        crate::recorder::accounting::reset_for_test();
+
+        let (tx, rx) = bounded::<ShipperMessage>(8);
+        tx.send(ShipperMessage::Drain {
+            deadline: Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        })
+        .unwrap();
+        let start = Instant::now();
+        let handle = thread::spawn(move || run_loop(rx));
+        let exit = handle.join().expect("shipper joined cleanly");
+        let elapsed = start.elapsed();
+
+        assert!(!exit.drain_completed);
+        assert_eq!(exit.batches_drained, 0);
+        assert_eq!(exit.batches_abandoned_at_deadline, 0);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "deadline-pass with no residual must return promptly; took {elapsed:?}",
+        );
+        assert_eq!(crate::recorder::accounting::snapshot(), 0);
+        drop(tx);
     }
 
     // --- install_channel_at_minit --------------------------------------

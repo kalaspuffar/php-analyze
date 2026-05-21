@@ -27,6 +27,7 @@ pub(crate) mod accounting;
 pub mod dictionary;
 #[cfg(feature = "recorder-dump")]
 pub mod dump;
+pub(crate) mod flush;
 pub mod observer;
 pub mod types;
 

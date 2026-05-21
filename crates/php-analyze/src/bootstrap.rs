@@ -292,15 +292,13 @@ fn rinit_body() {
         return;
     }
     let identity = build_request_identity();
-    // Slice-3 cap thresholds, cached onto the `Trace` so the hot path
-    // does not need to re-read `Config::global()` per call.
-    // `Config::max_depth: u16` widens losslessly to `u32` so the gate's
-    // comparison with `Trace::virtual_depth: u32` happens without a
-    // cast.
-    let limits = TraceLimits {
-        max_depth: u32::from(config.max_depth),
-        buffer_cap_bytes: config.buffer_cap_bytes,
-    };
+    // Slice-3 cap thresholds and Phase-4-slice-2 flush thresholds, both
+    // cached onto the `Trace` via [`TraceLimits::from(&Config)`] so the
+    // hot path does not need to re-read `Config::global()` per call.
+    // `Config::max_depth: u16` widens losslessly to `u32` inside the
+    // impl so the gate's comparison with `Trace::virtual_depth: u32`
+    // happens without a cast.
+    let limits = TraceLimits::from(config);
     recorder::rinit_allocate_trace(identity, limits);
 }
 
@@ -374,7 +372,11 @@ fn request_identity_from_sapi(
 ) -> RequestIdentity {
     let host: Arc<str> = Arc::from(hostname.unwrap_or("(unknown-host)"));
     let sapi: Arc<str> = Arc::from(sapi_name);
-    let uri_or_script = request_uri.unwrap_or("(unknown-uri)").to_owned();
+    // Allocated once per request; the matching `Trace::uri_or_script`
+    // field then carries the same `Arc<str>` for the trace's lifetime,
+    // and `flush_into_pending_batch` clones it into every `MetaPartial`
+    // it produces. See PF-1 in `COMMENTS.md`.
+    let uri_or_script: Arc<str> = Arc::from(request_uri.unwrap_or("(unknown-uri)"));
     RequestIdentity {
         host,
         sapi,
@@ -1096,7 +1098,7 @@ mod tests {
             Some("worker-7.prod"),
         );
         assert_eq!(&*id.sapi, "fpm-fcgi");
-        assert_eq!(id.uri_or_script, "/api/v1/users?page=2");
+        assert_eq!(&*id.uri_or_script, "/api/v1/users?page=2");
         assert_eq!(&*id.host, "worker-7.prod");
         assert_eq!(id.pid, std::process::id());
     }
@@ -1112,7 +1114,7 @@ mod tests {
             Some("dev-laptop"),
         );
         assert_eq!(&*id.sapi, "cli");
-        assert_eq!(id.uri_or_script, "/usr/local/bin/my-script.php");
+        assert_eq!(&*id.uri_or_script, "/usr/local/bin/my-script.php");
     }
 
     #[test]
@@ -1122,7 +1124,7 @@ mod tests {
         // strings the wire format would have to special-case later).
         let id = request_identity_from_sapi("apache2handler", None, None);
         assert_eq!(&*id.sapi, "apache2handler");
-        assert_eq!(id.uri_or_script, "(unknown-uri)");
+        assert_eq!(&*id.uri_or_script, "(unknown-uri)");
         assert_eq!(&*id.host, "(unknown-host)");
     }
 
@@ -1316,5 +1318,33 @@ mod tests {
         assert!(!crate::shipper::handle_is_installed());
 
         crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn trace_limits_from_resolved_config_carries_flush_thresholds() {
+        // Phase-4 slice 2 §8.3: the bootstrap-layer wiring uses
+        // `TraceLimits::from(&Config)` so the two new
+        // `flush_records` / `flush_bytes` directives land on the
+        // trace exactly as configured. This test pins the contract
+        // at the bootstrap surface so a future regression in
+        // `rinit_body` (e.g. a hand-rolled `TraceLimits { .. }`
+        // construction that misses the new fields) is caught here,
+        // not in a fixture chase.
+        let raw = RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some("test-token".to_owned()),
+            flush_records: Some(2_500),
+            flush_bytes: Some(131_072),
+            ..RawIni::default()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        let limits = TraceLimits::from(&config);
+        assert_eq!(limits.flush_records, 2_500);
+        assert_eq!(limits.flush_bytes, 131_072);
+        // Tap the slice-3 fields too so a future widening of
+        // `TraceLimits` is caught by the same test.
+        assert_eq!(limits.max_depth, u32::from(config.max_depth));
+        assert_eq!(limits.buffer_cap_bytes, config.buffer_cap_bytes);
     }
 }

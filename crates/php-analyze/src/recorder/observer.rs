@@ -46,9 +46,10 @@ use ext_php_rs::zend::{ExecuteData, ExecutorGlobals, FcallInfo, FcallObserver};
 use crate::clocks;
 use crate::config::Config;
 use crate::recorder::accounting;
+use crate::recorder::flush;
 use crate::recorder::types::{
-    CallFrame, CallRecord, DictEntry, FunctionKey, FunctionKind, RequestIdentity, Trace,
-    TraceLimits, CALL_RECORD_FIXED_BYTES, DICT_ENTRY_FIXED_BYTES,
+    CallFrame, CallRecord, DictEntry, FunctionKey, FunctionKind, PendingBatch, RequestIdentity,
+    Trace, TraceLimits, CALL_RECORD_FIXED_BYTES, DICT_ENTRY_FIXED_BYTES,
 };
 use crate::spike::SpikeObserver;
 
@@ -104,38 +105,73 @@ pub fn rinit_allocate_trace(identity: RequestIdentity, limits: TraceLimits) {
 /// unconditionally — a no-op when the slot is already `None`
 /// (extension disabled, spike active, or `RINIT` was skipped).
 ///
-/// **Phase 4 anchor**: the buffer is discarded here in slice 2. The
-/// Phase-4 shipper change will replace the discard with a
-/// `shipper.try_send(trace.into_pending_batch())` call. The
-/// `recorder-dump` Cargo feature inserts a diagnostic dump
-/// in-between for the slice-2 integration tests; that dump
-/// disappears alongside the discard in Phase 4. See design.md §D-9.
+/// ## Phase-4 slice 2: `RSHUTDOWN` final flush
+///
+/// Per `SPECIFICATION.md` §3.2 / REQ F-BF-3, a non-empty buffer at
+/// request end SHALL be handed to the shipper as a final batch
+/// before the trace is dropped. An **empty** buffer is NOT flushed
+/// — the spec is explicit, and an empty `Batch(_)` would force the
+/// future encoder to either produce an empty `calls` array or
+/// special-case the absence.
+///
+/// Order of operations:
+///
+/// 1. Take the trace out of the thread-local slot.
+/// 2. If the trace has any buffered records, build a `PendingBatch`
+///    via `Trace::flush_into_pending_batch` (which already resets
+///    `buffer_estimated_bytes = 0` and clears the two `Vec`s) and
+///    hand it to `recorder::flush::try_send_batch`. The
+///    `recorder-dump` `F: trigger=rshutdown` line is emitted in
+///    this branch so a fixture can assert the cadence.
+/// 3. Subtract whatever `buffer_estimated_bytes` remains on the
+///    post-flush trace. In the flushed case this is zero (a `sub(0)`
+///    no-op); in the empty-buffer case it is also zero in the
+///    common path (`push_record` and `push_dict_entry_via_intern`
+///    bill the atomic synchronously with the field). The subtract
+///    is kept for symmetry with slice 3's `DCR-1` ordering rule
+///    ("subtract before sink so the budget stays exact even if a
+///    downstream hand-off panics") — the `try_send_batch` call is
+///    above it, but `try_send_batch` itself is panic-safe by
+///    construction (the `Mutex` poison guards in `clone_canonical_sender`
+///    swallow panics), so the ordering is purely a "what if a
+///    future addition panics here" defence.
+/// 4. Run the `recorder-dump` whole-trace dumper (gated behind the
+///    feature flag). This is the same site slice 3 used; only the
+///    `F:` line shape grew.
+///
+/// **Channel-full at RSHUTDOWN**: the final batch goes through
+/// `try_send_batch` like every other batch. If the channel is full,
+/// the drop counter bumps by `batch.calls.len()` and the bytes are
+/// subtracted — exactly the same R-13 distinction as a mid-request
+/// flush. The trace's `drop_counter` is the `Arc` clone on the
+/// batch, so the bump is visible through the trace's `Arc` until
+/// the trace itself drops at the end of this function.
 pub fn rshutdown_release_trace() {
     CURRENT_TRACE.with(|slot| {
         let trace = slot.borrow_mut().take();
-        // Slice-3 invariant: subtract this trace's contribution from
-        // the process-wide budget so the atomic returns to its
-        // pre-trace value at request boundary. Phase 4 will move
-        // this subtract to the shipper's batch-consumed path; in
-        // slice 3 the trace owns the entire bill, so the
-        // rshutdown-time subtract is the only sub site.
-        //
-        // Order matters: the subtract runs **before** any diagnostic
-        // sink so the budget stays exact even if a downstream
-        // hand-off panics (DCR-1). The dump only reads
-        // `drop_counter` / `trace_id`; neither depends on the
-        // per-trace estimator, so the swap is safe. This also
-        // mirrors the shape Phase 4 will inherit: "release budget,
-        // then publish to sink".
-        if let Some(trace) = trace.as_ref() {
-            accounting::sub(trace.buffer_estimated_bytes);
+        let Some(mut trace) = trace else {
+            return;
+        };
+
+        // Phase-4 slice 2: hand the non-empty buffer to the shipper
+        // before the trace is dropped.
+        if !trace.buffer.is_empty() {
+            let batch = trace.flush_into_pending_batch();
+            emit_flush_dump_line(&trace, &batch, FlushTrigger::Rshutdown);
+            flush::try_send_batch(batch);
         }
-        // `trace` is consumed below. Phase 4 will move the
-        // `try_send` of the constructed `PendingBatch` to this line.
+
+        // Slice-3 invariant: subtract this trace's residual
+        // contribution. In the flushed case, `flush_into_pending_batch`
+        // already reset `buffer_estimated_bytes` to zero, so this is a
+        // `sub(0)` no-op. In the empty-buffer case, the field was zero
+        // anyway. The unconditional call keeps the slice-3 wording
+        // intact and survives a future change that puts non-billed
+        // bytes onto the running estimate.
+        accounting::sub(trace.buffer_estimated_bytes);
+
         #[cfg(feature = "recorder-dump")]
-        if let Some(trace) = trace.as_ref() {
-            crate::recorder::dump::write_trace_if_path_set(trace);
-        }
+        crate::recorder::dump::write_trace_if_path_set(&trace);
         drop(trace);
     });
 }
@@ -778,7 +814,84 @@ pub(crate) fn finish_call_record(
         mem_out_bytes: snapshots.mem_out_bytes,
         abnormal_exit: abnormal,
     });
+
+    // Phase-4 slice 2: threshold-driven flush at the end-handler accept
+    // tail (`SPECIFICATION.md` §3.2 "after each emitted record … hand
+    // current buffer to shipper"). The check sits *after* push_record
+    // so the post-push counts are the ones tested against the
+    // thresholds, and *only* on the accept branch — the slice-3 LIFO
+    // consume branch returns early above (line at `if trace.dropped_begins > 0`)
+    // and never reaches here. Tests cover both branches.
+    if let Some(trigger) = flush_predicate_trigger(trace) {
+        let batch = trace.flush_into_pending_batch();
+        emit_flush_dump_line(trace, &batch, trigger);
+        flush::try_send_batch(batch);
+    }
 }
+
+/// Decide whether the post-`push_record` state crosses either flush
+/// threshold and return which trigger fired. Pure read on the two
+/// cached `Trace` fields (`flush_records`, `flush_bytes`) and the two
+/// running counters (`buffer.len()`, `buffer_estimated_bytes`).
+/// Records-trigger wins ties because the predicate is `||` and the
+/// records check is the first operand — the trigger name is mostly a
+/// diagnostic-line concern (the `recorder-dump` `F:` line), not a
+/// behavioural difference.
+fn flush_predicate_trigger(trace: &Trace) -> Option<FlushTrigger> {
+    if trace.buffer.len() >= trace.flush_records {
+        Some(FlushTrigger::Records)
+    } else if trace.buffer_estimated_bytes >= trace.flush_bytes {
+        Some(FlushTrigger::Bytes)
+    } else {
+        None
+    }
+}
+
+/// Why a flush was emitted. Carried into the `recorder-dump` `F:` line
+/// so a fixture can assert that the cadence is driven by the predicate
+/// the operator configured, not by chance. The third variant
+/// (`Rshutdown`) is set by [`rshutdown_release_trace`]; the first two
+/// are the steady-state mid-request triggers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushTrigger {
+    Records,
+    Bytes,
+    Rshutdown,
+}
+
+impl FlushTrigger {
+    /// Wire name carried in the `recorder-dump` `F:` line. Stable
+    /// strings — the fixture assertions in `tests/recorder_observer.rs`
+    /// depend on these values. The method is only reachable from the
+    /// `recorder-dump`-gated emitter; default builds compile it but
+    /// never call it, hence the `allow(dead_code)`.
+    #[cfg_attr(not(feature = "recorder-dump"), allow(dead_code))]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Records => "records",
+            Self::Bytes => "bytes",
+            Self::Rshutdown => "rshutdown",
+        }
+    }
+}
+
+/// Emit the `recorder-dump` `F:` block for a freshly-built flush
+/// batch. Production builds (no `recorder-dump` feature) compile this
+/// to an empty function — the `cfg`-gated body lives in
+/// [`crate::recorder::dump`] (Phase-4 slice 2 §7).
+#[cfg(feature = "recorder-dump")]
+fn emit_flush_dump_line(trace: &Trace, batch: &PendingBatch, trigger: FlushTrigger) {
+    crate::recorder::dump::record_flush(
+        trace,
+        batch,
+        trigger,
+        batch.calls.len(),
+        batch.size_estimate,
+    );
+}
+
+#[cfg(not(feature = "recorder-dump"))]
+fn emit_flush_dump_line(_trace: &Trace, _batch: &PendingBatch, _trigger: FlushTrigger) {}
 
 // --- BootObserver dispatcher ----------------------------------------------
 
@@ -860,7 +973,7 @@ mod tests {
             host: Arc::from("test-host"),
             sapi: Arc::from("cli"),
             pid: 1,
-            uri_or_script: "/tmp/test.php".to_owned(),
+            uri_or_script: Arc::from("/tmp/test.php"),
         }
     }
 
@@ -871,6 +984,11 @@ mod tests {
         TraceLimits {
             max_depth: 1024,
             buffer_cap_bytes: 64 * 1024 * 1024,
+            // Phase-4 slice 2: slice-3 observer tests never cross the
+            // flush thresholds. The flush-cadence tests below build
+            // their own `TraceLimits` with explicit values.
+            flush_records: usize::MAX,
+            flush_bytes: usize::MAX,
         }
     }
 
@@ -1559,6 +1677,8 @@ mod tests {
             TraceLimits {
                 max_depth,
                 buffer_cap_bytes: 64 * 1024 * 1024,
+                flush_records: usize::MAX,
+                flush_bytes: usize::MAX,
             },
         )
     }
@@ -1571,6 +1691,8 @@ mod tests {
             TraceLimits {
                 max_depth: 1024,
                 buffer_cap_bytes,
+                flush_records: usize::MAX,
+                flush_bytes: usize::MAX,
             },
         )
     }
@@ -2003,15 +2125,18 @@ mod tests {
 
     #[test]
     fn rshutdown_returns_atomic_to_zero_after_balanced_trace() {
-        let _guard = account_guard();
+        // Phase-4 slice 2 update: `rshutdown_release_trace` now hands
+        // the non-empty buffer to the shipper before subtracting. The
+        // shipper-side consume subtract (Section 6) is what returns
+        // the bytes to the budget; until that lands we emulate the
+        // consume inline so the slice-3 invariant ("RSHUTDOWN returns
+        // the atomic to zero") survives the producer-wiring change.
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
         accounting::reset_for_test();
+        let rx = install_test_channel(8);
 
-        // Allocate the trace into the thread-local slot via the
-        // production path so the rshutdown helper exercises the real
-        // sub site.
         rinit_allocate_trace(stub_identity(), permissive_limits());
-
-        // Drive a few accepts inside the slot.
         with_current_trace(|trace| {
             let cat_a = cat_for("rshut_a");
             let cat_b = cat_for("rshut_b");
@@ -2027,11 +2152,18 @@ mod tests {
 
         rshutdown_release_trace();
 
+        // Emulate the Section-6 shipper consume subtract by draining
+        // every queued batch and subtracting its `size_estimate`.
+        for batch in drain_queued_batches(&rx) {
+            accounting::sub(batch.size_estimate);
+        }
+
         assert_eq!(
             accounting::snapshot(),
             0,
-            "rshutdown_release_trace must subtract the full contribution",
+            "rshutdown_release_trace + shipper consume must balance the atomic",
         );
+        crate::shipper::reset_for_test();
     }
 
     #[test]
@@ -2048,8 +2180,13 @@ mod tests {
 
     #[test]
     fn two_consecutive_request_cycles_keep_zero_balance_invariant() {
-        let _guard = account_guard();
+        // Phase-4 slice 2: each RSHUTDOWN now flushes via try_send;
+        // we emulate the Section-6 shipper subtract by draining the
+        // channel between cycles so the slice-3 invariant survives.
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
         accounting::reset_for_test();
+        let rx = install_test_channel(8);
 
         for _ in 0..2 {
             rinit_allocate_trace(stub_identity(), permissive_limits());
@@ -2059,12 +2196,17 @@ mod tests {
                 end_with_snapshots(trace, exit_snapshots(), false);
             });
             rshutdown_release_trace();
+            // Emulate the shipper consume so the atomic balances.
+            for batch in drain_queued_batches(&rx) {
+                accounting::sub(batch.size_estimate);
+            }
             assert_eq!(
                 accounting::snapshot(),
                 0,
                 "atomic returns to zero between requests",
             );
         }
+        crate::shipper::reset_for_test();
     }
 
     #[test]
@@ -2088,6 +2230,475 @@ mod tests {
         assert_eq!(trace.drop_counter.load(Ordering::Acquire), 7);
         assert!(trace.stack.is_empty());
         assert_eq!(trace.buffer.len(), 3, "only the three accepted calls emit");
+    }
+
+    // --- Phase-4 slice 2: threshold-driven flush --------------------------
+
+    /// Build a `Trace` with the four cap / depth knobs set permissively
+    /// but the two flush thresholds set explicitly. The slice-2
+    /// flush-cadence tests use this rather than `permissive_limits`
+    /// (which sets both flush thresholds to `usize::MAX`).
+    fn trace_with_flush_thresholds(flush_records: usize, flush_bytes: usize) -> Trace {
+        Trace::new(
+            stub_identity(),
+            TraceLimits {
+                max_depth: 1024,
+                buffer_cap_bytes: 64 * 1024 * 1024,
+                flush_records,
+                flush_bytes,
+            },
+        )
+    }
+
+    /// Install a Sender + Receiver pair into the shipper's canonical
+    /// slot so `try_send_batch` on the recorder's accept tail has a
+    /// real channel to land on. Returns the Receiver so the test
+    /// asserts the cadence by counting `ShipperMessage::Batch(_)`
+    /// drains.
+    fn install_test_channel(
+        depth: usize,
+    ) -> crossbeam_channel::Receiver<crate::recorder::types::ShipperMessage> {
+        crate::shipper::reset_for_test();
+        let (tx, rx) = crossbeam_channel::bounded(depth);
+        crate::shipper::install_test_sender(tx);
+        rx
+    }
+
+    /// Drain every queued `Batch` from `rx` and return them as a vec.
+    /// Used to assert the number and contents of batches a test
+    /// emitted. The receiver is left in place so a follow-up
+    /// `try_recv` confirms emptiness.
+    fn drain_queued_batches(
+        rx: &crossbeam_channel::Receiver<crate::recorder::types::ShipperMessage>,
+    ) -> Vec<PendingBatch> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                crate::recorder::types::ShipperMessage::Batch(b) => out.push(b),
+                crate::recorder::types::ShipperMessage::Drain { .. } => {
+                    panic!("unexpected Drain in flush cadence test");
+                }
+            }
+        }
+        out
+    }
+
+    // --- Focused tests for `flush_predicate_trigger` ----------------------
+    //
+    // PF-5 (`COMMENTS.md`): the end-to-end flush tests below assert
+    // `batches.len() == 1` but don't pin which branch of the predicate
+    // fired. The integration fixture `run_fixture_threshold_flush` covers
+    // the trigger-string contract at the dump layer, but the unit suite
+    // is what runs on every `cargo test`. These three tests pin each
+    // arm against hand-built `Trace` state so a future regression that
+    // collapses the `Records` / `Bytes` / `None` decision is caught at
+    // compile-then-run time.
+
+    /// Bind a `Trace`'s `buffer` and `buffer_estimated_bytes` fields to
+    /// known values without driving them through `push_record`. The
+    /// predicate is a pure read of those two fields against the limits,
+    /// so synthesised buffer contents are the right input: there is no
+    /// billing through `accounting`, and the dict is left empty. Callers
+    /// that mix this helper with the production flush path will leak
+    /// budget bytes — these tests do not, because they only call the
+    /// predicate.
+    fn trace_with_buffer_state(
+        flush_records: usize,
+        flush_bytes: usize,
+        records: usize,
+        estimated_bytes: usize,
+    ) -> Trace {
+        let mut trace = trace_with_flush_thresholds(flush_records, flush_bytes);
+        for i in 0..records {
+            trace.buffer.push(crate::recorder::types::CallRecord {
+                call_id: (i as u64) + 1,
+                parent: 0,
+                fn_id: 0,
+                depth: 0,
+                t_in_ns: 0,
+                t_out_ns: 0,
+                cpu_u_ns: 0,
+                cpu_s_ns: 0,
+                mem_in_bytes: 0,
+                mem_out_bytes: 0,
+                abnormal_exit: false,
+            });
+        }
+        trace.buffer_estimated_bytes = estimated_bytes;
+        trace
+    }
+
+    #[test]
+    fn flush_predicate_trigger_returns_records_when_buffer_meets_records_threshold() {
+        // 5 records ≥ flush_records=5; bytes are well below the bytes
+        // threshold, so the predicate must pick `Records`.
+        let trace = trace_with_buffer_state(5, 10_000, 5, 64);
+        assert_eq!(
+            flush_predicate_trigger(&trace),
+            Some(FlushTrigger::Records),
+            "records-arm must win when buffer.len() >= flush_records",
+        );
+    }
+
+    #[test]
+    fn flush_predicate_trigger_returns_bytes_when_only_byte_threshold_is_met() {
+        // Records well below the threshold; bytes ≥ flush_bytes.
+        let trace = trace_with_buffer_state(usize::MAX, 80, 1, 97);
+        assert_eq!(
+            flush_predicate_trigger(&trace),
+            Some(FlushTrigger::Bytes),
+            "bytes-arm must fire when records-arm cannot",
+        );
+    }
+
+    #[test]
+    fn flush_predicate_trigger_returns_none_when_neither_threshold_is_met() {
+        // Both gates disarmed by being safely below the thresholds.
+        let trace = trace_with_buffer_state(100, 10_000, 3, 192);
+        assert_eq!(
+            flush_predicate_trigger(&trace),
+            None,
+            "predicate must return None when neither threshold is met",
+        );
+    }
+
+    #[test]
+    fn flush_predicate_trigger_records_arm_wins_ties_when_both_thresholds_meet() {
+        // Both gates would fire; predicate evaluates records first so
+        // the diagnostic `F:` line carries `trigger=records`. The
+        // behavioural outcome (a flush happens) is the same either way;
+        // pinning the tie-break is a contract for `recorder-dump`.
+        let trace = trace_with_buffer_state(4, 80, 4, 256);
+        assert_eq!(
+            flush_predicate_trigger(&trace),
+            Some(FlushTrigger::Records),
+            "records-arm wins ties (predicate evaluates records first)",
+        );
+    }
+
+    #[test]
+    fn finish_call_record_flushes_at_exactly_flush_records() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        let mut trace = trace_with_flush_thresholds(4, usize::MAX);
+        let cat = cat_for("ok");
+
+        // Four balanced begin/end pairs → exactly one flush.
+        for _ in 0..4 {
+            begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+            end_with_snapshots(&mut trace, exit_snapshots(), false);
+        }
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(
+            batches.len(),
+            1,
+            "exactly one flush at the records boundary"
+        );
+        assert_eq!(
+            batches[0].calls.len(),
+            4,
+            "batch carries the four accepted records",
+        );
+        assert!(trace.buffer.is_empty(), "trace buffer reset after flush");
+
+        // One more begin/end is below the next threshold; no second flush.
+        begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+        end_with_snapshots(&mut trace, exit_snapshots(), false);
+        assert!(
+            drain_queued_batches(&rx).is_empty(),
+            "no second flush below the next records boundary",
+        );
+        assert_eq!(trace.buffer.len(), 1);
+
+        // PF-6 (`COMMENTS.md`): balance the accounting atomic by
+        // mimicking the shipper's consume-side subtract for the
+        // already-queued batch, then subtracting the residual record
+        // bytes still owned by this trace. The next test's
+        // `reset_for_test()` would mask any imbalance anyway, but the
+        // explicit loop makes the production budget round-trip visible
+        // and matches the slice-3 `rshutdown_release_trace_after_*`
+        // test's shape.
+        crate::shipper::reset_for_test();
+        for batch in &batches {
+            accounting::sub(batch.size_estimate);
+        }
+        accounting::sub(trace.buffer_estimated_bytes);
+        assert_eq!(
+            accounting::snapshot(),
+            0,
+            "balanced after fake shipper subtract + residual subtract",
+        );
+    }
+
+    #[test]
+    fn finish_call_record_flushes_at_first_byte_threshold_crossing() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        // The §3.2 estimator: 64 bytes/record + per-dict-entry bytes
+        // (24 + len(fqn) + len(file)). Our `cat_for("ok")` interns
+        // `"ok"` with `file="/x.php"` (slice-3 fixture). Compute the
+        // post-first-record estimate so the test threshold falls just
+        // above it.
+        //
+        // First accept: 1 record (64) + 1 dict entry (24 + 2 + 7 = 33)
+        //   = 97 bytes total. The cap-gate `would_add` is the same.
+        // Threshold `flush_bytes = 80` triggers on the first record
+        // (buffer_estimated_bytes >= 80).
+        let mut trace = trace_with_flush_thresholds(usize::MAX, 80);
+        let cat = cat_for("ok");
+
+        // PF-5: assert the predicate would pick the `Bytes` arm at the
+        // crossing point — `flush_records = usize::MAX` disarms the
+        // records arm, but a future regression could flip the `||`
+        // order and still produce a single batch. Synthesise a `Trace`
+        // in the exact post-accept shape (1 record, 97 bytes) so the
+        // arm assertion is independent of how `finish_call_record`
+        // produces the buffer.
+        let probe = trace_with_buffer_state(usize::MAX, 80, 1, 97);
+        assert_eq!(
+            flush_predicate_trigger(&probe),
+            Some(FlushTrigger::Bytes),
+            "the byte-threshold crossing must trigger via the Bytes arm",
+        );
+
+        begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+        end_with_snapshots(&mut trace, exit_snapshots(), false);
+
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(batches.len(), 1, "flush triggers on the byte threshold");
+        assert_eq!(batches[0].calls.len(), 1);
+
+        // The post-flush buffer is empty and the running estimate is
+        // zero, so the next accept does not cross the threshold again
+        // (it's back to the post-first-accept value, which is the
+        // first crossing — but the `flush_records = usize::MAX`
+        // disarms that gate, and the bytes-gate fires only when
+        // `>= 80`, which the second accept reaches).
+        //
+        // To exercise the "no spurious second flush" property we
+        // raise the bytes threshold *above* what one accept produces
+        // (97 bytes) and confirm the second accept does not trigger.
+        let mut trace2 = trace_with_flush_thresholds(usize::MAX, 200);
+        begin_with_snapshots(&mut trace2, &cat, entry_snapshots());
+        end_with_snapshots(&mut trace2, exit_snapshots(), false);
+        assert!(
+            drain_queued_batches(&rx).is_empty(),
+            "below the threshold, no flush yet",
+        );
+        assert_eq!(trace2.buffer.len(), 1);
+
+        // PF-6: balance the atomic. The `batches` vec holds the
+        // already-queued batch (the bytes-trigger crossing); the two
+        // traces still own the post-flush residual (`trace2` has 1
+        // record, 97 bytes; `trace`'s buffer is empty so its residual
+        // is 0).
+        crate::shipper::reset_for_test();
+        for batch in &batches {
+            accounting::sub(batch.size_estimate);
+        }
+        accounting::sub(trace.buffer_estimated_bytes + trace2.buffer_estimated_bytes);
+        assert_eq!(
+            accounting::snapshot(),
+            0,
+            "balanced after fake shipper subtract + residuals",
+        );
+    }
+
+    #[test]
+    fn finish_call_record_lifo_consume_branch_does_not_flush() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        // Tight thresholds so a hypothetical accidental flush would
+        // be obvious — but the LIFO branch returns before reaching
+        // the predicate, so the channel stays empty.
+        let mut trace = trace_with_flush_thresholds(1, 1);
+        trace.dropped_begins = 1;
+        trace.virtual_depth = 1;
+
+        // An `end` event with `dropped_begins > 0` decrements the
+        // matcher (LIFO consume branch) and returns without
+        // push_record — the flush predicate is unreachable.
+        end_with_snapshots(&mut trace, exit_snapshots(), false);
+
+        assert_eq!(trace.dropped_begins, 0);
+        assert!(
+            drain_queued_batches(&rx).is_empty(),
+            "LIFO consume must not reach the flush predicate",
+        );
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn finish_call_record_does_not_double_flush_after_a_post_flush_reset() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        // Flush at every record; verify the cadence is exactly N batches
+        // for N records, not 2N (a regression that double-evaluated
+        // the predicate would fire twice per record).
+        let mut trace = trace_with_flush_thresholds(1, usize::MAX);
+        let cat = cat_for("ok");
+        for _ in 0..5 {
+            begin_with_snapshots(&mut trace, &cat, entry_snapshots());
+            end_with_snapshots(&mut trace, exit_snapshots(), false);
+        }
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(
+            batches.len(),
+            5,
+            "exactly one batch per record at flush_records = 1",
+        );
+        for batch in &batches {
+            assert_eq!(
+                batch.calls.len(),
+                1,
+                "each batch carries exactly one record"
+            );
+        }
+        assert!(trace.buffer.is_empty());
+
+        // PF-6: balance the atomic. Five batches landed on the
+        // channel, each carrying one record's worth of size_estimate;
+        // the trace's residual buffer is empty so its
+        // `buffer_estimated_bytes` is zero.
+        crate::shipper::reset_for_test();
+        for batch in &batches {
+            accounting::sub(batch.size_estimate);
+        }
+        accounting::sub(trace.buffer_estimated_bytes);
+        assert_eq!(
+            accounting::snapshot(),
+            0,
+            "balanced after fake shipper subtract + empty residual",
+        );
+    }
+
+    // --- Phase-4 slice 2: RSHUTDOWN final flush ---------------------------
+
+    #[test]
+    fn rshutdown_release_trace_flushes_non_empty_buffer_then_balances_accounting() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        // Drive a sub-threshold workload so no mid-request flush
+        // happens. `flush_records = 100` is comfortably above the 3
+        // accepts below; `flush_bytes = usize::MAX` disarms the
+        // bytes-gate.
+        rinit_allocate_trace(
+            stub_identity(),
+            TraceLimits {
+                max_depth: 1024,
+                buffer_cap_bytes: 64 * 1024 * 1024,
+                flush_records: 100,
+                flush_bytes: usize::MAX,
+            },
+        );
+        with_current_trace(|trace| {
+            let cat = cat_for("ok");
+            for _ in 0..3 {
+                begin_with_snapshots(trace, &cat, entry_snapshots());
+                end_with_snapshots(trace, exit_snapshots(), false);
+            }
+            assert_eq!(trace.buffer.len(), 3);
+        });
+        // No mid-request batches yet.
+        assert!(drain_queued_batches(&rx).is_empty());
+
+        rshutdown_release_trace();
+
+        // Exactly one batch on the channel, carrying the three
+        // records; the accounting atomic is non-zero because the
+        // shipper hasn't consumed yet (the shipper-side subtract is
+        // Section 6's concern).
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(batches.len(), 1, "RSHUTDOWN flushes one final batch");
+        assert_eq!(batches[0].calls.len(), 3);
+        // Simulate the shipper-side consume-path subtract so the next
+        // test sees a balanced atomic. Section 6 wires this for real.
+        accounting::sub(batches[0].size_estimate);
+        assert_eq!(accounting::snapshot(), 0);
+
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn rshutdown_release_trace_with_empty_buffer_does_not_flush() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        rinit_allocate_trace(stub_identity(), permissive_limits());
+        // No calls at all — buffer stays empty.
+        rshutdown_release_trace();
+
+        assert!(
+            drain_queued_batches(&rx).is_empty(),
+            "empty buffer must NOT produce a final batch",
+        );
+        assert_eq!(accounting::snapshot(), 0);
+
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn rshutdown_release_trace_after_threshold_flush_only_emits_residual() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        rinit_allocate_trace(
+            stub_identity(),
+            TraceLimits {
+                max_depth: 1024,
+                buffer_cap_bytes: 64 * 1024 * 1024,
+                flush_records: 4,
+                flush_bytes: usize::MAX,
+            },
+        );
+        with_current_trace(|trace| {
+            let cat = cat_for("ok");
+            // 6 calls @ flush_records = 4 → one mid-request batch of 4,
+            // 2 records left in the buffer.
+            for _ in 0..6 {
+                begin_with_snapshots(trace, &cat, entry_snapshots());
+                end_with_snapshots(trace, exit_snapshots(), false);
+            }
+        });
+
+        // The mid-request batch has already landed; drain it so the
+        // RSHUTDOWN check is clean.
+        let mid = drain_queued_batches(&rx);
+        assert_eq!(mid.len(), 1, "one mid-request flush");
+        assert_eq!(mid[0].calls.len(), 4);
+
+        rshutdown_release_trace();
+
+        let residual = drain_queued_batches(&rx);
+        assert_eq!(residual.len(), 1, "exactly one residual batch");
+        assert_eq!(residual[0].calls.len(), 2, "two records carried over");
+
+        // The shipper's consume subtract is Section 6; emulate it
+        // here so the atomic ends at zero.
+        accounting::sub(mid[0].size_estimate);
+        accounting::sub(residual[0].size_estimate);
+        assert_eq!(accounting::snapshot(), 0);
+
+        crate::shipper::reset_for_test();
     }
 
     // --- BootObserver dispatcher ------------------------------------------

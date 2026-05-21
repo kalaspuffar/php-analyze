@@ -19,19 +19,41 @@
 //! Plain text, one record per line, deterministic order:
 //!
 //! ```text
+//! F:record_count=<N> estimated_bytes=<B> trigger=<T>
 //! D:<fn_id>:<kind>:<line>:<fqn>\t<file>
 //! C:<call_id>:<parent>:<fn_id>:<depth>:<t_in_ns>:<t_out_ns>:<cpu_u_ns>:<cpu_s_ns>:<mem_in>:<mem_out>:<abnormal>
 //! DROP: dropped_records=<N>
 //! RSHUTDOWN: dropped trace_id=<hex>
 //! ```
 //!
-//! - `D:` lines come first, in dictionary-insertion order, ONLY for
-//!   entries that have not yet been drained via
-//!   `Dictionary::take_new_entries`. (Slice 2 never drains, so every
-//!   entry from the trace appears once.)
-//! - `C:` lines follow, in emission order (the same order
-//!   `Trace::push_record` saw).
-//! - One `DROP:` line follows the last `C:` line, summarising the
+//! - `F:` lines (Phase-4 slice 2) mark a flush boundary; each `F:` is
+//!   followed by the batch's `D:` and `C:` lines in the same order
+//!   the recorder produced them. `<T>` is one of `records`, `bytes`,
+//!   or `rshutdown`. A trace may produce zero or more `F:` blocks
+//!   depending on the configured `flush_records` / `flush_bytes` and
+//!   the workload.
+//!
+//!   **Diagnostic semantics (PF-7 in `COMMENTS.md`):** the `F:` line
+//!   records what the **recorder believed it flushed** at the moment
+//!   of the boundary — it does NOT promise the batch reached the
+//!   shipper. A channel-full (`SPECIFICATION.md` §5.3 R-13),
+//!   disconnected, or no-Sender `try_send_batch` will still emit the
+//!   `F:` line; the batch is then dropped and the channel-full arm
+//!   bumps the `drop_counter` by `batch.calls.len()`. A reader
+//!   reconciling delivery against the dump SHOULD cross-reference the
+//!   trailing `DROP:` line, which carries the cumulative drop count at
+//!   trace end. The diagnostic is "attempted flushes" rather than
+//!   "delivered flushes" because it sits in front of `try_send_batch`
+//!   — moving it inside the `Ok(())` arm would lose the
+//!   "recorder produced N batches" signal the slice-2 fixtures
+//!   rely on.
+//! - `D:` lines list dictionary entries new to this batch
+//!   (`Dictionary::take_new_entries`'s output). A function seen in
+//!   batch N keeps its `fn_id` in batch N+1 but does not appear in
+//!   batch N+1's `D:` block — the wire format is incremental.
+//! - `C:` lines list this batch's call records in emission order (the
+//!   same order `Trace::push_record` saw).
+//! - One `DROP:` line follows the last `F:` block, summarising the
 //!   trace's cumulative drop counter at dump time. Slice 3 added
 //!   this line; the value is read via
 //!   `trace.drop_counter.load(Ordering::Acquire)`. The line is
@@ -52,7 +74,8 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use crate::recorder::types::{DictEntry, FunctionKind, Trace};
+use crate::recorder::observer::FlushTrigger;
+use crate::recorder::types::{DictEntry, FunctionKind, PendingBatch, Trace};
 
 /// The env var the harness sets; absent means "do nothing".
 const DUMP_PATH_ENV: &str = "PHP_ANALYZE_DUMP_PATH";
@@ -64,6 +87,16 @@ const DUMP_PATH_ENV: &str = "PHP_ANALYZE_DUMP_PATH";
 /// the test harness to discover). The function's contract is purely
 /// best-effort: if the dump can't be written, the test will fail at
 /// the assert step, which is the right failure surface.
+///
+/// After Phase-4 slice 2, by the time `write_trace_if_path_set` runs
+/// at `RSHUTDOWN` the trace's `buffer` and
+/// `dictionary.new_entries` are *empty* — the `RSHUTDOWN`-final
+/// flush moved them into a `PendingBatch` and called
+/// [`record_flush`], which already wrote the `F:` / `D:` / `C:`
+/// lines for that batch. This function therefore writes only the
+/// trailing `DROP:` summary and `RSHUTDOWN:` marker; the
+/// per-batch lines have already landed via prior `record_flush`
+/// calls (mid-request thresholds and the rshutdown-final flush).
 pub(crate) fn write_trace_if_path_set(trace: &Trace) {
     let Some(path) = read_dump_path() else {
         return;
@@ -71,6 +104,72 @@ pub(crate) fn write_trace_if_path_set(trace: &Trace) {
     if let Err(err) = write_trace_to_path(trace, &path) {
         eprintln!("recorder::dump: failed to write {:?}: {err}", path);
     }
+}
+
+/// Append one flush block (an `F:` line + the batch's `D:` / `C:`
+/// lines) to the dump file. Called by the recorder's accept-tail
+/// flush site and by `RSHUTDOWN`'s final-flush site, *after* the
+/// batch has been built but before it is handed to
+/// `recorder::flush::try_send_batch`. The `trace` argument is the
+/// post-`flush_into_pending_batch` source trace; only used here for
+/// its `trace_id` if a future header field needs it (today the
+/// helper ignores it).
+///
+/// No-op when `PHP_ANALYZE_DUMP_PATH` is unset.
+pub(crate) fn record_flush(
+    _trace: &Trace,
+    batch: &PendingBatch,
+    trigger: FlushTrigger,
+    record_count: usize,
+    estimated_bytes: usize,
+) {
+    let Some(path) = read_dump_path() else {
+        return;
+    };
+    if let Err(err) = write_flush_block(&path, batch, trigger, record_count, estimated_bytes) {
+        eprintln!("recorder::dump: failed to write flush block to {path:?}: {err}");
+    }
+}
+
+fn write_flush_block(
+    path: &std::path::Path,
+    batch: &PendingBatch,
+    trigger: FlushTrigger,
+    record_count: usize,
+    estimated_bytes: usize,
+) -> std::io::Result<()> {
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut sink = BufWriter::new(file);
+
+    writeln!(
+        sink,
+        "F:record_count={} estimated_bytes={} trigger={}",
+        record_count,
+        estimated_bytes,
+        trigger.as_str(),
+    )?;
+    for entry in &batch.dict {
+        write_dict_line(&mut sink, entry)?;
+    }
+    for record in &batch.calls {
+        writeln!(
+            sink,
+            "C:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            record.call_id,
+            record.parent,
+            record.fn_id,
+            record.depth,
+            record.t_in_ns,
+            record.t_out_ns,
+            record.cpu_u_ns,
+            record.cpu_s_ns,
+            record.mem_in_bytes,
+            record.mem_out_bytes,
+            record.abnormal_exit,
+        )?;
+    }
+    sink.flush()?;
+    Ok(())
 }
 
 fn read_dump_path() -> Option<PathBuf> {
@@ -163,6 +262,20 @@ pub struct ParsedDump {
     /// fixture from a previous slice's binary would not).
     pub dropped_records: Option<u64>,
     pub rshutdown_marker_seen: bool,
+    /// Phase-4 slice 2 `F:record_count=<N> estimated_bytes=<B>
+    /// trigger=<T>` lines in emission order. Empty for a slice-3
+    /// dump (no flush surface yet) or a slice-2 dump with
+    /// `flush_records` / `flush_bytes` so large no threshold fires.
+    pub flushes: Vec<ParsedFlush>,
+}
+
+/// An `F:` line from a Phase-4 slice 2 dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFlush {
+    pub record_count: usize,
+    pub estimated_bytes: usize,
+    /// The literal trigger string: `records`, `bytes`, or `rshutdown`.
+    pub trigger: String,
 }
 
 /// A `D:` line.
@@ -201,6 +314,7 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
     let mut calls = Vec::new();
     let mut dropped_records: Option<u64> = None;
     let mut rshutdown_marker_seen = false;
+    let mut flushes: Vec<ParsedFlush> = Vec::new();
 
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("D:") {
@@ -210,6 +324,10 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
         } else if let Some(rest) = line.strip_prefix("C:") {
             if let Some(parsed) = parse_call_line(rest) {
                 calls.push(parsed);
+            }
+        } else if let Some(rest) = line.strip_prefix("F:") {
+            if let Some(parsed) = parse_flush_line(rest) {
+                flushes.push(parsed);
             }
         } else if let Some(rest) = line.strip_prefix("DROP: dropped_records=") {
             // Slice-3 `DROP:` line. The format is fixed; the entire
@@ -225,6 +343,30 @@ pub fn parse_dump(path: &std::path::Path) -> std::io::Result<ParsedDump> {
         calls,
         dropped_records,
         rshutdown_marker_seen,
+        flushes,
+    })
+}
+
+/// Parse `record_count=<N> estimated_bytes=<B> trigger=<T>`. Returns
+/// `None` if any of the three `key=value` pairs is missing or
+/// malformed.
+fn parse_flush_line(rest: &str) -> Option<ParsedFlush> {
+    let mut record_count: Option<usize> = None;
+    let mut estimated_bytes: Option<usize> = None;
+    let mut trigger: Option<String> = None;
+    for part in rest.split_whitespace() {
+        let (key, value) = part.split_once('=')?;
+        match key {
+            "record_count" => record_count = value.parse().ok(),
+            "estimated_bytes" => estimated_bytes = value.parse().ok(),
+            "trigger" => trigger = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some(ParsedFlush {
+        record_count: record_count?,
+        estimated_bytes: estimated_bytes?,
+        trigger: trigger?,
     })
 }
 
@@ -302,7 +444,7 @@ mod tests {
             host: Arc::from("test-host"),
             sapi: Arc::from("cli"),
             pid: 1,
-            uri_or_script: "/tmp/test.php".to_owned(),
+            uri_or_script: Arc::from("/tmp/test.php"),
         }
     }
 
@@ -310,6 +452,8 @@ mod tests {
         TraceLimits {
             max_depth: 1024,
             buffer_cap_bytes: 64 * 1024 * 1024,
+            flush_records: usize::MAX,
+            flush_bytes: usize::MAX,
         }
     }
 

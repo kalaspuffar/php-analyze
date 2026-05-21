@@ -148,26 +148,34 @@ pub struct MetaPartial {
 
 /// A batch handed off from the recorder to the shipper.
 ///
-/// Mirrors `SPECIFICATION.md` §4.1.6 (`PendingBatch`) with one deliberate
-/// deviation for this slice: there is no `drop_counter: Arc<AtomicU64>`
-/// field. The drop counter is introduced by Phase-2 slice 3
-/// (`recorder-depth-and-cap-drops`) when the depth and buffer-cap
-/// enforcement paths that need to bump it land. The shipper does not
-/// exist yet either (Phase 4), so the type is currently unused at
-/// runtime; it ships now so the substrate is feature-complete for the
-/// next slice's needs.
+/// Mirrors `SPECIFICATION.md` §4.1.6 (`PendingBatch`). Per AD-9 the
+/// `drop_counter` field is an [`Arc::clone`] of the source [`Trace`]'s
+/// counter — not a snapshot. The next-slice encoder reads the **live**
+/// counter at send time, after the recorder has had the chance to bump
+/// it via subsequent drops in the same trace; a snapshot would freeze
+/// the value at flush time and lose any drops that occurred between
+/// flush and encode.
 ///
-/// **Invariant**: `size_estimate` is always
-/// [`estimate_batch_bytes`]`(&dict, &calls)`. Constructing a `PendingBatch`
-/// directly bypasses that invariant, which is why slice-3 callers should
-/// prefer the future `Trace::flush_into_batch` accessor (not yet present)
-/// over the field-level constructor.
+/// **Invariant (estimator)**: `size_estimate` is always
+/// [`estimate_batch_bytes`]`(&dict, &calls)`. Constructing a
+/// `PendingBatch` directly bypasses that invariant, which is why callers
+/// should prefer [`Trace::flush_into_pending_batch`] over the field-level
+/// constructor. The accessor populates `size_estimate` from the trace's
+/// running `buffer_estimated_bytes` and `debug_assert!`s the invariant
+/// before returning.
 #[derive(Debug)]
 pub struct PendingBatch {
     pub meta_partial: MetaPartial,
     pub dict: Vec<DictEntry>,
     pub calls: Vec<CallRecord>,
     pub size_estimate: usize,
+    /// Per-trace drop counter (`SPECIFICATION.md` AD-9), shared with
+    /// the source [`Trace`] via [`Arc::clone`]. The shipper reads it
+    /// at encode time (Phase 4 slice 3) to stamp
+    /// `meta.dropped_records`; the recorder continues to bump it on
+    /// the buffer-cap, depth-gate, and channel-full drop paths in the
+    /// same trace until the trace ends.
+    pub drop_counter: Arc<AtomicU64>,
 }
 
 /// `SPECIFICATION.md` §3.2 size-estimate constants.
@@ -224,16 +232,25 @@ pub struct RequestIdentity {
     pub host: Arc<str>,
     pub sapi: Arc<str>,
     pub pid: u32,
-    pub uri_or_script: String,
+    /// Carried as `Arc<str>` so the eventual `MetaPartial`-construction
+    /// site (`Trace::flush_into_pending_batch`) clones the `Arc` rather
+    /// than allocating a fresh slice per flush. The `Arc::from(&str)`
+    /// allocation happens **once per request** at
+    /// `bootstrap::request_identity_from_sapi`, paid alongside the
+    /// `host` / `sapi` allocations, instead of once per flush. See
+    /// review finding PF-1 in `COMMENTS.md`.
+    pub uri_or_script: Arc<str>,
 }
 
-/// Per-trace cap thresholds, plumbed from `Config` into [`Trace::new`].
+/// Per-trace cap and flush thresholds, plumbed from `Config` into
+/// [`Trace::new`].
 ///
-/// Slice 3 (`recorder-depth-and-cap-drops`) caches `Config::max_depth`
-/// and `Config::buffer_cap_bytes` onto the `Trace` itself so the hot
-/// path (`begin_with_snapshots`) never needs to touch `Config::global()`
-/// and tests can construct a `Trace` with arbitrary thresholds without
-/// poking the global config.
+/// Slice 3 (`recorder-depth-and-cap-drops`) introduced this struct with
+/// `max_depth` and `buffer_cap_bytes`; Phase-4 slice 2
+/// (`recorder-flushes-into-shipper`) added the two flush thresholds so
+/// the end-handler's hot-path predicate is a pair of field loads against
+/// values already in cache from the preceding `push_record` write — no
+/// indirection through `Config::global()`, no `usize` cast per call.
 ///
 /// `max_depth` widens from `Config::max_depth: u16` to `u32` so the
 /// comparison against `Trace::virtual_depth: u32` happens without a
@@ -242,6 +259,28 @@ pub struct RequestIdentity {
 pub struct TraceLimits {
     pub max_depth: u32,
     pub buffer_cap_bytes: usize,
+    /// Cached `Config::flush_records` — flush the buffer once it
+    /// reaches this many records. `usize` to match
+    /// `Vec::len()` on the comparison.
+    pub flush_records: usize,
+    /// Cached `Config::flush_bytes` — flush the buffer once
+    /// `buffer_estimated_bytes` reaches this many bytes. `usize` to
+    /// match the estimator's own type.
+    pub flush_bytes: usize,
+}
+
+impl From<&crate::config::Config> for TraceLimits {
+    /// Build a `TraceLimits` from the resolved [`Config`]. Centralises
+    /// the `u16 → u32` widening for `max_depth` and the
+    /// `flush_records` / `flush_bytes` `usize` carry-through.
+    fn from(config: &crate::config::Config) -> Self {
+        Self {
+            max_depth: u32::from(config.max_depth),
+            buffer_cap_bytes: config.buffer_cap_bytes,
+            flush_records: config.flush_records,
+            flush_bytes: config.flush_bytes,
+        }
+    }
 }
 
 /// Per-request recorder state, owned by the PHP request thread.
@@ -301,7 +340,12 @@ pub struct Trace {
     pub host: Arc<str>,
     pub pid: u32,
     pub sapi: Arc<str>,
-    pub uri_or_script: String,
+    /// `Arc<str>` so [`Self::flush_into_pending_batch`] can clone the
+    /// `Arc` into [`MetaPartial::uri_or_script`] without allocating.
+    /// The matching allocation happens once per request at
+    /// `bootstrap::request_identity_from_sapi`. See PF-1 in
+    /// `COMMENTS.md` for the worked rationale.
+    pub uri_or_script: Arc<str>,
 
     /// Per-trace `Arc<AtomicU64>` drop counter (AD-9). Phase 4 clones
     /// the `Arc` into `PendingBatch::drop_counter` so the shipper
@@ -337,6 +381,19 @@ pub struct Trace {
     /// Cached threshold from `Config::buffer_cap_bytes`. Slice-3
     /// design D-3 / D-4.
     pub(crate) buffer_cap_bytes: usize,
+
+    /// Cached threshold from `Config::flush_records`. The end-handler
+    /// accept tail compares `buffer.len()` against this value;
+    /// crossing the threshold drives a flush via
+    /// `recorder::flush::try_send_batch`. See Phase-4 slice 2 design
+    /// D-3 (flush at end-handler, not begin) and the matching
+    /// `recorder-call-events` requirement.
+    pub(crate) flush_records: usize,
+
+    /// Cached threshold from `Config::flush_bytes`. Sibling of
+    /// `flush_records`; the predicate is an `||` so either crossing
+    /// fires the flush.
+    pub(crate) flush_bytes: usize,
 }
 
 impl Trace {
@@ -376,6 +433,8 @@ impl Trace {
             dropped_begins: 0,
             max_depth: limits.max_depth,
             buffer_cap_bytes: limits.buffer_cap_bytes,
+            flush_records: limits.flush_records,
+            flush_bytes: limits.flush_bytes,
         }
     }
 
@@ -482,6 +541,84 @@ impl Trace {
         self.drop_counter.fetch_add(1, Ordering::Relaxed);
         self.dropped_begins = self.dropped_begins.saturating_add(1);
     }
+
+    /// Hand the current buffer and new-since-last-flush dictionary
+    /// entries to a fresh [`PendingBatch`], resetting the trace's
+    /// pending state in-place. Called by the Phase-4 producer paths
+    /// (threshold-driven flush at the end-handler tail, `RSHUTDOWN`
+    /// final flush). See design.md §D-2 / §D-6.
+    ///
+    /// Steady-state cost: two `Vec::new()` swaps (`mem::take`), one
+    /// `Arc::clone` (atomic increment), one `MetaPartial` construct.
+    /// **No allocations on this path** — the `Vec`-and-`Arc::clone`
+    /// triple is constant-time; the `MetaPartial` carries three
+    /// `Arc<str>` clones (`host`, `sapi`, `uri_or_script`), not owned
+    /// strings. PF-1 (`COMMENTS.md`) records the round-1 fix that
+    /// lifted `Trace::uri_or_script` from `String` to `Arc<str>` so
+    /// the third clone is also a refcount bump rather than a fresh
+    /// `Arc::from(&str)` allocation per flush.
+    ///
+    /// // NOTE for Phase 5 (AC-RC-5 zero-alloc audit): this is the
+    /// // only non-Drop hot path that produces a `PendingBatch`. The
+    /// // zero-alloc property rests on `std::mem::take` returning the
+    /// // sentinel `Vec::new()` for both fields and on `Arc::clone`
+    /// // being a single relaxed atomic increment. Phase 5 may want
+    /// // to pre-size the post-take `Vec`s via
+    /// // `Vec::with_capacity(flush_records)` to avoid the first
+    /// // post-flush push's `malloc`; see design.md §D-2 for the
+    /// // trade-off.
+    ///
+    /// The dictionary's interning map is **preserved** by
+    /// [`Dictionary::take_new_entries`] — a function that fired one
+    /// `CallRecord` into batch N continues to map to the same
+    /// `fn_id` for any subsequent record that targets it; only the
+    /// staged `new_entries` journal moves. The next batch's `dict`
+    /// vec therefore lists only entries that became visible *after*
+    /// this flush, matching the §4.2 incremental wire shape.
+    pub(crate) fn flush_into_pending_batch(&mut self) -> PendingBatch {
+        // Capture the running estimate *before* the take so the
+        // returned `PendingBatch.size_estimate` matches what the
+        // recorder billed to `accounting::BYTES_IN_MEMORY`. The
+        // estimator invariant (§D-2) is re-checked via
+        // `debug_assert_eq!` below.
+        let size_estimate = self.buffer_estimated_bytes;
+
+        let calls = std::mem::take(&mut self.buffer);
+        let dict = self.dictionary.take_new_entries();
+        self.buffer_estimated_bytes = 0;
+
+        let meta_partial = MetaPartial {
+            schema_version: 1,
+            trace_id: self.trace_id,
+            host: Arc::clone(&self.host),
+            pid: self.pid,
+            start_time_realtime_ns: self.start_time_realtime_ns,
+            sapi: Arc::clone(&self.sapi),
+            uri_or_script: Arc::clone(&self.uri_or_script),
+        };
+
+        let batch = PendingBatch {
+            meta_partial,
+            dict,
+            calls,
+            size_estimate,
+            drop_counter: Arc::clone(&self.drop_counter),
+        };
+
+        // Estimator invariant: the running `buffer_estimated_bytes`
+        // matches what the §3.2 formula would compute from the moved
+        // contents. Held in `debug_assert_eq!` so release builds skip
+        // the recomputation but tests catch any drift between the
+        // incremental bookkeeping in `push_record` /
+        // `push_dict_entry_via_intern` and the whole-batch formula.
+        debug_assert_eq!(
+            batch.size_estimate,
+            estimate_batch_bytes(&batch.dict, &batch.calls),
+            "estimator drift: buffer_estimated_bytes diverged from estimate_batch_bytes",
+        );
+
+        batch
+    }
 }
 
 #[cfg(test)]
@@ -577,7 +714,7 @@ mod tests {
             host: Arc::from(host),
             sapi: Arc::from(sapi),
             pid,
-            uri_or_script: uri_or_script.to_owned(),
+            uri_or_script: Arc::from(uri_or_script),
         }
     }
 
@@ -589,6 +726,12 @@ mod tests {
         TraceLimits {
             max_depth: 1024,
             buffer_cap_bytes: 64 * 1024 * 1024,
+            // Phase-4 slice 2: thresholds large enough that the slice-3
+            // tests, which predate the flush predicate, never cross
+            // either of them. Tests that exercise the flush cadence
+            // build their own `TraceLimits` with smaller values.
+            flush_records: usize::MAX,
+            flush_bytes: usize::MAX,
         }
     }
 
@@ -622,7 +765,7 @@ mod tests {
         assert_eq!(trace.pid, 12345);
         assert_eq!(&*trace.host, "host.example");
         assert_eq!(&*trace.sapi, "cli");
-        assert_eq!(trace.uri_or_script, "/path/to/script.php");
+        assert_eq!(&*trace.uri_or_script, "/path/to/script.php");
         assert_eq!(trace.call_id_seq, 0);
         assert!(trace.stack.is_empty(), "fresh stack must be empty");
         assert!(trace.buffer.is_empty(), "fresh buffer must be empty");
@@ -782,14 +925,14 @@ mod tests {
             host: Arc::from("worker-42.prod"),
             sapi: Arc::from("fpm-fcgi"),
             pid: 4242,
-            uri_or_script: "/srv/app/index.php?route=/api/v1/users".to_owned(),
+            uri_or_script: Arc::from("/srv/app/index.php?route=/api/v1/users"),
         };
         let trace = Trace::new(identity.clone(), permissive_limits());
 
         assert_eq!(&*trace.host, &*identity.host);
         assert_eq!(&*trace.sapi, &*identity.sapi);
         assert_eq!(trace.pid, identity.pid);
-        assert_eq!(trace.uri_or_script, identity.uri_or_script);
+        assert_eq!(&*trace.uri_or_script, &*identity.uri_or_script);
     }
 
     // --- Slice-3 tests ------------------------------------------------
@@ -833,10 +976,52 @@ mod tests {
         let limits = TraceLimits {
             max_depth: 42,
             buffer_cap_bytes: 99,
+            flush_records: usize::MAX,
+            flush_bytes: usize::MAX,
         };
         let trace = Trace::new(sample_identity("h", "cli", 1, "/a.php"), limits);
         assert_eq!(trace.max_depth, 42);
         assert_eq!(trace.buffer_cap_bytes, 99);
+    }
+
+    #[test]
+    fn trace_new_caches_flush_thresholds_from_request_limits() {
+        let limits = TraceLimits {
+            max_depth: 1024,
+            buffer_cap_bytes: 64 * 1024 * 1024,
+            flush_records: 5000,
+            flush_bytes: 524_288,
+        };
+        let trace = Trace::new(sample_identity("h", "cli", 1, "/a.php"), limits);
+        assert_eq!(trace.flush_records, 5000);
+        assert_eq!(trace.flush_bytes, 524_288);
+    }
+
+    #[test]
+    fn trace_limits_from_config_carries_flush_records_and_flush_bytes() {
+        // Build a `Config` with non-default flush thresholds via the
+        // public `from_ini_values` path so the test exercises the same
+        // resolution code the bootstrap layer runs at MINIT.
+        let raw = crate::config::RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some("inline-token".to_owned()),
+            flush_records: Some(5000),
+            flush_bytes: Some(524_288),
+            ..crate::config::RawIni::default()
+        };
+        let (config, _warnings) = crate::config::Config::from_ini_values(&raw);
+        assert!(config.enabled, "the test config must be enabled");
+        assert_eq!(config.flush_records, 5000);
+        assert_eq!(config.flush_bytes, 524_288);
+
+        let limits = TraceLimits::from(&config);
+        assert_eq!(limits.flush_records, 5000);
+        assert_eq!(limits.flush_bytes, 524_288);
+        // u16 → u32 widening — verified once so the `From` impl is
+        // covered end-to-end for max_depth too.
+        assert_eq!(limits.max_depth, u32::from(config.max_depth));
+        assert_eq!(limits.buffer_cap_bytes, config.buffer_cap_bytes);
     }
 
     #[test]
@@ -889,6 +1074,181 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&trace_one.drop_counter, &trace_two.drop_counter),
             "the Arc itself must be a fresh allocation, not a clone",
+        );
+    }
+
+    // --- Phase-4 slice 2: flush_into_pending_batch -------------------------
+
+    /// Stage a buffer + dictionary state on a fresh trace by interning
+    /// `dict_entries` distinct functions and pushing `record_count`
+    /// `CallRecord`s through the `Trace`-side accessors so the
+    /// estimator invariant holds throughout. Returns the trace; the
+    /// caller MUST hold an `account_guard()` because the helper
+    /// touches the process-wide budget.
+    fn trace_with_staged_buffer(record_count: usize, dict_entries: usize) -> Trace {
+        let mut trace = trace_with(sample_identity("h", "cli", 1, "/x.php"));
+        for i in 0..dict_entries {
+            let name = format!("fn_{i}");
+            let key = FunctionKey::Internal {
+                name: Arc::from(name.as_str()),
+            };
+            let fqn_owned = format!("internal:{name}");
+            trace.push_dict_entry_via_intern(key, |fn_id| DictEntry {
+                fn_id,
+                fqn: fqn_owned,
+                file: String::new(),
+                line: 0,
+                kind: FunctionKind::Internal,
+            });
+        }
+        for i in 0..record_count {
+            trace.push_record(CallRecord {
+                call_id: (i as u64) + 1,
+                ..sample_call_record()
+            });
+        }
+        trace
+    }
+
+    #[test]
+    fn flush_into_pending_batch_moves_buffer_and_dict_new_entries() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with_staged_buffer(3, 2);
+        let pre_buffer_bytes = trace.buffer_estimated_bytes;
+        assert!(
+            pre_buffer_bytes > 0,
+            "test fixture must produce a non-zero estimate"
+        );
+
+        let batch = trace.flush_into_pending_batch();
+
+        assert_eq!(batch.calls.len(), 3, "calls move into the batch");
+        assert_eq!(batch.dict.len(), 2, "dict-new-entries move into the batch");
+        assert!(trace.buffer.is_empty(), "trace buffer is reset");
+        assert_eq!(
+            trace.buffer_estimated_bytes, 0,
+            "trace buffer_estimated_bytes is reset",
+        );
+
+        // The dictionary's interning map is preserved across the flush:
+        // re-interning the same key returns the existing `fn_id` and
+        // stages no fresh `DictEntry`.
+        let key = FunctionKey::Internal {
+            name: Arc::from("fn_0"),
+        };
+        assert!(
+            trace.dictionary.contains_key(&key),
+            "interning map MUST survive the flush",
+        );
+    }
+
+    #[test]
+    fn flush_into_pending_batch_resets_buffer_estimated_bytes() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with_staged_buffer(5, 1);
+        let pre_estimate = trace.buffer_estimated_bytes;
+        let batch = trace.flush_into_pending_batch();
+
+        assert_eq!(trace.buffer_estimated_bytes, 0);
+        assert_eq!(
+            batch.size_estimate, pre_estimate,
+            "size_estimate equals the pre-take estimator value",
+        );
+        // The §3.2 whole-batch formula matches the incremental
+        // accumulator — also asserted by `flush_into_pending_batch`'s
+        // own `debug_assert_eq!`, but kept here as a release-build
+        // check.
+        assert_eq!(
+            batch.size_estimate,
+            estimate_batch_bytes(&batch.dict, &batch.calls),
+        );
+    }
+
+    #[test]
+    fn flush_into_pending_batch_preserves_the_dictionary_map_across_flushes() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with_staged_buffer(1, 1);
+        let first = trace.flush_into_pending_batch();
+        assert_eq!(first.dict.len(), 1, "first flush carries the dict entry");
+
+        // Re-intern the same key: should NOT add a new entry to the
+        // trace's `dictionary.new_entries`. We confirm by inspecting
+        // the next flush, which would otherwise carry a duplicate.
+        let key = FunctionKey::Internal {
+            name: Arc::from("fn_0"),
+        };
+        let fqn_owned = "internal:fn_0".to_owned();
+        let _fn_id = trace.push_dict_entry_via_intern(key, |fn_id| DictEntry {
+            fn_id,
+            fqn: fqn_owned,
+            file: String::new(),
+            line: 0,
+            kind: FunctionKind::Internal,
+        });
+        trace.push_record(sample_call_record());
+
+        let second = trace.flush_into_pending_batch();
+        assert!(
+            second.dict.is_empty(),
+            "second flush carries no dict entries — the function was already interned",
+        );
+        assert_eq!(second.calls.len(), 1, "the one record moves through");
+    }
+
+    #[test]
+    fn pending_batch_drop_counter_is_arc_clone_of_trace_counter() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with(sample_identity("h", "cli", 1, "/x.php"));
+        // Stage one record so the flush produces a non-empty batch
+        // (a zero-record flush is exercised separately).
+        trace.push_record(sample_call_record());
+
+        let batch = trace.flush_into_pending_batch();
+
+        // The Arc is the same allocation.
+        assert!(
+            Arc::ptr_eq(&batch.drop_counter, &trace.drop_counter),
+            "PendingBatch::drop_counter must be Arc::clone of trace.drop_counter, not a snapshot",
+        );
+
+        // A bump through the trace is visible through the batch's
+        // clone — the slice-2 design promise that the encoder reads
+        // the live counter, not a snapshot.
+        trace.drop_counter.fetch_add(7, Ordering::Release);
+        assert_eq!(batch.drop_counter.load(Ordering::Acquire), 7);
+
+        // And a bump through the batch's clone is visible through
+        // the trace — symmetry of the Arc.
+        batch.drop_counter.fetch_add(2, Ordering::Release);
+        assert_eq!(trace.drop_counter.load(Ordering::Acquire), 9);
+    }
+
+    #[test]
+    fn two_flushes_from_the_same_trace_share_the_drop_counter_arc() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with(sample_identity("h", "cli", 1, "/x.php"));
+        trace.push_record(sample_call_record());
+        let batch_a = trace.flush_into_pending_batch();
+        trace.push_record(sample_call_record());
+        let batch_b = trace.flush_into_pending_batch();
+
+        assert!(
+            Arc::ptr_eq(&batch_a.drop_counter, &batch_b.drop_counter),
+            "both batches from the same trace must share the Arc",
+        );
+        assert!(
+            Arc::ptr_eq(&batch_a.drop_counter, &trace.drop_counter),
+            "and share with the source trace",
         );
     }
 
