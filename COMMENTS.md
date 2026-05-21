@@ -3198,3 +3198,194 @@ Total workspace test count delta in this fix-round: **+6**,
 matching the WSI-1 scenario count exactly. No new dependencies,
 no production-code behaviour change.
 
+---
+
+## Slice-4-shipper-substrate deviations and notes
+
+### C-13 — Slice-4 slice-1 (`shipper-thread-and-channel`) implementation notes
+
+This entry records the in-flight deviations discovered while
+implementing Phase 4 slice 1 — the channel + thread + drain
+substrate. The slice ships no `SPECIFICATION.md` or README
+changes; the deviations below are local to the OpenSpec change's
+specs and to this file.
+
+**Status:** branch `feat/shipper-thread-and-channel`, OpenSpec
+change `shipper-thread-and-channel`, `openspec validate
+shipper-thread-and-channel --strict` is green. All gates green:
+`cargo fmt --all --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo test --all --all-features`
+(172 lib + 1 spike + 1 recorder-integration + 12 stub round-trip
+= 186, 0 failed), `cargo test --release --lib --all-features` (173),
+and `PHP_ANALYZE_RUN_RECORDER=1 cargo test --test recorder_observer
+--features recorder-dump` against `php8.4` on the build host.
+
+#### Deviations from the slice-4 proposal/specs
+
+1. **Canonical Sender slot is `Mutex<Option<Sender>>`, not
+   `OnceLock<Sender>`.** `tasks.md` §4.1 sketched
+   `static SENDER: OnceLock<Sender<ShipperMessage>>`. `OnceLock`
+   cannot be cleared, so `drain_and_join_at_mshutdown` would have
+   no way to drop the canonical Sender at shutdown — the channel
+   would stay open and the shipper loop's `recv_deadline` would
+   block until the deadline expired, even on a clean shutdown of
+   an empty channel (the empty-channel `< 100 ms` shutdown test
+   would fail by ~5 seconds). The implemented type is
+   `Mutex<Option<Sender<ShipperMessage>>>`: `install_channel_at_minit`
+   enforces the "set once" semantic by checking `is_some()` before
+   populating, and `drain_and_join_at_mshutdown` takes the Sender
+   out and explicitly drops it. The spec wording ("the
+   process-global `Sender` is populated") is preserved; only the
+   container type differs. The module doc records the deviation
+   in-source. **Action**: no follow-up needed; the deviation is
+   architectural and reads coherent against the implemented spec.
+
+2. **Bootstrap-side helpers factored as pure `Option<&Config>` -taking
+   functions for testability.** The straightforward wiring would
+   have been three inline calls inside `startup` / `rinit_body` /
+   `mshutdown_body`, each consulting `Config::global()`
+   directly. That would make the R-10 silent-disable contract
+   essentially untestable without poking the `OnceLock`. The
+   implementation factors out `install_shipper_if_enabled`,
+   `spawn_shipper_if_enabled`, and `drain_shipper_if_enabled`
+   (each `fn(Option<&Config>) -> ()`), so tests can drive both
+   the enabled and disabled paths with hand-built `Config`
+   values. Five new `bootstrap::tests` cover the matrix.
+
+3. **`acquire_test_lock` / `reset_for_test` / accessor surface
+   added on `crate::shipper`.** The shipper module exposes four
+   `#[cfg(test)]` helpers (`acquire_test_lock`, `reset_for_test`,
+   `sender_is_installed`, `handle_is_installed`,
+   `receiver_is_installed`, `spawned_flag`, `clone_sender_for_test`,
+   `install_panicking_handle_for_test`) for the bootstrap tests
+   in §7.4 / §7.5 / §8.1 to peek at and reset the module-global
+   slots between tests. Same pattern as `recorder::accounting`'s
+   `acquire_test_lock` / `reset_for_test`. None of this surface
+   compiles in production builds (the `#[cfg(test)]` gate is
+   exhaustive).
+
+4. **Thread name is truncated to 15 chars at the kernel.** The
+   spawned thread is named `php-analyze-shipper` (19 chars), but
+   `/proc/<pid>/task/<tid>/comm` reports `php-analyze-shi` because
+   Linux truncates `task->comm` to `TASK_COMM_LEN - 1 = 15` bytes.
+   The spec does not require a specific thread name (only that
+   exactly one thread spawns), so the truncation is benign for
+   correctness. Operators using `ps -L` or `top -H -p <pid>` will
+   see the truncated name. Not amended in code; recorded here for
+   future reviewer reference.
+
+5. **`run_loop` tolerates a second `Drain` message.** The spec
+   does not contemplate two `Drain` messages in one run (only
+   `drain_and_join_at_mshutdown` sends `Drain`, and only once),
+   but the implementation matches `Ok(ShipperMessage::Drain { .. })`
+   in the drain-phase and ignores it. This is defensive: slice 2's
+   future encoder might inadvertently re-Drain on an error path,
+   and we'd rather see the ignore than have the loop crash. The
+   pure-Rust unit test for this defensive arm is implicit (a
+   second Drain falls through to the next `recv_deadline`).
+   Recorded so a future reviewer doesn't flag the "dead arm" as
+   unreachable.
+
+6. **`#[allow(dead_code)]` on `JoinOutcome::Clean`'s payload.**
+   Clippy under `-D warnings` flags `Clean(ShipperExit)` because
+   slice 1's `drain_shipper_if_enabled` binds the outcome to
+   `_outcome` and discards. The allow is annotated with a reason
+   pointing forward to slice 2 (the encoder will read
+   `ShipperExit::batches_drained` and
+   `batches_abandoned_at_deadline` to surface counts at
+   `E_NOTICE`). The fields are read by tests via the derived
+   `Debug`, so the allow only covers the production
+   discard.
+
+#### Manual host verification (build host PHP 8.4.21)
+
+The §10 manual checks reproduce the spec scenarios at the OS
+level. All four runs commit to the same `target/release/libphp_analyze.so`
+built at HEAD.
+
+```
+$ cargo build --release -p php-analyze       → libphp_analyze.so (~8 MB)
+$ php8.4 -d extension=$PWD/target/release/libphp_analyze.so \
+       -d php_analyze.server_url=http://localhost:8888 \
+       -d php_analyze.auth_token=dummy --ri php_analyze
+  → status: enabled (true); auth_token redacted as ***;
+    all 14 directive rows render; one startup E_WARNING for
+    http:// URL (TLS-recommendation).
+
+$ php8.4 ... -r 'usleep(300000); /proc/<pid>/task scan;'
+  with enabled extension
+  → 2 threads: ['php-analyze-shi', 'php8.4']
+  with php_analyze.enabled=0
+  → 1 thread: ['php8.4']
+
+$ for i in 1..3 do
+    time(php8.4 ... -r 'echo ok;')
+  end
+  → 37 ms, 51 ms, 61 ms — well below the 5200 ms
+    (shutdown_grace + 200 ms) envelope; the shipper drain is
+    essentially free in slice 1 (no I/O).
+```
+
+The thread-count check satisfies AC-PB-1 (each enabled PHP
+process owns exactly one shipper thread after its first request)
+**and** the modified `extension-bootstrap` "Disabled extension
+spawns no background threads" scenario in one observation pair.
+The total-wall-time check satisfies AC-PB-2 / AC-BS-4 (MSHUTDOWN
+returns within `shutdown_grace + 200 ms`).
+
+#### Test-count delta
+
+| Phase | Lib tests | Integration tests | Notes |
+| --- | --- | --- | --- |
+| Slice-3 round-1 / Wire+stub round-2 (pre-slice-4) | 152 | 1 spike + 1 recorder (gated) + 12 stub round-trip | Baseline after `b3635bf Merge PR #7`. |
+| Slice-4 slice-1 (post-this-commit) | 172 (debug) / 173 (release) | 1 spike + 1 recorder (gated) + 12 stub round-trip | +20 lib tests: 15 in `shipper::tests`, 5 in `bootstrap::tests`. |
+
+Per-module breakdown of the 20 additions:
+- `shipper::tests::run_loop_*`: 5 tests (the four termination
+  conditions of the loop state machine).
+- `shipper::tests::install_channel_at_minit_*`: 2 tests.
+- `shipper::tests::spawn_if_needed_at_rinit_*`: 4 tests (incl. a
+  three-thread CAS race with a `Barrier`).
+- `shipper::tests::drain_and_join_at_mshutdown_*`: 4 tests (incl.
+  the panicking-shipper-thread test).
+- `bootstrap::tests::bootstrap_*`: 5 tests (install / drain
+  per-config-state matrix plus the full-lifecycle scenarios).
+
+#### Gates evidence (final, on build host PHP 8.4.21)
+
+```
+cargo fmt --all --check                                          clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  172 + 1 + 1 + 12 = 186, 0 failed
+cargo test --release --lib --all-features                        173, 0 failed
+PHP_ANALYZE_RUN_RECORDER=1 cargo test \
+    --test recorder_observer --features recorder-dump            1 passed
+openspec validate shipper-thread-and-channel --strict            valid
+```
+
+#### Out-of-scope, queued for follow-up
+
+- **MessagePack encoding on the shipper thread** — slice 2. The
+  current `run_loop` drops batches silently; slice 2 grows an
+  `on_batch` step that encodes via `rmp_serde::to_vec_named`.
+- **ureq POST (single attempt)** — slice 2. The encoded bytes
+  will be POSTed via a `ureq::Agent` configured once at MINIT.
+- **Retry/backoff** — slice 3. Per-attempt backoff
+  (`retry_backoff_ms × 2^attempt`), with `retry_count + 1` total
+  attempts before drop.
+- **`PendingBatch::drop_counter: Arc<AtomicU64>` field** — slice
+  2 (where the encoder reads it to stamp `meta.dropped_records`).
+  The `Trace::drop_counter` field is already in place.
+- **Recorder threshold-driven flushes + `RSHUTDOWN`-final-flush**
+  — slice 2. Slice-3's recorder still discards the buffer at
+  RSHUTDOWN; slice 2 wires it into the channel.
+- **Channel-full vs. buffer-cap drop distinction (R-13)** —
+  slice 3. Both increment the same `drop_counter`; slice 3 grows
+  the `E_NOTICE` log line that distinguishes them.
+- **`E_NOTICE` log line on retry-exhaust / drain-abandon** —
+  slice 3. Surfaces `ShipperExit::batches_abandoned_at_deadline`
+  to operators.
+- **R-10 follow-up `mshutdown-respects-silent-disable`** — closed
+  in this slice as a side benefit; the queued OpenSpec change can
+  be removed from the follow-up list.
+
