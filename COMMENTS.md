@@ -1425,3 +1425,568 @@ calling frame is unwinding via an exception. No further verification
 is needed in slice 2 beyond the integration test's `throws.php`
 fixture (which the slice-2 harness exercises against every available
 PHP version).
+
+---
+
+## Code review — 2026-05-21 (branch `feat/recorder-observer-hooks-and-trace-lifecycle`)
+
+**Reviewer:** Claude Code
+**Reviewed against:** `SPECIFICATION.md` §3.1 (Bootstrapper), §3.2 (Recorder),
+§4.1 (in-memory types), §8.3 NFR-REL-1 (never crash PHP), §10 Phase 2 deliverables.
+**Scope:** all commits on `feat/recorder-observer-hooks-and-trace-lifecycle`
+vs. `main` (`cd7cfaf`, `8ff4e08`, `c0487e4`, `429ec03`, `7e8949a`).
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+warnings`, and `cargo test --all` (96 lib + 1 integration test, 0
+skipped) are clean locally.
+
+Findings prefixed **RO-N** (Recorder Observer). The branch is
+well-scoped (~2300 lines of diff dominated by `observer.rs` +
+`dump.rs` and ~700 lines of tests), the substrate-only contract from
+slice 1 is respected (no field-visibility regressions on `Trace`),
+and the `BootObserver` dispatcher cleanly fans out to the three
+runtime variants without coupling the Recorder to the Spike. The
+issues below are mostly correctness and silent-disable-posture
+defenses to land before slice 3 builds on top.
+
+### Issues to fix on this branch
+
+- **RO-1** — **CRITICAL.** Panic across the `extern "C"` FFI
+  boundary aborts the PHP process, violating NFR-REL-1
+  ("never crash the PHP process"). Three observed panic sites
+  on the `bootstrap::rinit` path:
+
+  1. `recorder::rinit_allocate_trace` (`observer.rs:66-76`)
+     hard-asserts that the thread-local slot is `None`. Any
+     RINIT-without-RSHUTDOWN pairing failure (FPM worker
+     interrupted mid-request, a future change that forgets to
+     wire `rshutdown`, etc.) hits `assert!(borrow.is_none(), …)`.
+  2. `Trace::new` (via `recorder::types.rs:295-315`) allocates
+     `Arc<str>`s on the request thread; OOM aborts at the
+     allocator are panics in Rust.
+  3. `clocks::cpu_times_now_ns` and `clocks::clock_gettime_ns`
+     hard-assert their syscall return codes (`clocks.rs:106-110`,
+     promoted from `debug_assert!` per RS-5). On the supported
+     target they are infallible, but the contract is "if it ever
+     happens, abort". A `rinit` invocation that reaches the
+     assert-failure path takes down the PHP worker.
+
+  Since Rust 1.71 a panic crossing `extern "C"` aborts the
+  process (no longer UB, but the failure mode is exactly the
+  silent-disable posture is meant to prevent). Spec §1.4 OQ-9 /
+  AD-4 and the whole `bootstrap.rs` design lean on "PHP keeps
+  running even when we can't". Aborting the worker on a
+  recorder bug means one bad request takes a whole FPM child
+  out — and on CLI it means the user's script dies with
+  `abort()` rather than completing.
+
+  **Suggestion (cheapest):** downgrade the `assert!` in
+  `rinit_allocate_trace` to a `debug_assert!`, and on the
+  release path drop the stale `Trace` silently (or log one
+  `E_NOTICE`):
+
+  ```rust
+  pub fn rinit_allocate_trace(identity: RequestIdentity) {
+      CURRENT_TRACE.with(|slot| {
+          let mut borrow = slot.borrow_mut();
+          debug_assert!(
+              borrow.is_none(),
+              "RINIT without RSHUTDOWN: previous request leaked a Trace",
+          );
+          // Release-path recovery: drop the stale Trace; the leak is
+          // visible via dropped_records (slice 3 onwards).
+          *borrow = Some(Trace::new(identity));
+      });
+  }
+  ```
+
+  **Suggestion (defense in depth):** wrap the bodies of
+  `bootstrap::rinit`, `bootstrap::rshutdown`, and
+  `bootstrap::mshutdown` in `std::panic::catch_unwind`. Any
+  panic anywhere downstream is caught at the FFI boundary,
+  the extension self-disables for the rest of the request, the
+  PHP process keeps running. The first such catch should also
+  bump a future drop-counter (slice 3) so the operator sees
+  it.
+
+  The `double_rinit_without_rshutdown_panics` test
+  (`observer.rs:699`) should be rewritten against the
+  debug-only behaviour (`#[cfg(debug_assertions)]
+  #[should_panic(...)]`) so the release-build invariant
+  ("drop the stale slot, do not crash") gets its own test.
+
+- **RO-2** — **MAJOR.** `recorder_observer.rs:67`
+  (`std::process::exit(77)`) is the autotools "skip" convention,
+  but `cargo test` treats any non-zero exit code as a failed
+  test — and `std::process::exit` terminates the whole test
+  binary process, taking out the result reporting along with
+  it. The intent ("skip when no PHP found") therefore becomes
+  "fail" the moment a developer runs `PHP_ANALYZE_RUN_RECORDER=1
+  cargo test --test recorder_observer` on a host that doesn't
+  match the cdylib's php-config. In CI the matrix entry
+  installs the matching `php<v>`, so the path isn't reached
+  there — but on local rebuilds with the `update-alternatives`
+  pinned to a different version (which the test even mentions
+  in its own message), this fails confusingly.
+  - **Suggestion:** replace `std::process::exit(77)` with
+    `eprintln!(...); return;`. The test then passes loudly as
+    a skip, mirroring the `PHP_ANALYZE_RUN_RECORDER != "1"`
+    branch above it. The risk of silently passing when PHP is
+    missing in CI is bounded: CI's apt-install step would have
+    failed first.
+  - **Alternative:** if the project later wants a stricter "we
+    really exercised PHP" signal, add a separate
+    `#[ignore]`d test that fails when `available.is_empty()`,
+    and require it to be unignored on CI via `--include-ignored`.
+
+- **RO-3** — **MAJOR.** `end_on_empty_stack_is_a_silent_noop_in_release`
+  (`observer.rs:992-1014`) early-returns on `cfg!(debug_assertions)`,
+  which is **always** true under the default `cargo test`. The
+  test therefore executes only its `if cfg!(debug_assertions)`
+  arm — i.e. it does nothing. The CI doesn't run
+  `cargo test --release` (the workflow only runs `cargo test
+  --all`), so the release-mode silent-noop contract on
+  `end_with_snapshots` has **zero** automated coverage. The
+  test passes via vacuous truth.
+  - **Suggestion:** restructure the test so the release
+    behaviour is reachable from debug builds. Two options:
+    1. Replace the `debug_assert!` in `end_with_snapshots`
+       with a runtime-toggleable counter that the test reads
+       (e.g., a `#[cfg(any(test, feature = "...")]
+       AtomicUsize`). Then a normal debug `cargo test` exercises
+       the silent-noop path.
+    2. Extract the post-pop logic into a separate function that
+       takes `Option<CallFrame>` and exercise the `None` arm
+       directly; keep the `debug_assert!` in the caller for
+       in-place callers.
+    Option 2 is the smaller delta and gives the test back its
+    point.
+
+- **RO-4** — **MAJOR.** `zend_string_to_str`
+  (`observer.rs:257-265`) returns `None` when the bytes are not
+  valid UTF-8. The PHP filename surface is **not** UTF-8 on
+  Linux — filesystem paths are arbitrary bytes, and a project
+  with non-ASCII characters in a path that doesn't normalise to
+  UTF-8 will have its `file` field disappear. `categorise` then
+  falls back to `file: ""`, and the closure-vs-function
+  precedence rule depends on whether `filename.is_some()` —
+  which it isn't after the silent drop, so a non-UTF-8-file
+  closure routes to the function branch instead. Two distinct
+  closures in two non-UTF-8 files collapse into the same
+  `Function { file: Arc::from(""), function: Arc::from(name),
+  line: 0 }` key once `function_name` is also lost. End result:
+  per-call counts in the dictionary undercount distinct
+  functions for the affected files, and the wire layer (Phase
+  3) sees a malformed picture without any signal that
+  conversion happened.
+  - **Suggestion:** use `String::from_utf8_lossy(&slice).into_owned()`
+    (returning `Cow<'a, str>`) so non-UTF-8 bytes become the
+    Unicode replacement character `U+FFFD` rather than vanishing.
+    The categorisation then sees a present-but-corrupted name,
+    and dictionary collisions still happen for distinct paths
+    only when their normalised forms match (rare). Alternatively
+    return `Option<&'a [u8]>` and let the categoriser decide —
+    but that bleeds non-UTF-8 into the rest of the recorder,
+    which the §4.2 wire format will reject.
+  - **Test gap:** there is no test for non-UTF-8 file/function
+    paths today. Add one against `zend_string_to_str` with a
+    fabricated `zend_string` whose payload is `[0xFF, 0xFF]`,
+    asserting the chosen behaviour.
+
+- **RO-5** — **MAJOR.** `categorise` (`observer.rs:298-366`)
+  papers over Zend reporting gaps with `unwrap_or("(unknown)")`
+  / `unwrap_or("(anonymous)")` placeholder strings, then builds
+  the `FunctionKey` from those placeholders. Every distinct
+  unknown-function reaches the **same** `Internal { name:
+  Arc::from("(anonymous)") }` or `Function { ..., function:
+  Arc::from("(unknown)"), ... }` key. The dictionary then
+  treats them as one call site; `flat_calls.php`-style counts
+  for the affected functions become wrong by exactly that
+  collision factor. RO-4 makes this worse: a UTF-8 drop on a
+  filename collapses the file component to `""` too.
+  - **Suggestion:** the placeholders are operator-debugging
+    aids — give them call-site-distinguishing identity. Cheapest:
+    incorporate the `execute_data` raw pointer as a tiebreaker
+    in the synthesised `function_name`/`file`, e.g.
+    `Arc::from(format!("(unknown)@{:p}", execute_data))`. That
+    collides only on the same Zend reuse of memory, which is
+    rare within one request. Even better: log a one-shot
+    `E_NOTICE` ("php-analyze: encountered a Zend function with
+    no name; falling back to pointer-based identity") so the
+    operator can flag the upstream.
+  - **Alternative:** if the consensus is "Zend never produces
+    this shape", change the `unwrap_or` to an early-return that
+    skips the begin-frame push entirely AND bumps a future
+    drop-counter; the call is then absent from the trace rather
+    than fabricated.
+  - **Test gap:** the existing
+    `categorise_handles_missing_line_and_missing_file_gracefully`
+    test asserts the **shape** of the placeholder fallback but
+    doesn't assert against collision (it creates exactly one
+    such call). Adding a test that categorises two distinct
+    `info` values with the same placeholder shape and observes
+    they collide would surface the bug and document the
+    deliberate decision (whichever way it goes).
+
+- **RO-6** — **MAJOR.** `Recorder::begin_handler`
+  (`observer.rs:387-400`) captures the snapshots **before**
+  checking whether a `Trace` exists in the thread-local slot.
+  When the slot is empty — which happens for every observer
+  fire between `MINIT` and the first `RINIT`, and for any future
+  out-of-request fire — the cost is wasted: one
+  `clock_gettime(CLOCK_MONOTONIC)`, one `getrusage(RUSAGE_THREAD)`,
+  one `zend_memory_usage(true)`, AND the `extract_fcall_info`
+  pointer-walk. The module doc comment specifically calls out
+  why `should_observe` returns `true` unconditionally (so PHP
+  doesn't cache `false` for slot-empty fires), which guarantees
+  every observed function hits this code path at MINIT-time on
+  first sight. The same applies in reverse at `end_handler`.
+  - **Suggestion:** check slot presence first; capture only
+    when there's somewhere for the data to go:
+    ```rust
+    fn begin_handler(&self, execute_data: &ExecuteData) {
+        // Avoid the syscall trio when there's no trace to fill.
+        let has_trace = CURRENT_TRACE.with(|s| s.borrow().is_some());
+        if !has_trace { return; }
+        let info = unsafe { extract_fcall_info(execute_data) };
+        let snapshots = EntrySnapshots::capture_now();
+        with_current_trace(|trace| {
+            let categorised = categorise(&info);
+            begin_with_snapshots(trace, &categorised, snapshots);
+        });
+    }
+    ```
+    The double-borrow is cheap (the second `borrow_mut` only
+    contends with the first if the recorder ever re-enters,
+    which it doesn't). Alternatively, fuse the check and the
+    work into a single closure call by deferring the snapshot
+    capture into the closure body:
+    ```rust
+    with_current_trace(|trace| {
+        let info = unsafe { extract_fcall_info(execute_data) };
+        let snapshots = EntrySnapshots::capture_now();
+        let categorised = categorise(&info);
+        begin_with_snapshots(trace, &categorised, snapshots);
+    });
+    ```
+    This adds two-Zend-deref's worth of latency between PHP's
+    observer-fire and the wall-clock read, which is the
+    accuracy concern; the design notes don't quantify how much
+    that matters for slice 2.
+
+### Nitpicks (suggestions, no fix required)
+
+- **RO-7** — **MINOR.** `EntrySnapshots::capture_now` reads
+  CPU *before* monotonic; `ExitSnapshots::capture_now` likewise
+  reads CPU before monotonic. The cpu_window for one call is
+  therefore `T_cpu_in → T_cpu_out`; the wall_window is
+  `T_wall_in → T_wall_out`. Since both `T_cpu_*` precede their
+  respective `T_wall_*`, the cpu window is **shifted left** of
+  the wall window, not contained in it. The principled order
+  for "CPU should not exceed wall" is: wall first on entry
+  (`T_wall_in < T_cpu_in`), CPU first on exit (`T_cpu_out <
+  T_wall_out`) — so the cpu window strictly sits inside the
+  wall window and `cpu_delta ≤ wall_delta` is guaranteed by
+  ordering. The saturating-sub `max(0)` in `end_with_snapshots`
+  defends against measurement skew already, so the practical
+  impact is small, but the asymmetry is a footgun for a future
+  reader debugging "why does cpu exceed wall sometimes".
+  - **Suggestion:** flip the order inside `EntrySnapshots::capture_now`
+    (wall, then cpu, then mem) and keep `ExitSnapshots::capture_now`
+    the same — or vice versa. Document the chosen direction in the
+    type doc comment. Costless; pure ordering.
+
+- **RO-8** — **MINOR.** `bootstrap::read_hostname` runs
+  `gethostname(3)` plus a `Vec<u8>` allocation on every
+  `RINIT`. The host name is constant for the life of the
+  process. On a long-lived FPM worker handling thousands of
+  requests, that's thousands of redundant syscalls + allocations.
+  - **Suggestion:** cache once via `OnceLock<Arc<str>>` populated
+    in `bootstrap::startup` (MINIT) or lazily on first read.
+    `RequestIdentity::host` can then become a clone of the
+    cached `Arc<str>`. The structure already uses `Arc<str>` for
+    `host`, so the swap is local.
+  - **Side benefit:** the slice-3 `dropped_records` accounting
+    will want every RINIT to be as cheap as possible to keep
+    the "extension disabled" comparison fair.
+
+- **RO-9** — **MINOR.** `bootstrap.rs:281`'s
+  `buf.as_mut_ptr().cast::<i8>()` hard-codes `c_char = i8`,
+  which holds on Linux x86_64 but breaks on aarch64 where
+  `c_char = u8`. The crate is x86_64-only per
+  `SPECIFICATION.md` §7.4, so the code compiles on the
+  supported target — but a future aarch64 target lift will hit
+  a type mismatch under `clippy::cast_sign_loss` or similar.
+  - **Suggestion:** use `buf.as_mut_ptr().cast::<libc::c_char>()`.
+    Same generated assembly on x86_64, portable across
+    `c_char` flavours, no clippy adjustment needed if the
+    project ever broadens its target.
+
+- **RO-10** — **MINOR.** `BootObserver::Disabled`'s
+  `begin`/`end` arms are empty match-arms (`observer.rs:553-565`).
+  Because the same variant's `should_observe` returns `false`,
+  PHP caches "don't observe" per unique function on first sight
+  — so `begin` / `end` for `Disabled` are unreachable after the
+  first call to `should_observe`. The arms are defensive but
+  also dead code in steady state.
+  - **Suggestion:** if you want to keep them as documentation,
+    add an inline comment explaining "should_observe → false
+    means these arms are only reached for the first per-function
+    fire, then never again". If you'd rather lean on the
+    invariant, leave the empty match arm; clippy doesn't flag
+    it. Either is fine. The current shape is correct; the
+    comment is what's missing.
+
+- **RO-11** — **MINOR.** `tests/php-recorder/run.sh:45`
+  unconditionally invokes `cargo build -p php-analyze --features
+  recorder-dump` on every fixture invocation. Cargo no-ops when
+  up-to-date, but the no-op still spawns the build script and
+  walks the dep graph (~200ms on a warm cache). Across three
+  fixtures × two PHP versions in CI = six redundant builds per
+  matrix entry.
+  - **Suggestion:** the Rust integration test
+    (`recorder_observer.rs`) already iterates over the
+    fixtures; have the test invoke `cargo build` once via
+    `Command::new(env!("CARGO")).args([...])` before the
+    fixture loop, and have `run.sh` skip the build step if the
+    cdylib exists. The shell harness becomes "stage the ini
+    file, run PHP, report" only.
+  - **Alternative:** put `cargo build --features recorder-dump`
+    in CI explicitly before the test step (the workflow has a
+    dedicated `cargo build --features recorder-dump` step
+    already at line 86; let `run.sh` lean on it being run
+    first, or have `run.sh` guard the build with a
+    `[[ -f "$CDYLIB" ]] || cargo build …`).
+
+- **RO-12** — **MINOR.** `recorder::dump::write_trace_if_path_set`
+  (`dump.rs:59-66`) swallows I/O errors via `eprintln!`. Under
+  `cargo test`, stderr is captured per-test and only printed on
+  failure — so a dump-file write that silently fails would not
+  surface in the test output unless the test also asserts on
+  the dump's existence (which `run.sh` does via the
+  `RSHUTDOWN:` marker check). Robust by design, but the
+  `eprintln!` is misleading: it suggests the operator will see
+  the error, when in `cargo test` they will not.
+  - **Suggestion:** when `cfg!(test)` is true, replace
+    `eprintln!` with a `panic!` so the test fails loudly. The
+    `dump` module is already `#[cfg(feature = "recorder-dump")]`,
+    so the test-only escalation costs nothing in production
+    builds.
+  - **Alternative:** return the `io::Result` from
+    `write_trace_if_path_set` and have the caller in
+    `rshutdown_release_trace` decide what to do (current
+    callers ignore it).
+
+- **RO-13** — **NIT.** `Recorder::end_handler`'s arguments are
+  named `_execute_data: &ExecuteData, _retval: Option<&Zval>`
+  (`observer.rs:405`). The matching `FcallObserver::end` impl
+  at `observer.rs:429-431` names them `execute_data, retval`
+  (no leading underscore). The two names refer to the same
+  parameter through the dispatch indirection; consistency would
+  ease grep-readability. Pick one convention crate-wide
+  (`_execute_data` is the clippy-canonical form for an unused
+  parameter; in trait impls the underscore is conventionally
+  dropped because the parameter is part of the trait
+  signature).
+
+- **RO-14** — **NIT.** `dump.rs:64`'s
+  `eprintln!("recorder::dump: failed to write {:?}: {err}", path)`
+  uses the `Debug` formatter on `PathBuf`. For paths containing
+  unusual characters this prints the escaped form, which is
+  fine for diagnostics, but most operator-facing log lines in
+  this crate use `Display` (`{}`). Trivial style alignment;
+  swap `{:?}` to `{}` if you want consistency.
+
+### Positive highlights
+
+- **`with_current_trace` accessor design** (`observer.rs:112-114`)
+  — a single named entry point for "borrow the thread-local
+  trace mutably" with a clear contract documented at the call
+  site. The non-recursive borrow invariant is stated up front
+  and the `RefCell` panic is reframed as a bug-signal rather
+  than something to defend against. Slice-3's depth/cap
+  enforcement should plug into this accessor without growing
+  the surface.
+
+- **`TraceGuard` test pattern** (`observer.rs:654-667`) —
+  using `Drop` to reset the thread-local on test unwind is
+  exactly the right shape for test hygiene when a panic
+  inside a test body might otherwise leave global state
+  populated for the next test on the same thread. Future
+  recorder tests should reuse this guard.
+
+- **`BootObserver` enum-dispatch over trait object** —
+  picking variants at MINIT and dispatching via a
+  `match self` over the three variants is faster than a
+  `Box<dyn FcallObserver>` (one discriminant load and a
+  jump-table vs. an indirect virtual call), AND it makes the
+  set of possible runtime configurations exhaustively
+  visible in the source. Resist any future refactor that
+  hides this behind dynamic dispatch.
+
+- **`RequestIdentity` struct replacing four positional args**
+  — the slice-1 RS-8 finding asked for exactly this and the
+  follow-through is clean (named-field construction at the
+  one non-test caller; clone-friendly `Debug + Clone`
+  derives; doc comment explicitly cites the rationale).
+  Documented in C-7 / the spec amendment too.
+
+- **`recorder-dump` Cargo feature** — making the diagnostic
+  module strictly opt-in keeps the production cdylib smaller
+  AND prevents a future change from accidentally calling
+  `write_trace_if_path_set` from a non-test path. The feature
+  gate, the `pub(crate)` `new_entries_for_dump` accessor on
+  `Dictionary`, and the conditional re-exports in
+  `recorder/mod.rs` all line up consistently.
+
+- **The integration harness handles module-API mismatch
+  gracefully** — `run.sh`'s `module API`-grep exit-77 plus
+  `recorder_observer.rs`'s per-binary skip iteration is the
+  right shape for a multi-PHP test matrix; the CI workflow
+  pins the matching `php-config` per matrix entry so both
+  paths actually get exercised in the binding-evidence CI
+  run.
+
+- **`C-7` / `C-8` deviation notes** — both close the PHP-8.3
+  follow-up from C-5 and document the `FcallObserver::end`
+  API surprise that was raised against the wrong upstream
+  signature. The narrative reads as "we discovered the real
+  API late, amended the design, and the implementation
+  matches" — exactly what `COMMENTS.md` is for.
+
+### Specification compliance
+
+- ✅ §3.1 Bootstrapper — `RINIT` allocates the `Trace`, `RSHUTDOWN`
+  releases it; `MINFO`/`MSHUTDOWN` unchanged from Phase 1.
+- ✅ §3.2 Recorder — begin/end handlers wired; per-call
+  metrics captured per OQ-8 / amended §3.2 (RUSAGE_THREAD);
+  exception detection via `ExecutorGlobals::has_exception()`
+  (deviation C-8).
+- ✅ §4.1 in-memory types — `RequestIdentity` added per RS-8;
+  `Trace::new` single-arg; mutable state stays `pub(crate)`
+  behind accessors.
+- ⚠️ §3.2 AC-RC-1 ("exactly N records modulo `max_depth` /
+  `buffer_cap_bytes` drops") — slice 2 explicitly defers
+  `max_depth` and `buffer_cap_bytes` to slice 3. Acceptable.
+- ⚠️ §3.2 AC-RC-3 (recursive >max_depth → no crash, overflow
+  counted) — also deferred to slice 3.
+- ⚠️ §8.3 NFR-REL-1 / AD-4 (silent-disable, never crash PHP)
+  — see RO-1: the `assert!`-in-`rinit` and downstream
+  syscall asserts can abort the worker. This is the primary
+  hard finding.
+- ⚠️ §3.2 AC-RC-4 (after RSHUTDOWN the per-trace state is
+  deallocated) — slice 2 discards the buffer at RSHUTDOWN
+  pending Phase 4's shipper handoff (documented in the
+  `rshutdown_release_trace` doc comment). The discard works
+  as advertised; coverage is via the `RSHUTDOWN:` marker in
+  the dump.
+- ⚠️ §3.2 AC-RC-5 ("Hot path performs zero heap allocations
+  in steady state") — slice 2 still allocates two `String`s
+  per dictionary miss in `begin_with_snapshots`
+  (`observer.rs:454-468`), correctly flagged inline as "do
+  not copy this shape into Phase 5". Acceptable for slice 2;
+  the comment is the right output.
+
+### Overall recommendation
+
+**REQUEST CHANGES.** The branch is structurally sound and
+the tests landed are strong, but **RO-1** is a direct hit on
+NFR-REL-1: the `assert!` in `rinit_allocate_trace` will
+crash PHP rather than self-disable on a recoverable
+condition. **RO-2** and **RO-3** are test-coverage holes
+that quietly pass today; both are cheap to fix on this
+branch. **RO-4** and **RO-5** are correctness defenses
+against malformed Zend reporting that the wire format
+(Phase 3) cannot tolerate. **RO-6** is the cheapest perf
+fix in the set. **RO-7** through **RO-14** are
+deferrable.
+
+The cleanest path is to land **RO-1**, **RO-2**, **RO-3**,
+**RO-4**, **RO-5**, **RO-6** on this branch as a fix-round
+(same OpenSpec change, per the precedent set by earlier
+slices' round-1 fix commits), and queue the rest as
+follow-ups:
+
+- `recorder-rinit-catch-unwind` — RO-1 (catch_unwind +
+  debug_assert downgrade).
+- `recorder-observer-test-cleanups` — RO-2 + RO-3 (replace
+  exit-77 with return; restructure release-mode test to be
+  reachable from debug).
+- `recorder-utf8-and-identity-defenses` — RO-4 + RO-5
+  (lossy UTF-8 decode + pointer-tiebreaker on
+  unknown-function fallback).
+- `recorder-skip-snapshots-when-slot-empty` — RO-6.
+- `recorder-clock-ordering` — RO-7 (flip CPU/wall order
+  inside the snapshot constructors).
+- `recorder-cache-hostname` — RO-8.
+- `recorder-portable-c-char` — RO-9.
+- `recorder-bootobserver-disabled-doc` — RO-10.
+- `recorder-driver-build-once` — RO-11.
+- `recorder-dump-loud-failure-in-tests` — RO-12.
+- `recorder-style-cleanups` — RO-13 + RO-14.
+
+Slice 3 (`recorder-depth-and-cap-drops`) does **not** depend
+on any of RO-7 through RO-14, so those can move in parallel
+once RO-1..RO-6 land. RO-1 is the only one that affects the
+NFR-REL-1 posture, so it should be the first commit on the
+fix-round.
+
+---
+
+## C-9: Round-2 review-fix status (branch `feat/recorder-observer-hooks-and-trace-lifecycle`)
+
+**Date:** 2026-05-21
+**Reviewer findings:** RO-1 … RO-14 (see above)
+**Implementer response:** the six MAJOR / CRITICAL findings landed
+on the same branch as a fix-round (per the precedent set by
+`recorder-clocks-and-types`'s round-1 fix-commit `fb459ad` and
+the spike's round-1 fix-commit `2d2fe05`). The eight nitpicks
+(RO-7 … RO-14) are deferred to follow-up changes; the
+review's own follow-up list above is the canonical queue.
+
+### What changed on this branch in the fix-round
+
+| ID | Status | Implementation |
+| --- | --- | --- |
+| RO-1 | Closed | `bootstrap::rinit` / `rshutdown` / `mshutdown` bodies wrapped in `std::panic::catch_unwind` so any downstream panic — including the now-`debug_assert!` pairing check in `rinit_allocate_trace` — is contained at the FFI frame instead of aborting PHP. The previous `assert!` becomes a `debug_assert!`; release builds silently drop the stale `Trace` and install the fresh one. Two tests pin the new contract: the debug-only `double_rinit_without_rshutdown_panics_in_debug_builds` (kept for the loud-in-tests posture) and the release-only `double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds` (proves the recovery path). |
+| RO-2 | Closed | `tests/recorder_observer.rs` replaces `std::process::exit(77)` with `eprintln!(...); return;` so a host without `php8.3`/`php8.4` produces a `cargo test`-recognised pass-as-skip rather than a process-terminating non-zero exit. |
+| RO-3 | Closed | `end_with_snapshots` now delegates the post-pop work to a new helper `finish_call_record(trace, Option<CallFrame>, …)`. The empty-stack contract is testable from a default `cargo test` run by calling `finish_call_record(&mut trace, None, …)` directly; the `debug_assert!` in `end_with_snapshots` remains as the loud-in-tests pairing signal. Two new tests replace the vacuous `cfg!(debug_assertions)` early-return: `finish_call_record_with_no_frame_is_a_silent_noop` and `finish_call_record_with_a_frame_emits_a_record_with_the_frame_fields`. |
+| RO-4 | Closed | `zend_string_to_str` (`Option<&'a str>`) → `zend_string_to_cow` (`Option<Cow<'a, str>>`). Common-case UTF-8 names stay zero-copy; non-UTF-8 payloads become `Cow::Owned(String)` with U+FFFD substituted via `String::from_utf8_lossy`. The intermediate carrier changed from upstream `FcallInfo<'a>` (whose fields are `Option<&'a str>`) to a recorder-owned `RawCallSite<'a>` with `Option<Cow<'a, str>>` fields; `categorise` and `Categorised<'a>::file` were widened to `Cow<'a, str>` to match. Two new tests pin both arms of the helper: `zend_string_to_cow_replaces_invalid_utf8_bytes_with_replacement_char` and `zend_string_to_cow_returns_a_zero_copy_borrow_for_valid_utf8`. |
+| RO-5 | Closed | The synthesised placeholder names `(unknown)` / `(anonymous)` now incorporate the `execute_data` pointer as a tiebreaker via `unknown_placeholder(kind, addr) → "({kind})@0x{hex}"`. Distinct call sites no longer collapse to one `FunctionKey`; the only remaining collision mode is Zend's reuse of the same `execute_data` slot inside one request, which is bounded and recognisable. Two new tests: `categorise_unknown_fallback_uses_execute_data_addr_as_tiebreaker` (function branch) and `categorise_internal_with_no_name_uses_execute_data_addr_tiebreaker` (internal branch). |
+| RO-6 | Closed | `Recorder::begin_handler` and `Recorder::end_handler` now capture clock/CPU/memory snapshots **inside** the `with_current_trace` closure. A slot-empty fire pays only for the `RefCell::borrow_mut` + `Option::as_mut().map` overhead — the `clock_gettime` / `getrusage` / `zend_memory_usage` syscalls are skipped entirely. The existing `recorder_begin_with_no_active_trace_is_a_noop` test's comment was updated to document the new invariant; a direct "no syscall fired" assertion would require a mock-clock layer, which is out of scope for this round. |
+
+### Deferred to follow-up changes (RO-7 … RO-14)
+
+The review's queued list at the bottom of the round-2 note
+above is the canonical follow-up roster. None of them affect
+NFR-REL-1 / NFR-SEC-1 / NFR-MAINT-1; none are blockers for
+slice 3 (`recorder-depth-and-cap-drops`).
+
+### Test-count delta
+
+| Phase | Lib tests | Integration tests | Notes |
+| --- | --- | --- | --- |
+| Slice-2 round-1 (pre-fix) | 96 | 1 (spike) + 1 (recorder, gated) | Baseline after `7e8949a docs: close R-2 for PHP 8.3`. |
+| Slice-2 round-2 (post-fix) | 101 (debug) / 101 (release) | 1 (spike) + 1 (recorder, gated) | +5 tests covering the new RO-1, RO-3, RO-4, RO-5 invariants. RO-2 and RO-6 are exercised via existing tests (skip semantics and slot-empty no-op). |
+
+Gates green on the fix-round branch:
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all`
+- `cargo test --all --features recorder-dump`
+- `cargo test --release --lib` (exercises the release-only `double_rinit_without_rshutdown_replaces_the_stale_trace_in_release_builds` test)
+- `openspec validate recorder-observer-hooks-and-trace-lifecycle`
+
+### Architectural note — `FcallInfo<'a>` → `RawCallSite<'a>`
+
+The RO-4 fix forced a change to the categorise input type:
+`ext_php_rs::zend::FcallInfo<'a>` carries `Option<&'a str>`
+fields, leaving nowhere to store a lossy-decoded `String`
+with the right lifetime. The recorder now owns a
+`RawCallSite<'a>` with `Option<Cow<'a, str>>` fields plus an
+`execute_data_addr: usize` (for RO-5's tiebreaker). The trait
+signatures still take `&FcallInfo` per upstream's contract —
+this is the boundary at which our owned analogue meets the
+upstream borrowed one. If upstream ever widens
+`FcallInfo`'s string fields, `RawCallSite` can collapse back
+into a thin adapter; until then, the local type is the
+correctness substrate.
