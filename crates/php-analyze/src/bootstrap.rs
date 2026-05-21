@@ -241,6 +241,45 @@ fn drain_shipper_if_enabled(config: Option<&Config>) {
         return;
     }
     let _outcome = shipper::drain_and_join_at_mshutdown(config.shutdown_grace);
+    // Drain any drop-notice lines queued by the shipper thread,
+    // including those produced by the final-deadline drain that
+    // `drain_and_join_at_mshutdown` just executed. Runs on the
+    // main PHP thread so `php_error` is sound here.
+    emit_queued_drop_notices();
+}
+
+/// Drain the shipper's `SPECIFICATION.md` §5.2 step-4 drop-notice
+/// queue and feed each line through `php_error(E_NOTICE, ...)`.
+///
+/// Runs on the main PHP thread (from inside the `catch_unwind`
+/// frames of [`rshutdown`] and [`mshutdown`]) so the Zend call is
+/// sound. The shipper itself runs on a background OS thread and
+/// MUST NOT call `php_error` directly — see the queue's module
+/// comment in `crate::shipper`.
+fn emit_queued_drop_notices() {
+    for notice in shipper::drain_drop_notices() {
+        emit_php_notice(&notice);
+    }
+}
+
+/// Production builds dispatch through `ext_php_rs::error::php_error`
+/// at `ErrorType::Notice`. The `cargo test` binary links without a
+/// live PHP runtime, so `php_error_docref` (called transitively by
+/// `php_error`) is unresolvable — the unit-test build replaces this
+/// with a no-op. Integration coverage of the wired-up
+/// `php_error(E_NOTICE, ...)` call lives on
+/// `tests/shipper_round_trip.rs`'s future retry-exhaust scenario
+/// (deferred to the `stub-ingest-configurable-failure` follow-up,
+/// per `COMMENTS.md` SEH-10). The same shim pattern is used by
+/// `spike::emit_spike_log_warning`.
+#[cfg(not(test))]
+fn emit_php_notice(message: &str) {
+    php_error(&ErrorType::Notice, message);
+}
+
+#[cfg(test)]
+fn emit_php_notice(_message: &str) {
+    // Intentionally empty: see the production-path doc comment above.
 }
 
 /// `RINIT` — request startup. Allocates the per-request `Trace` in the
@@ -315,8 +354,24 @@ fn rinit_body() {
 ///
 /// `C` ABI entry point called by Zend at the end of each PHP request.
 pub unsafe extern "C" fn rshutdown(_type_: i32, _module_number: i32) -> i32 {
-    let _ = std::panic::catch_unwind(recorder::rshutdown_release_trace);
+    let _ = std::panic::catch_unwind(rshutdown_body);
     0
+}
+
+/// Pure-Rust body of [`rshutdown`]. Releases the recorder's
+/// per-request `Trace` and drains any drop-notice lines queued by
+/// the shipper thread since the previous request boundary. Both
+/// steps run on the main PHP thread; `emit_queued_drop_notices`
+/// requires this (the shipper background thread MUST NOT call
+/// `php_error` itself).
+///
+/// If `recorder::rshutdown_release_trace` panics the outer
+/// `catch_unwind` swallows it and the drop-notice drain is skipped
+/// for this request — the queue is a `Mutex<VecDeque>` so the
+/// notices remain visible to the next request's drain.
+fn rshutdown_body() {
+    recorder::rshutdown_release_trace();
+    emit_queued_drop_notices();
 }
 
 /// Build a [`RequestIdentity`] from live SAPI state. Reads the SAPI

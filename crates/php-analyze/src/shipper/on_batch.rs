@@ -87,6 +87,19 @@ pub(crate) trait OnBatch: Send {
         records_in_batch: usize,
         deadline: Option<Instant>,
     ) -> OnBatchOutcome;
+
+    /// The destination URL this handler POSTs to, for inclusion in
+    /// the `SPECIFICATION.md` §5.2 `E_NOTICE` drop line. The default
+    /// returns `None` so test fakes (e.g. [`RecordingOnBatch`]) do
+    /// not need to invent a URL; the production
+    /// [`crate::shipper::http::RmpEncodeAndHttpPost`] impl overrides
+    /// it to expose `&self.server_url.as_str()`. The bearer token
+    /// MUST NOT be exposed through this accessor (AC-SH-4); URLs
+    /// have no slot for the token, so the invariant holds by
+    /// construction.
+    fn server_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// What the recording fake captured for one `handle` call. Tests pull
