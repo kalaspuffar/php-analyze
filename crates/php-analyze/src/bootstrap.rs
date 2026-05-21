@@ -9,12 +9,21 @@
 //!   `ExecutorGlobals::ini_values()`, freezes them into [`Config`] through
 //!   [`crate::config::initialise_from_ini`], and logs every returned
 //!   warning at `E_WARNING`. It always returns success so PHP keeps
-//!   starting (AD-4 / NFR-USE-2 silent-disable).
-//! - **`MSHUTDOWN`** is a no-op for this change. The Shipper drain that
-//!   later changes add will live here.
+//!   starting (AD-4 / NFR-USE-2 silent-disable). When the resolved
+//!   [`Config::enabled`] is `true`, it also installs the Phase-4
+//!   shipper channel via [`crate::shipper::install_channel_at_minit`].
+//! - **`MSHUTDOWN`** drains the Phase-4 shipper channel and joins the
+//!   shipper thread (bounded by `Config::shutdown_grace + 200 ms`)
+//!   when the extension is enabled. Disabled extensions take the
+//!   no-op fast path so the silent-disable posture survives (R-10
+//!   `mshutdown-respects-silent-disable` is satisfied here as a side
+//!   benefit).
 //! - **`RINIT` / `RSHUTDOWN`** short-circuit immediately when
 //!   `Config::global().map_or(true, |c| !c.enabled)`. Observer registration
-//!   is out of scope until the recorder change.
+//!   is out of scope until the recorder change. `RINIT` additionally
+//!   asks the shipper module to lazy-spawn its thread on the first
+//!   per-process invocation (fork-safe per `SPECIFICATION.md` §3.4 /
+//!   AD-4 / R-10).
 //! - **`MINFO`** renders the resolved configuration. `auth_token` is
 //!   *never* rendered from the [`secrecy::SecretString`] plaintext; the
 //!   row is literally the string `"***"`. As belt-and-suspenders, the
@@ -34,6 +43,7 @@ use ext_php_rs::{info_table_end, info_table_header, info_table_row, info_table_s
 use crate::config::{initialise_from_ini, Config, DisableReason, RawIni, TokenSource};
 use crate::recorder::types::TraceLimits;
 use crate::recorder::{self, RequestIdentity};
+use crate::shipper;
 
 // --- Directive table -------------------------------------------------------
 
@@ -153,7 +163,41 @@ pub fn startup(_type_: i32, module_number: i32) -> i32 {
         php_error(&ErrorType::Warning, &warning.to_string());
     }
 
+    // Install the Phase-4 shipper channel for enabled extensions only.
+    // The disabled path stays silent — no channel, no thread, no
+    // `MSHUTDOWN` work at process exit (the `shipper::*` slots remain
+    // `None` / `false`).
+    install_shipper_if_enabled(Config::global());
+
     0
+}
+
+/// Pure helper: install the shipper channel iff the resolved config
+/// is enabled. Factored out of [`startup`] so the silent-disable
+/// posture (R-10) can be unit-tested against a hand-built
+/// [`Config`] without touching the [`Config::global`] [`OnceLock`].
+fn install_shipper_if_enabled(config: Option<&Config>) {
+    let Some(config) = config else {
+        return;
+    };
+    if !config.enabled {
+        return;
+    }
+    shipper::install_channel_at_minit(config.shipper_queue_depth);
+}
+
+/// Pure helper: lazy-spawn the shipper thread iff the resolved config
+/// is enabled. Factored out of [`rinit_body`] so the silent-disable
+/// posture can be unit-tested without touching the
+/// [`Config::global`] [`OnceLock`].
+fn spawn_shipper_if_enabled(config: Option<&Config>) {
+    let Some(config) = config else {
+        return;
+    };
+    if !config.enabled {
+        return;
+    }
+    shipper::spawn_if_needed_at_rinit();
 }
 
 /// `MSHUTDOWN` — module shutdown. No-op for this change; later changes
@@ -168,12 +212,35 @@ pub fn startup(_type_: i32, module_number: i32) -> i32 {
 /// path becomes a silent extension-disable rather than a process abort
 /// (RO-1 / NFR-REL-1).
 pub unsafe extern "C" fn mshutdown(_type_: i32, _module_number: i32) -> i32 {
-    let _ = std::panic::catch_unwind(|| {
-        // Slice 2: body is a no-op. The catch_unwind frame exists so
-        // Phase-4's shipper-drain code lands inside the firewall
-        // without a structural change here.
-    });
+    let _ = std::panic::catch_unwind(mshutdown_body);
     0
+}
+
+/// Pure-Rust body of [`mshutdown`]. Honours the silent-disable
+/// posture: a disabled extension never installed a shipper channel,
+/// so this short-circuits without touching the shipper module's
+/// globals at all. R-10 (`mshutdown-respects-silent-disable`) is
+/// satisfied by this guard as a side benefit of Phase 4 slice 1.
+///
+/// Delegates to [`drain_shipper_if_enabled`] so the per-config
+/// branch is unit-testable against a hand-built [`Config`].
+fn mshutdown_body() {
+    drain_shipper_if_enabled(Config::global());
+}
+
+/// Pure helper: drain the shipper iff the resolved config is enabled.
+/// The [`crate::shipper::JoinOutcome`] is discarded in slice 1:
+/// a `Panicked` shipper is silently absorbed; a `Clean(_)` shipper's
+/// counts are not surfaced yet. Slice 3 will introduce an `E_NOTICE`
+/// log line here for the `Panicked` and abandoned-batches paths.
+fn drain_shipper_if_enabled(config: Option<&Config>) {
+    let Some(config) = config else {
+        return;
+    };
+    if !config.enabled {
+        return;
+    }
+    let _outcome = shipper::drain_and_join_at_mshutdown(config.shutdown_grace);
 }
 
 /// `RINIT` — request startup. Allocates the per-request `Trace` in the
@@ -210,7 +277,18 @@ fn rinit_body() {
     let Some(config) = Config::global() else {
         return;
     };
-    if !config.enabled || config.spike_observer {
+    if !config.enabled {
+        return;
+    }
+    // Lazy-spawn the Phase-4 shipper thread on the first per-process
+    // RINIT. Cheap CAS on the steady-state path. The spawn happens
+    // even when the spike is the active observer — the channel was
+    // installed in `startup` because the extension is enabled, and a
+    // spike-only configuration still needs the channel torn down at
+    // MSHUTDOWN. The shipper sits idle (no producer sends anything)
+    // until slice 2 wires the Recorder.
+    spawn_shipper_if_enabled(Some(config));
+    if config.spike_observer {
         return;
     }
     let identity = build_request_identity();
@@ -1096,5 +1174,147 @@ mod tests {
             .find(|(l, _)| l == "php_analyze.auth_token")
             .expect("auth_token row");
         assert_eq!(token_row.1, "***");
+    }
+
+    // --- shipper lifecycle hooks -------------------------------------------
+
+    /// Helper: build a fully-enabled `Config` for the lifecycle
+    /// tests below. Server URL and token are valid so the resolved
+    /// `enabled` is `true`.
+    fn enabled_config_for_lifecycle_tests() -> Config {
+        let raw = RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some("test-token".to_owned()),
+            ..RawIni::default()
+        };
+        Config::from_ini_values(&raw).0
+    }
+
+    /// Helper: build a `Config` whose `enabled` is `false` for the
+    /// silent-disable lifecycle tests. Uses the master-switch path
+    /// so no warnings fire (slice-1 R-5 fix-up).
+    fn disabled_config_for_lifecycle_tests() -> Config {
+        let raw = RawIni {
+            enabled: Some(false),
+            ..RawIni::default()
+        };
+        Config::from_ini_values(&raw).0
+    }
+
+    #[test]
+    fn bootstrap_startup_with_disabled_config_does_not_install_the_channel() {
+        // R-10 / NFR-USE-2: a disabled extension must not even
+        // construct the shipper channel. The `Config { enabled: false,
+        // .. }` short-circuit in `install_shipper_if_enabled` is the
+        // sole guard.
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+        let disabled = disabled_config_for_lifecycle_tests();
+        assert!(!disabled.enabled, "disabled fixture sanity");
+        install_shipper_if_enabled(Some(&disabled));
+        assert!(
+            !crate::shipper::sender_is_installed(),
+            "disabled startup must not install the sender"
+        );
+        assert!(
+            !crate::shipper::receiver_is_installed(),
+            "disabled startup must not stash a receiver"
+        );
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn bootstrap_startup_with_enabled_config_installs_the_channel() {
+        // Companion to the disabled test: the enabled path actually
+        // installs the channel at the configured depth.
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+        let enabled = enabled_config_for_lifecycle_tests();
+        assert!(enabled.enabled, "enabled fixture sanity");
+        install_shipper_if_enabled(Some(&enabled));
+        assert!(crate::shipper::sender_is_installed());
+        assert!(crate::shipper::receiver_is_installed());
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn bootstrap_mshutdown_with_disabled_config_is_a_noop() {
+        // R-10 explicitly: mshutdown on a disabled extension must
+        // not even attempt to drain a non-existent channel. The
+        // shipper module's drain function would itself return
+        // `NotInstalled` defensively, but the bootstrap-layer
+        // `!config.enabled` guard is the load-bearing one for the
+        // silent-disable posture.
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+        let disabled = disabled_config_for_lifecycle_tests();
+        // Pre-condition: no shipper state is installed. Calling
+        // drain on a disabled config must keep it that way.
+        assert!(!crate::shipper::sender_is_installed());
+        drain_shipper_if_enabled(Some(&disabled));
+        assert!(!crate::shipper::sender_is_installed());
+        assert!(!crate::shipper::handle_is_installed());
+        assert!(!crate::shipper::spawned_flag());
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn bootstrap_full_lifecycle_with_disabled_config_keeps_shipper_globals_empty() {
+        // Modified `extension-bootstrap` scenario: "Disabled
+        // extension spawns no background threads". Drives all three
+        // lifecycle helpers (`install`, `spawn`, `drain`) against a
+        // disabled config and asserts every shipper slot stays
+        // empty throughout.
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+        let disabled = disabled_config_for_lifecycle_tests();
+
+        install_shipper_if_enabled(Some(&disabled));
+        assert!(!crate::shipper::sender_is_installed(), "after install");
+        assert!(!crate::shipper::receiver_is_installed(), "after install");
+        assert!(!crate::shipper::spawned_flag(), "after install");
+        assert!(!crate::shipper::handle_is_installed(), "after install");
+
+        spawn_shipper_if_enabled(Some(&disabled));
+        assert!(!crate::shipper::sender_is_installed(), "after spawn");
+        assert!(!crate::shipper::receiver_is_installed(), "after spawn");
+        assert!(!crate::shipper::spawned_flag(), "after spawn");
+        assert!(!crate::shipper::handle_is_installed(), "after spawn");
+
+        drain_shipper_if_enabled(Some(&disabled));
+        assert!(!crate::shipper::sender_is_installed(), "after drain");
+        assert!(!crate::shipper::receiver_is_installed(), "after drain");
+        assert!(!crate::shipper::spawned_flag(), "after drain");
+        assert!(!crate::shipper::handle_is_installed(), "after drain");
+
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn bootstrap_full_lifecycle_with_enabled_config_installs_spawns_and_drains() {
+        // Companion to the disabled-lifecycle test: the enabled
+        // path drives all three steps end-to-end and verifies the
+        // shipper thread starts and joins cleanly. This is the
+        // closest-to-PHP-free integration test for the §7 wiring.
+        let _guard = crate::shipper::acquire_test_lock();
+        crate::shipper::reset_for_test();
+        let enabled = enabled_config_for_lifecycle_tests();
+
+        install_shipper_if_enabled(Some(&enabled));
+        assert!(crate::shipper::sender_is_installed());
+        assert!(crate::shipper::receiver_is_installed());
+
+        spawn_shipper_if_enabled(Some(&enabled));
+        assert!(crate::shipper::spawned_flag());
+        assert!(crate::shipper::handle_is_installed());
+
+        drain_shipper_if_enabled(Some(&enabled));
+        // After drain, the slots are taken-and-dropped; the
+        // shipper has joined.
+        assert!(!crate::shipper::sender_is_installed());
+        assert!(!crate::shipper::handle_is_installed());
+
+        crate::shipper::reset_for_test();
     }
 }
