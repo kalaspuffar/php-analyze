@@ -46,7 +46,8 @@
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::time::Duration;
 
 use php_analyze::wire;
@@ -239,25 +240,28 @@ impl StubProcess {
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
 
-        // Read the `bound:` and `ready` lines from stdout. The stub's
-        // bind protocol guarantees these arrive in that order with
-        // flushes between. A 5-second read budget is plenty on
-        // loopback; if the stub hangs, we want to fail loudly rather
-        // than block `cargo test`.
+        // Read the `bound:` and `ready` lines from stdout under a
+        // 5-second hard cap. The stub's bind protocol guarantees the
+        // two lines arrive in that order with flushes between; if
+        // the stub hangs we want to fail loudly with a clear panic
+        // rather than block `cargo test`.
         let stdout = child
             .stdout
             .take()
             .expect("stub-ingest stdout was requested as piped");
-        let mut reader = BufReader::new(stdout);
-        let port = read_bound_port(&mut reader);
-        let ready_line = read_one_line(&mut reader);
-        assert_eq!(ready_line.trim(), "ready", "stub did not print `ready`");
-
-        // The reader is dropped here, closing our end of the stdout
-        // pipe. The stub continues writing to stdout (it won't, by
-        // contract — stdout is silent after `ready`); on Linux,
-        // writes to a closed pipe SIGPIPE the writer, but the stub
-        // doesn't write again so this is moot.
+        let port = match handshake_with_timeout(stdout, Duration::from_secs(5)) {
+            Ok(port) => port,
+            Err(msg) => {
+                // Kill the child eagerly so the worker thread's
+                // pending `read_line` returns EOF and exits, rather
+                // than waiting for `StubProcess::Drop` (which the
+                // panic below would trigger but only after stack
+                // unwinding settles).
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stub-ingest handshake: {msg}");
+            }
+        };
         Self { child, port }
     }
 
@@ -290,52 +294,68 @@ impl Drop for StubProcess {
     }
 }
 
-fn read_bound_port(reader: &mut BufReader<std::process::ChildStdout>) -> u16 {
-    let line = read_one_line(reader);
+/// Read the stub's two handshake lines (`bound: <addr>` then `ready`)
+/// under a wall-clock budget. Returns the parsed port on success, an
+/// error message on any failure shape.
+///
+/// Implementation: the read happens on a worker thread; the test
+/// thread waits on a `sync_channel(1).recv_timeout(timeout)`. On
+/// timeout the test thread returns an error; the caller is expected
+/// to `child.kill()` so the worker's pending `read_line` returns EOF
+/// and the worker exits. This is the "worker + recv_timeout" idiom
+/// recommended over a `std::process::exit(137)` watchdog, which
+/// would tear down the entire `cargo test` process unconditionally
+/// (SEH-1 round-2 review fix).
+fn handshake_with_timeout(stdout: ChildStdout, timeout: Duration) -> Result<u16, String> {
+    let (tx, rx) = sync_channel::<Result<u16, String>>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(read_handshake(stdout));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(format!("readline timeout after {timeout:?}")),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("worker thread exited without sending a result".to_string())
+        }
+    }
+}
+
+fn read_handshake(stdout: ChildStdout) -> Result<u16, String> {
+    let mut reader = BufReader::new(stdout);
+    let mut bound = String::new();
+    let bytes = reader
+        .read_line(&mut bound)
+        .map_err(|e| format!("read bound line: {e}"))?;
+    if bytes == 0 {
+        return Err("stub stdout closed before `bound:`".to_string());
+    }
+    let port = parse_bound_line(&bound)?;
+    let mut ready = String::new();
+    let bytes = reader
+        .read_line(&mut ready)
+        .map_err(|e| format!("read ready line: {e}"))?;
+    if bytes == 0 {
+        return Err("stub stdout closed before `ready`".to_string());
+    }
+    if ready.trim() != "ready" {
+        return Err(format!("expected `ready`, got {:?}", ready.trim()));
+    }
+    Ok(port)
+}
+
+/// Parse a `bound: 127.0.0.1:NNNNN` stdout line and return the port.
+/// Factored out for unit-test reach.
+fn parse_bound_line(line: &str) -> Result<u16, String> {
     let trimmed = line.trim();
-    // Expected shape: `bound: 127.0.0.1:NNNNN`.
     let addr = trimmed
         .strip_prefix("bound: ")
-        .unwrap_or_else(|| panic!("stub `bound:` line malformed: {trimmed:?}"));
+        .ok_or_else(|| format!("`bound:` line malformed: {trimmed:?}"))?;
     let port = addr
         .rsplit(':')
         .next()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or_else(|| panic!("stub bound addr has no port: {addr:?}"));
-    port
-}
-
-fn read_one_line(reader: &mut BufReader<std::process::ChildStdout>) -> String {
-    // 5-second hard cap on the readline so a hung stub doesn't hang
-    // `cargo test`. `BufRead::read_line` itself has no timeout
-    // primitive in std, so we spawn a watchdog thread that kills the
-    // test after the deadline. The watchdog uses `std::process::exit`
-    // because there's no portable way to interrupt a blocked
-    // `read_line`; this is a test-only escape hatch.
-    let deadline = Duration::from_secs(5);
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(deadline);
-        eprintln!(
-            "shipper_round_trip: stub stdout readline timeout ({:?}); aborting",
-            deadline
-        );
-        std::process::exit(137);
-    });
-
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .unwrap_or_else(|e| panic!("read stub stdout: {e}"));
-    if bytes == 0 {
-        panic!("stub stdout closed before producing a line");
-    }
-    // The watchdog detaches when the test naturally exits — but
-    // `cargo test` runs each test in the same process, so we let it
-    // sit until the deadline. The `std::process::exit(137)` only
-    // fires if a different test hangs more than 5s on its own
-    // stdout readline. In practice this won't fire.
-    drop(handle);
-    line
+        .ok_or_else(|| format!("bound addr has no port: {addr:?}"))?;
+    Ok(port)
 }
 
 fn mentions_module_api_mismatch(buf: &[u8]) -> bool {
