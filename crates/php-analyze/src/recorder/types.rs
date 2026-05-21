@@ -207,6 +207,24 @@ pub enum ShipperMessage {
     Drain { deadline: Instant },
 }
 
+/// Per-request identity values plumbed from `bootstrap::rinit` into
+/// [`Trace::new`].
+///
+/// Collapses what used to be four positional parameters on `Trace::new`
+/// (`host`, `sapi`, `pid`, `uri_or_script`) into one struct. Two
+/// `Arc<str>` arguments sandwiching a `u32` made the original signature
+/// vulnerable to a silent swap at the call site; named-field
+/// construction at the only non-test caller (`bootstrap::rinit`)
+/// removes the class of bug. See review finding RS-8 and slice-2
+/// proposal §D-4 / `recorder-call-events` spec for the rationale.
+#[derive(Debug, Clone)]
+pub struct RequestIdentity {
+    pub host: Arc<str>,
+    pub sapi: Arc<str>,
+    pub pid: u32,
+    pub uri_or_script: String,
+}
+
 /// Per-request recorder state, owned by the PHP request thread.
 ///
 /// Mirrors `SPECIFICATION.md` §4.1.2 with two implementation choices
@@ -274,7 +292,13 @@ impl Trace {
     /// arrives in Phase 4. `start_time_realtime_ns` is captured here, at
     /// construction, because the recorder needs the request anchor as
     /// early as possible and `clocks::realtime_now_ns` is cheap.
-    pub fn new(host: Arc<str>, sapi: Arc<str>, pid: u32, uri_or_script: String) -> Self {
+    pub fn new(identity: RequestIdentity) -> Self {
+        let RequestIdentity {
+            host,
+            sapi,
+            pid,
+            uri_or_script,
+        } = identity;
         Self {
             trace_id: [0; 16],
             start_time_realtime_ns: clocks::realtime_now_ns(),
@@ -421,14 +445,26 @@ mod tests {
         }
     }
 
+    /// Build a `RequestIdentity` from string literals. Centralises the
+    /// boilerplate so tests stay readable; one slice-2-and-later caller
+    /// fills in `Trace::new`'s only argument.
+    fn sample_identity(host: &str, sapi: &str, pid: u32, uri_or_script: &str) -> RequestIdentity {
+        RequestIdentity {
+            host: Arc::from(host),
+            sapi: Arc::from(sapi),
+            pid,
+            uri_or_script: uri_or_script.to_owned(),
+        }
+    }
+
     #[test]
     fn trace_new_produces_the_documented_initial_state() {
-        let trace = Trace::new(
-            Arc::from("host.example"),
-            Arc::from("cli"),
+        let trace = Trace::new(sample_identity(
+            "host.example",
+            "cli",
             12345,
-            "/path/to/script.php".to_owned(),
-        );
+            "/path/to/script.php",
+        ));
 
         assert_eq!(trace.trace_id, [0u8; 16]);
         assert_eq!(trace.pid, 12345);
@@ -463,7 +499,7 @@ mod tests {
 
     #[test]
     fn trace_next_call_id_is_monotonic_from_one() {
-        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
         let ids: Vec<u64> = (0..5).map(|_| trace.next_call_id()).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(trace.call_id_seq, 5);
@@ -471,7 +507,7 @@ mod tests {
 
     #[test]
     fn trace_push_record_appends_to_buffer_and_bumps_the_estimate_by_64() {
-        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
         let before = trace.buffer_estimated_bytes;
         trace.push_record(sample_call_record());
         assert_eq!(trace.buffer.len(), 1, "buffer must hold the new record");
@@ -484,7 +520,7 @@ mod tests {
 
     #[test]
     fn trace_push_dict_entry_via_intern_bumps_estimate_only_on_a_miss() {
-        let mut trace = Trace::new(Arc::from("host"), Arc::from("cli"), 1, "/s.php".to_owned());
+        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
 
         let key = FunctionKey::Internal {
             name: Arc::from("strlen"),
@@ -558,6 +594,26 @@ mod tests {
         // Empty inputs collapse to zero — the §3.2 formula has no
         // constant offset beyond what each entry contributes.
         assert_eq!(estimate_batch_bytes(&[], &[]), 0);
+    }
+
+    #[test]
+    fn request_identity_round_trips_through_trace_new() {
+        // Slice-2 contract: every `RequestIdentity` field surfaces on
+        // the returned `Trace` unchanged. The test deliberately uses
+        // values distinct from the slice-1 baseline so a copy-paste
+        // regression that hard-coded the old defaults would be caught.
+        let identity = RequestIdentity {
+            host: Arc::from("worker-42.prod"),
+            sapi: Arc::from("fpm-fcgi"),
+            pid: 4242,
+            uri_or_script: "/srv/app/index.php?route=/api/v1/users".to_owned(),
+        };
+        let trace = Trace::new(identity.clone());
+
+        assert_eq!(&*trace.host, &*identity.host);
+        assert_eq!(&*trace.sapi, &*identity.sapi);
+        assert_eq!(trace.pid, identity.pid);
+        assert_eq!(trace.uri_or_script, identity.uri_or_script);
     }
 
     #[test]
