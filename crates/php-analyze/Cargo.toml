@@ -83,6 +83,12 @@ tempfile = "3"
 # raw-bytes encoder by hand. It is *not* part of the production crate's
 # closure — the Phase-4 shipper uses `rmp-serde` directly.
 rmpv = "1"
+# `serde_json` decodes the `/debug/batches` JSON response from
+# `stub-ingest` in the Phase-4 slice-3 integration test
+# (`tests/shipper_round_trip.rs`). The stub itself depends on
+# `serde_json` to produce that JSON; we depend on it here to consume
+# it. Not in the production closure — production uses MessagePack.
+serde_json = "1"
 
 [features]
 # Diagnostic-only: enables a `recorder::dump` module that writes the
