@@ -41,6 +41,8 @@
 //! drops it. The "process-global Sender" spec wording is preserved;
 //! only the container type differs. Recorded in `COMMENTS.md` C-13.
 
+mod encode;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
