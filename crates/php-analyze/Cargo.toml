@@ -46,5 +46,14 @@ libc = "0.2"
 # Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
 tempfile = "3"
 
+[features]
+# Diagnostic-only: enables a `recorder::dump` module that writes the
+# discarded buffer at `RSHUTDOWN` to the path named by the
+# `PHP_ANALYZE_DUMP_PATH` env var. Used exclusively by the slice-2
+# integration tests under `tests/php-recorder/`. Default builds (no
+# features) ship no dump code in the cdylib. The feature disappears in
+# Phase 4 when the shipper replaces the discard with a `try_send`.
+recorder-dump = []
+
 [lints]
 workspace = true

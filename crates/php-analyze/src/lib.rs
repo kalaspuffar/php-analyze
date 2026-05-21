@@ -18,14 +18,16 @@
 //! - [`config`] — parses, validates, range-clamps, and freezes the
 //!   `php_analyze.*` directives into an immutable [`Config`] global at
 //!   `MINIT`. Pure-Rust; testable without PHP headers.
-//! - [`recorder`] — per-trace in-memory data model (`Trace`, `CallFrame`,
-//!   `CallRecord`, `DictEntry`, …) and the function-dictionary interner
-//!   (`Dictionary`). Pure-Rust substrate; the `FcallObserver` wiring
-//!   that drives it arrives in a follow-up change.
+//! - [`recorder`] — per-trace in-memory data model (`Trace`,
+//!   `CallFrame`, `CallRecord`, `DictEntry`, …), the function-
+//!   dictionary interner (`Dictionary`), the production `Recorder`
+//!   (`FcallObserver` impl), the `BootObserver` dispatcher, and the
+//!   `RINIT`/`RSHUTDOWN` lifecycle entry points.
 //! - [`spike`] — Phase-0 spike: an `FcallObserver` that logs every
 //!   begin/end event to a configurable destination. Off by default
-//!   (`php_analyze.spike_observer = 0`). Removed by Phase 2's Recorder
-//!   change.
+//!   (`php_analyze.spike_observer = 0`). Reached only through the
+//!   `BootObserver::Spike` variant; production loads with the default
+//!   directive set route through `BootObserver::Recorder`.
 
 pub mod bootstrap;
 pub mod clocks;
@@ -55,21 +57,11 @@ fn startup(ty: i32, mod_num: i32) -> i32 {
 /// The `fcall_observer` factory runs once at `MINIT`, **after** our
 /// `startup` shim has populated `Config::global()` (this ordering is
 /// load-bearing; see `openspec/changes/spike-zend-observer/design.md`
-/// §D-1 Resolution). The factory consults `Config::global()` to build
-/// a [`spike::SpikeObserver`] whose `should_observe` is `false` for
-/// every input when either gate (`enabled`, `spike_observer`) is
-/// closed — so a default-configured load installs an observer that
-/// returns `false` once per unique function and does nothing else.
-fn build_spike_observer() -> spike::SpikeObserver {
-    // `Config::global()` is `Some` at this point per the wiring
-    // documented above; the `expect` here is a load-bearing invariant
-    // that we'd want to know about loudly if it ever broke.
-    let config = Config::global().expect(
-        "Config::global() must be populated before observer factory fires; check startup wiring",
-    );
-    spike::SpikeObserver::from_config(config)
-}
-
+/// §D-1 Resolution). [`recorder::build_boot_observer`] consults
+/// `Config::global()` to build a [`recorder::BootObserver`] that
+/// dispatches to (a) the recorder when `enabled && !spike_observer`,
+/// (b) the spike when `enabled && spike_observer`, (c) a no-op
+/// `Disabled` variant otherwise.
 #[php_module]
 #[php(startup = startup)]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
@@ -79,5 +71,5 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .request_startup_function(bootstrap::rinit)
         .request_shutdown_function(bootstrap::rshutdown)
         .info_function(bootstrap::minfo)
-        .fcall_observer(build_spike_observer)
+        .fcall_observer(recorder::build_boot_observer)
 }

@@ -81,6 +81,18 @@ impl Dictionary {
     pub fn take_new_entries(&mut self) -> Vec<DictEntry> {
         std::mem::take(&mut self.new_entries)
     }
+
+    /// Borrow the staged entries without draining them. Used **only**
+    /// by `recorder::dump` (diagnostic-only, behind the
+    /// `recorder-dump` Cargo feature) so the slice-2 integration
+    /// tests can inspect the dictionary contents before the trace is
+    /// dropped. Production code MUST go through
+    /// [`take_new_entries`](Self::take_new_entries), which transfers
+    /// ownership to the future shipper batch.
+    #[cfg(feature = "recorder-dump")]
+    pub(crate) fn new_entries_for_dump(&self) -> &[DictEntry] {
+        &self.new_entries
+    }
 }
 
 impl Default for Dictionary {
