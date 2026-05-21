@@ -268,12 +268,29 @@ pub(crate) fn drain_and_join_at_mshutdown(grace: Duration) -> JoinOutcome {
     let Some(sender) = sender else {
         return JoinOutcome::NotInstalled;
     };
-    // `try_send` (not `send`) so MSHUTDOWN never blocks on
-    // backpressure. A full channel just means the shipper sees
-    // `Drain` after consuming pending batches; the same deadline
-    // still bounds it.
     let deadline = Instant::now() + grace;
-    let _ = sender.try_send(ShipperMessage::Drain { deadline });
+    // `send_timeout(grace)` (not `try_send`) so the Drain message —
+    // and the deadline it carries — still reaches the shipper when
+    // the channel is momentarily full. `try_send` would silently
+    // skip the Drain on a saturated queue, and the shipper would
+    // then drain the entire backlog *without* ever seeing the
+    // deadline; in slice 1 that's harmless (each batch is a few
+    // instructions) but slice 2's encode + POST + retry per batch
+    // can blow past `shutdown_grace_ms` in the worst case. If
+    // `send_timeout` itself runs out the grace, the `drop(sender)`
+    // below closes the channel and the shipper exits via
+    // `Disconnected` — the deadline is effectively zero by then.
+    //
+    // TODO(slice-2): once `run_loop` performs real per-batch work,
+    // even a successfully-delivered Drain is not enough on its own.
+    // A full queue plus slow work blows past `grace` while the
+    // shipper is still chewing through pre-Drain batches. Slice 2
+    // must expose the deadline to the recv-loop head — e.g. a
+    // sibling `OnceLock<Instant>` or `AtomicI64`-as-`Instant` — so
+    // the loop can self-exit even before the Drain message
+    // surfaces. See `COMMENTS.md` round-1 review finding R-1 for
+    // the full rationale.
+    let _ = sender.send_timeout(ShipperMessage::Drain { deadline }, grace);
     // Dropping the canonical Sender (and any clones held by future
     // slice-2 producers, all of which are already gone at MSHUTDOWN
     // because RSHUTDOWN dropped them) closes the channel; the
@@ -372,9 +389,10 @@ pub(crate) fn install_panicking_handle_for_test() {
     let handle = thread::Builder::new()
         .name("php-analyze-shipper-panic-test".to_owned())
         .spawn(|| -> ShipperExit {
-            // Give the joiner a stable observation: panic immediately,
-            // before any recv. The unused `_rx` is dropped at the test
-            // teardown via `reset_for_test`.
+            // Panic immediately, before any recv. The locally-bound
+            // `_rx` drops when `install_panicking_handle_for_test`
+            // returns; the panicking thread itself never touches the
+            // receiver.
             panic!("intentional panic for drain_and_join_at_mshutdown test");
         })
         .expect("OS thread spawn for the panic-injection test failed");
