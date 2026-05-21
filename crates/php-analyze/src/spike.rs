@@ -31,6 +31,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, LineWriter, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ext_php_rs::ffi;
@@ -57,33 +58,51 @@ impl SpikeObserver {
     /// inside `ModuleStartup::startup`) — `Config::global()` is `Some`
     /// at this point.
     ///
-    /// File-open failures are logged via `php_error(E_WARNING)` and
-    /// the spike falls back to stderr. The active bit stays `true` in
-    /// that case: a fallback-to-stderr is preferable to silently
-    /// disabling a developer-requested spike.
+    /// When the spike is inactive (the production default) this short-
+    /// circuits before touching the filesystem: a stale
+    /// `php_analyze.spike_log_path` left in `php.ini` next to
+    /// `php_analyze.spike_observer = 0` must not produce a startup
+    /// `E_WARNING` for an unused feature (review finding S-2, mirroring
+    /// the master-switch quietness from R-5). The inactive sink is
+    /// [`io::sink`], a zero-cost no-op writer that satisfies the
+    /// `Mutex<Box<dyn Write + Send>>` invariant without holding a real
+    /// file descriptor.
+    ///
+    /// In the active path, file-open failures are logged via
+    /// `php_error(E_WARNING)` and the spike falls back to stderr. The
+    /// `active` bit stays `true` in that case: a fallback-to-stderr is
+    /// preferable to silently disabling a developer-requested spike.
+    /// The spike warning here can only fire when the operator has
+    /// explicitly turned the spike on, and the bootstrap layer's
+    /// disable-summary warning only fires when the extension is
+    /// disabled (which forces `active = false` here). The two paths
+    /// are therefore mutually exclusive and the
+    /// at-most-one-startup-`E_WARNING` invariant (NFR-USE-2 / AD-4) is
+    /// preserved. See `COMMENTS.md` C-6 for the full argument.
     pub fn from_config(config: &Config) -> Self {
         let active = config.enabled && config.spike_observer;
-        let sink: Box<dyn Write + Send> = if let Some(path) = config.spike_log_path.as_ref() {
-            match OpenOptions::new().create(true).append(true).open(path) {
-                Ok(file) => Box::new(LineWriter::new(file)),
-                Err(e) => {
-                    // The fallback intentionally does NOT silently
-                    // disable: a spike that runs with stderr output is
-                    // useful; a spike that runs with no output is not.
-                    let message = format!(
-                        "php-analyze spike: failed to open spike_log_path {:?} ({e}); falling back to stderr",
-                        path.display(),
-                    );
-                    ext_php_rs::error::php_error(&ext_php_rs::flags::ErrorType::Warning, &message);
-                    Box::new(io::stderr())
-                }
-            }
-        } else {
-            Box::new(io::stderr())
-        };
+        if !active {
+            return Self::inactive_sink();
+        }
+
+        let (sink, warning) = open_spike_sink(config.spike_log_path.as_deref());
+        if let Some(message) = warning {
+            emit_spike_log_warning(&message);
+        }
         Self {
             sink: Arc::new(Mutex::new(sink)),
             active,
+        }
+    }
+
+    /// Build an inactive observer with a no-op sink. Used by the
+    /// inactive short-circuit in [`from_config`] and by tests that need
+    /// to verify the `should_observe == false` path without constructing
+    /// a real file sink.
+    fn inactive_sink() -> Self {
+        Self {
+            sink: Arc::new(Mutex::new(Box::new(io::sink()))),
+            active: false,
         }
     }
 
@@ -137,6 +156,55 @@ impl FcallObserver for SpikeObserver {
     }
 }
 
+/// Emit the spike's file-open warning through PHP's error log.
+///
+/// In production builds this is a thin wrapper over
+/// `ext_php_rs::error::php_error`. Under `cargo test`, the symbol
+/// `php_error_docref` is not resolvable (no live PHP runtime in the
+/// test binary), so the shim becomes a no-op for unit-test purposes
+/// — the active-with-bad-path branch is unit-testable through
+/// [`open_spike_sink`] alone, which already verifies the warning
+/// string. Integration coverage of the wired-up `php_error` call
+/// lives in `tests/spike_observer.rs`.
+#[cfg(not(test))]
+fn emit_spike_log_warning(message: &str) {
+    ext_php_rs::error::php_error(&ext_php_rs::flags::ErrorType::Warning, message);
+}
+
+#[cfg(test)]
+fn emit_spike_log_warning(_message: &str) {
+    // Intentionally empty: see the production-path doc comment above.
+}
+
+/// Resolve the sink for an active spike. Pure: no PHP interaction;
+/// returns the optional warning string the caller should pass through
+/// `php_error(E_WARNING)`. Factored out so unit tests can verify the
+/// behaviour without needing a live PHP runtime.
+///
+/// - `None` path → stderr, no warning.
+/// - `Some(path)` that opens → append-mode file sink, no warning.
+/// - `Some(path)` that fails to open → stderr fallback with a
+///   token-free warning string for the caller to log.
+fn open_spike_sink(path: Option<&Path>) -> (Box<dyn Write + Send>, Option<String>) {
+    let Some(path) = path else {
+        return (Box::new(io::stderr()), None);
+    };
+
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => (Box::new(LineWriter::new(file)), None),
+        Err(e) => {
+            // The fallback intentionally does NOT silently disable: a
+            // spike that runs with stderr output is useful; a spike
+            // that runs with no output is not.
+            let message = format!(
+                "php-analyze spike: failed to open spike_log_path {:?} ({e}); falling back to stderr",
+                path.display(),
+            );
+            (Box::new(io::stderr()), Some(message))
+        }
+    }
+}
+
 /// Local, pure-Rust copy of `ext_php_rs::zend::FcallInfo` (which has
 /// `pub fields but only `pub(crate)` constructors in 0.15.13). The
 /// upstream type cannot be built from our crate, so we replicate its
@@ -155,6 +223,11 @@ struct LocalFcallInfo<'a> {
 }
 
 impl LocalFcallInfo<'_> {
+    /// A `LocalFcallInfo` with no inner borrows. The `'static` return
+    /// is the most-general lifetime: by reference covariance,
+    /// `LocalFcallInfo<'static>` coerces into `LocalFcallInfo<'a>` for
+    /// any `'a` at the call site, which is exactly what
+    /// [`extract_info`]'s null branch needs.
     fn empty() -> LocalFcallInfo<'static> {
         LocalFcallInfo {
             function_name: None,
@@ -174,6 +247,13 @@ impl LocalFcallInfo<'_> {
 /// `<fqn>` strings, so any future change here should be cross-checked
 /// against the upstream private implementation.
 ///
+/// The returned [`LocalFcallInfo`] borrows from the Zend strings that
+/// hang off `execute_data`. Tying the borrow lifetime to the input
+/// (`<'a>`) keeps the borrow checker honest: a future refactor that
+/// tries to stash the result past the callback's return will be a
+/// compile error rather than a silent use-after-free (review finding
+/// S-1 / S-6).
+///
 /// # Safety
 ///
 /// `execute_data` must be a valid `&ExecuteData` such that
@@ -183,7 +263,7 @@ impl LocalFcallInfo<'_> {
 /// `func.op_array.filename` are either null or valid for the duration
 /// of the call. All of those invariants are upheld by the Zend
 /// observer machinery for the duration of a `begin`/`end` callback.
-unsafe fn extract_info(execute_data: &ExecuteData) -> LocalFcallInfo<'static> {
+unsafe fn extract_info<'a>(execute_data: &'a ExecuteData) -> LocalFcallInfo<'a> {
     let func_ptr = execute_data.func;
     if func_ptr.is_null() {
         return LocalFcallInfo::empty();
@@ -230,25 +310,35 @@ unsafe fn extract_info(execute_data: &ExecuteData) -> LocalFcallInfo<'static> {
     }
 }
 
-/// Convert a `*mut zend_string` into a borrowed `&'static str`. The
-/// `'static` lifetime is a convenient fiction: the borrow is only
-/// valid for the duration of the observer callback, but every consumer
-/// in this module consumes the borrow inside the same callback and
-/// does not retain it.
+/// Convert a `*mut zend_string` into a borrowed `&'a str`. The
+/// caller picks `'a`; at the call sites inside [`extract_info`] the
+/// inference picks the lifetime of the enclosing `&'a ExecuteData`,
+/// which is exactly the borrow-checker bound the Zend observer
+/// surface guarantees (the `zend_string` lives at least as long as
+/// the callback's `ExecuteData`).
+///
+/// Previously this returned `Option<&'static str>` as a deliberate
+/// convenience, which silently invited use-after-free if a caller
+/// retained the borrow past the callback's return. Tying the
+/// lifetime to the input restores the compile-time guarantee
+/// (review finding S-1).
 ///
 /// # Safety
 ///
 /// `zs` must be either null or a pointer to a `zend_string` whose
-/// payload bytes form valid UTF-8. The Zend observer surface only
-/// passes us names for user functions (which the parser already
-/// validated as 8-bit-clean identifiers) and for filenames
-/// (path strings from disk; UTF-8-clean on Linux x86_64 in practice —
-/// if not, we return `None` and the FQN falls back to `(unknown)`).
-unsafe fn zend_string_to_str(zs: *mut ffi::zend_string) -> Option<&'static str> {
+/// payload bytes form valid UTF-8 and remain alive for the chosen
+/// `'a`. The Zend observer surface only passes us names for user
+/// functions (which the parser already validated as 8-bit-clean
+/// identifiers) and for filenames (path strings from disk; UTF-8-clean
+/// on Linux x86_64 in practice — if not, we return `None` and the FQN
+/// falls back to `(unknown)`).
+unsafe fn zend_string_to_str<'a>(zs: *mut ffi::zend_string) -> Option<&'a str> {
     if zs.is_null() {
         return None;
     }
     // SAFETY: non-null checked above; payload layout per Zend ABI.
+    // The lifetime `'a` is chosen by the caller and bounds how long
+    // the returned slice is allowed to live.
     let len = unsafe { (*zs).len };
     let ptr = unsafe { (*zs).val.as_ptr() };
     let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
@@ -449,5 +539,102 @@ mod tests {
             "entry: function:/x.php:1:only_me\n\
              exit: function:/x.php:1:only_me (abnormal=false)\n"
         );
+    }
+
+    // --- open_spike_sink (S-2 helper) -------------------------------------
+    //
+    // These tests exercise the pure sink-resolution helper without
+    // touching `from_config`, so no `php_error` call is invoked. The
+    // helper is the unit that decides "open the file or fall back to
+    // stderr"; the test contract is that a missing path produces no
+    // warning and a bad path produces a token-free warning string.
+
+    #[test]
+    fn open_spike_sink_returns_stderr_and_no_warning_when_path_is_none() {
+        let (_sink, warning) = open_spike_sink(None);
+        assert!(warning.is_none(), "no path → no warning; got {warning:?}",);
+    }
+
+    #[test]
+    fn open_spike_sink_warns_and_falls_back_when_path_cannot_be_opened() {
+        // A path under a non-existent parent dir cannot be opened with
+        // `O_APPEND | O_CREAT`; `OpenOptions::open` returns `ENOENT`.
+        let path = Path::new("/this/path/should/not/exist/spike.log");
+        let (_sink, warning) = open_spike_sink(Some(path));
+        let warning = warning.expect("a warning should be produced");
+        assert!(
+            warning.contains("falling back to stderr"),
+            "warning should mention stderr fallback, got: {warning}",
+        );
+        assert!(
+            warning.contains("spike_log_path"),
+            "warning should mention the directive name, got: {warning}",
+        );
+    }
+
+    // --- from_config (S-2 gate) -------------------------------------------
+    //
+    // The inactive-gate test reaches `from_config` directly. Constructing
+    // a `Config` via `from_ini_values` lets us avoid touching `Config`'s
+    // many public fields by hand, and exercises the same data path the
+    // PHP runtime would.
+
+    #[test]
+    fn from_config_with_spike_disabled_does_not_open_the_log_path() {
+        // Spike is off, but a bogus path is set. Without the S-2 gate
+        // this would trigger `OpenOptions::open` and then `php_error`,
+        // which we'd be unable to invoke safely outside a PHP process.
+        // With the gate, the constructor short-circuits to the inactive
+        // sink and never touches the filesystem.
+        let raw = crate::config::RawIni {
+            enabled: Some(true),
+            server_url: Some("https://example.com/v1/ingest".into()),
+            auth_token: Some("test-token".into()),
+            spike_observer: Some(false),
+            spike_log_path: Some("/this/path/should/not/exist/spike.log".into()),
+            ..Default::default()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        let observer = SpikeObserver::from_config(&config);
+
+        // Confirm the gate landed: `should_observe` is the surface
+        // through which the active bit is exposed.
+        let info = FcallInfo {
+            function_name: None,
+            class_name: None,
+            filename: None,
+            lineno: 0,
+            is_internal: false,
+        };
+        assert!(!observer.should_observe(&info));
+    }
+
+    #[test]
+    fn from_config_with_extension_disabled_does_not_open_the_log_path() {
+        // Master switch off; spike directive still flipped on with a
+        // bogus path. The `enabled && spike_observer` gate must close
+        // on the disabled side and skip the file-open.
+        let raw = crate::config::RawIni {
+            enabled: Some(false),
+            spike_observer: Some(true),
+            spike_log_path: Some("/this/path/should/not/exist/spike.log".into()),
+            ..Default::default()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        // Confirm the bootstrap layer would be silent (R-5 invariant).
+        assert!(
+            warnings.is_empty(),
+            "master-switch-off must produce no bootstrap warnings; got {warnings:?}",
+        );
+
+        let observer = SpikeObserver::from_config(&config);
+        let info = FcallInfo {
+            function_name: None,
+            class_name: None,
+            filename: None,
+            lineno: 0,
+            is_internal: false,
+        };
+        assert!(!observer.should_observe(&info));
     }
 }

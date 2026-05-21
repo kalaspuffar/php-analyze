@@ -163,6 +163,38 @@ every category v1 cares about (per `SPECIFICATION.md` §3.2 and
 the spec scenario `PHP-specialised internals are NOT observed` so
 Phase 2 inherits the known limitation cleanly.
 
+### C-6 — Spike's file-open `E_WARNING` does NOT violate AD-4 / NFR-USE-2
+
+Recorded while addressing review finding S-3 on the spike branch
+(`feat/spike-zend-observer`). The spike layer can emit an
+`E_WARNING` from `spike::SpikeObserver::from_config` when an active
+spike fails to open `spike_log_path`, and the bootstrap layer can
+emit an `E_WARNING` from `bootstrap::startup` when the extension
+disables itself. Naïvely, those are two `E_WARNING` sources in one
+process, which appears to break OQ-9 / AD-4's "single startup
+`E_WARNING`" wording.
+
+After the S-2 fix landed (`from_config` short-circuits before any
+filesystem work when `enabled && spike_observer` is `false`), the
+two sources are **mutually exclusive**:
+
+- The spike warning fires only when `active = enabled && spike_observer`
+  is `true`. That requires both `php_analyze.enabled = 1` and
+  `php_analyze.spike_observer = 1`.
+- The bootstrap disable-summary warning fires only when the
+  extension is being **disabled** (URL invalid, token missing,
+  master switch off, …). When the extension is disabled,
+  `Config::enabled` is `false`, which forces `active = false`, which
+  short-circuits the spike file-open. No spike warning is possible.
+
+So at most one of the two `E_WARNING` sources fires per process, and
+the AD-4 / NFR-USE-2 invariant is preserved without any further
+plumbing. The spike retains a direct `php_error` call rather than
+funnelling through `ConfigWarning`, which would couple the
+throwaway module to the bootstrap warning surface for no behavioural
+gain. The `from_config` doc comment records the same argument
+in-source.
+
 ## Repository hygiene notes (out of scope for this change)
 
 ### N-1 — `.gitignore` excludes `openspec/`, `personas/`, `CLAUDE.md`
@@ -559,4 +591,563 @@ full review:
   After R-5 the `MasterSwitchOff` path is fully silent; an `E_NOTICE`
   would be a UX upgrade but is explicitly out of scope for the
   reviewer's R-1..R-5 set. Follow-up `notice-on-master-switch-off`.
+
+---
+
+## Code review — 2026-05-21 (branch `feat/spike-zend-observer`)
+
+**Reviewer:** Claude Code
+**Reviewed against:** `SPECIFICATION.md` §3.5, §6.3, §10 Phase 0, §11
+(R-2). `CLAUDE.md` style rules.
+**Scope:** all commits on `feat/spike-zend-observer` vs. `main`
+(`bcc9017`, `7098366`, `4d9b96a`, `3b8606a`, `d6472ac`). `cargo fmt
+--check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+and `cargo test --all` (47 tests) pass locally.
+
+The spike does exactly what Phase 0 asks for: it stands up a real
+`FcallObserver` against `ext-php-rs = "=0.15.13"` with the `observer`
+feature, drives three PHP fixtures, and produces the coverage table
+C-5 records. The default-off posture is honoured (two new directives,
+both default to `0` / empty), and `phpinfo()` exposes a red-flag
+banner so a forgotten-on spike is visible. The findings below are
+mostly forward-looking: this code is throwaway per the module-level
+doc, but several patterns will be tempting to copy into Phase 2's
+Recorder, and a couple of them should be cleaned up first so the
+Recorder inherits something safe.
+
+### S-1 (Major) — `zend_string_to_str` returns an unsound `&'static str`
+
+- **File:** `crates/php-analyze/src/spike.rs:247-256` (and propagated
+  through `LocalFcallInfo<'static>` at `spike.rs:148-186`,
+  `extract_info` at `spike.rs:186-231`).
+- **Severity:** Major (unsound type signature; copying the pattern
+  into the Phase-2 Recorder would be a long-lived bug).
+- **Description:** The signature is `unsafe fn zend_string_to_str(zs:
+  *mut ffi::zend_string) -> Option<&'static str>`. The doc comment is
+  candid that the `'static` lifetime "is a convenient fiction" — the
+  borrow is in fact only valid for the duration of the observer
+  callback. That's exactly what makes it unsound: `'static` is the
+  type-level claim that the reference is valid forever, so anything
+  that consumes the result (a future refactor, a closure that escapes
+  the call, a `clone()` into a longer-lived struct) can silently
+  produce a dangling pointer with no compile-time warning. The current
+  call sites happen to be safe because they immediately copy into
+  owned `String`s inside `fqn`, but the next person to touch this
+  module is one careless edit away from a use-after-free.
+
+  The downstream consequence is in `LocalFcallInfo`: the type carries
+  a `'a` lifetime parameter (`spike.rs:149`), but every constructor
+  (`LocalFcallInfo::empty()` at `spike.rs:157-167` and `extract_info`
+  at `spike.rs:186`) returns `LocalFcallInfo<'static>`, so `'a` is
+  dead — it survives only as a hint to readers that the inner
+  references "morally" borrow from `ExecuteData`.
+- **Suggestion:** Tie the lifetime to the input. Either:
+  1. **Type-honest fix (preferred):** change the signature to
+     `unsafe fn zend_string_to_str<'a>(zs: *mut ffi::zend_string) ->
+     Option<&'a str>` and let inference pick `'a` from the call site
+     (which will be `&ExecuteData`-bound). Propagate through:
+     `extract_info<'a>(execute_data: &'a ExecuteData) ->
+     LocalFcallInfo<'a>`, and `LocalFcallInfo<'a>` keeps its
+     parameter for real. The `empty()` constructor becomes
+     `fn empty() -> LocalFcallInfo<'static>` only because it carries
+     no borrows.
+  2. **Copy-eagerly fix:** if Phase 2 is going to allocate a `String`
+     per call anyway (R-13 in `SPECIFICATION.md` is silent on this),
+     change the signature to `Option<String>` and pay the alloc
+     upfront. Phase 2 then has zero lifetime complexity for the
+     `zend_string` decode and the `'static` lie disappears.
+
+  Either is fine for the spike; (1) is the cheaper one to land and
+  preserves the zero-alloc-decode option for Phase 2.
+
+### S-2 (Major) — `SpikeObserver::from_config` opens the log file even when the spike is inactive
+
+- **File:** `crates/php-analyze/src/spike.rs:64-88`
+- **Severity:** Major (operator UX; produces an extra
+  `E_WARNING` that the silent-disable posture promises will not
+  appear).
+- **Description:** Control flow in the constructor:
+  1. Compute `active = config.enabled && config.spike_observer`.
+  2. Unconditionally `OpenOptions::new().create(true).append(true).open(path)`
+     if `spike_log_path` is set.
+  3. On open failure, emit `php_error(E_WARNING, …)` and fall back to
+     stderr.
+
+  An operator who leaves a stale `php_analyze.spike_log_path =
+  "/var/log/old-spike.log"` in `php.ini` but turns the spike off
+  (`php_analyze.spike_observer = 0`) still triggers the file-open at
+  `MINIT`. If the old path is no longer writable (rotated away,
+  permissions changed, mount removed) they get a `E_WARNING` on every
+  process startup *for an extension feature they're not using*. This
+  is the same operator-UX failure R-5 fixed for the master switch
+  applied at the spike layer.
+
+  It's also wasted work: open + close + Box-allocate-a-sink for a
+  spike whose `should_observe` will return `false` on every call.
+- **Suggestion:** Bail before opening when `active = false`. The body
+  collapses to:
+  ```rust
+  if !active {
+      return Self {
+          sink: Arc::new(Mutex::new(Box::new(io::sink()))),
+          active: false,
+      };
+  }
+  // ...existing open-file-or-stderr logic...
+  ```
+  Use `io::sink()` (or any `Write + Send` no-op) as the inactive
+  placeholder so the `Mutex<Box<dyn Write + Send>>` invariant holds
+  without burning a real file descriptor. Add a unit test:
+  `from_config(spike_observer=false, spike_log_path=Some("/no/such/dir"))`
+  must not emit a warning and must not error.
+
+### S-3 (Major) — `from_config`'s `E_WARNING` adds a second startup warning, contradicting NFR-USE-2 wording
+
+- **File:** `crates/php-analyze/src/spike.rs:73-78`
+- **Severity:** Major (correctness vs. spec wording; mitigated to
+  "Minor" by S-2 since the warning then only fires in the
+  spike-enabled path).
+- **Description:** `SPECIFICATION.md` §1.4 OQ-9 / AD-4 promise
+  "silent disable + **single** startup `E_WARNING`" on misconfig.
+  Today the bootstrap layer logs every `ConfigWarning` returned by
+  `from_ini_values`, of which there is at most one
+  *disable-summary* warning per process (asserted by the test
+  `at_most_one_disable_warning_is_emitted_when_multiple_required_values_missing`).
+  The spike sneaks a second `E_WARNING` in via `php_error` directly,
+  bypassing the warnings list, when the spike log file can't be
+  opened.
+
+  Under the current ordering (`build_spike_observer` runs after the
+  bootstrap layer has finished pushing warnings), an operator who
+  has both a misconfigured `auth_token` AND an unwriteable
+  `spike_log_path` will see two `E_WARNING` lines, which the spec
+  says can't happen.
+- **Suggestion:** Funnel the spike's file-open failure through the
+  same `ConfigWarning` channel the bootstrap layer uses. The
+  cheapest path: have `from_config` return `(Self,
+  Option<ConfigWarning>)` (or a new `SpikeWarning` variant)
+  and have `lib.rs::build_spike_observer` push the result through
+  `php_error` itself — but inside a "still no more than one warning
+  total" gate. Alternatively, downgrade to `E_NOTICE` and document
+  that spike misconfig is `E_NOTICE`-level (spike is a dev-only
+  switch; `E_NOTICE` matches the §5.2 retry-failure log level and
+  reads as "informational, not a misconfig"). Note in C-5 (or a new
+  C-6) so the deviation is recorded.
+
+  The order S-2 → S-3 matters: if S-2 lands first, the warning fires
+  *only* when the operator has explicitly turned the spike on,
+  which makes "a second warning" defensible. S-3 is then arguably
+  acceptable as-is; record the decision in `COMMENTS.md`.
+
+### S-4 (Minor) — `build_spike_observer` panics if `Config::global()` is unset
+
+- **File:** `crates/php-analyze/src/lib.rs:53-61`
+- **Severity:** Minor (lifecycle invariant; the panic is observable
+  only if a future `ext-php-rs` reorders the macro-generated startup).
+- **Description:** The factory does
+  `Config::global().expect("Config::global() must be populated before
+   observer factory fires; check startup wiring")`. The doc comment
+  documents the dependency on the macro's expansion order, and C-5
+  cites the exact line of `ext-php-rs-derive-0.11.12/src/module.rs`
+  the assumption rests on. But `expect` in `MINIT` is a panic; a
+  panic across an FFI boundary into PHP is undefined behaviour on
+  most targets, and on Linux x86_64 it tends to abort the process
+  rather than just disable the extension. That's the opposite of the
+  silent-disable posture the whole crate is built around.
+- **Suggestion:** Degrade gracefully:
+  ```rust
+  let Some(config) = Config::global() else {
+      // Defensive: should never happen given current ext-php-rs
+      // wiring (see C-5). If it does, fall back to an inactive
+      // observer so the extension still loads.
+      return spike::SpikeObserver::inactive();
+  };
+  spike::SpikeObserver::from_config(config)
+  ```
+  Add `SpikeObserver::inactive()` as a public sibling of
+  `from_config` that constructs the same `Self { sink: …, active:
+  false }` Self the S-2 fix produces. A `debug_assert!` (not
+  `expect`) on `Config::global().is_some()` keeps the invariant
+  visible in tests/debug builds.
+
+### S-5 (Minor) — `fqn` has an unreachable `unwrap_or` after the closure-detection branch
+
+- **File:** `crates/php-analyze/src/spike.rs:285-294`
+- **Severity:** Minor (dead defensive code; hides intent).
+- **Description:** The closure branch is entered when `is_closure
+  || info.function_name.is_none()`. Falling through means
+  `function_name` is `Some(_)` AND not a closure-shaped name. The
+  fall-through code is then:
+  ```rust
+  let name = info.function_name.unwrap_or("(unknown)");
+  format!("function:{file}:{line}:{name}")
+  ```
+  The `unwrap_or("(unknown)")` is unreachable: we already ruled out
+  `None` two lines up. A reader has to follow the negation chain to
+  see that, and a future edit that loosens the branch above (e.g. to
+  match additional closure variants by also returning when the name
+  is `Some` but in some other shape) will silently make the
+  `"(unknown)"` fallback reachable, masking the bug.
+- **Suggestion:** Bind the unwrap into the precondition:
+  ```rust
+  let Some(name) = info.function_name else {
+      // function_name was None — already handled by the closure
+      // branch above.
+      unreachable!("function_name is Some at this point");
+  };
+  format!("function:{file}:{line}:{name}")
+  ```
+  Or, more idiomatically, restructure `fqn` as an `enum FqnKind`
+  that's then formatted in one place — but that's overkill for
+  throwaway code. The `let-else` form is the minimum churn.
+
+### S-6 (Minor) — `LocalFcallInfo`'s lifetime parameter is dead
+
+- **File:** `crates/php-analyze/src/spike.rs:148-167`
+- **Severity:** Minor (gives the reader a false signal that
+  borrowing is in play; folds into S-1's fix).
+- **Description:** `LocalFcallInfo<'a>` has `'a` in its declaration,
+  but every `&'a str` inside is actually `&'static str` because
+  `zend_string_to_str` returns `'static` (S-1). The lifetime
+  parameter therefore documents an intent that isn't true. A reader
+  trying to understand the data flow will assume the borrows are
+  tied to `&ExecuteData` and write code that relies on the
+  compile-time enforcement that isn't there.
+- **Suggestion:** Fix together with S-1. If you take S-1's option
+  (1) (real lifetime), `'a` becomes meaningful. If you take option
+  (2) (own the strings), drop the parameter — `LocalFcallInfo`
+  becomes a `'static` struct with `Option<String>` fields.
+
+### S-7 (Minor) — `directive_table_numeric_defaults_match_resolved_config_defaults` doesn't assert the two new spike directives
+
+- **File:** `crates/php-analyze/src/bootstrap.rs:596-673`
+- **Severity:** Minor (drift guard gap; the same class of bug R-7
+  flagged previously).
+- **Description:** The existing test walks the directive table for
+  every numeric directive and the token-related strings, but the
+  two new entries (`php_analyze.spike_observer` and
+  `php_analyze.spike_log_path`) get only an indirect check via
+  `rows_include_every_directive_exactly_once`. Nothing asserts that
+  the *default-string in `DIRECTIVES`* ("0" / "") resolves to the
+  same `Config::spike_observer` / `Config::spike_log_path` that
+  `RawIni::default()` produces. A future edit that changes one
+  default in `DIRECTIVES` without touching `from_ini_values` (or
+  vice versa) compiles green.
+- **Suggestion:** Extend the existing test:
+  ```rust
+  // Spike directives default to off / unset.
+  assert_eq!(directive("php_analyze.spike_observer").default, "0");
+  assert_eq!(parse_bool("0"), Some(false));
+  assert!(!resolved.spike_observer);
+  assert_eq!(directive("php_analyze.spike_log_path").default, "");
+  assert!(resolved.spike_log_path.is_none());
+  ```
+  Three lines plus the directive lookups; covers the same drift
+  class for the spike directives that R-7's follow-up covers for
+  the production ones.
+
+### S-8 (Minor) — `spike_log_path` is documented as "absolute path" but never validated
+
+- **Files:**
+  - `crates/php-analyze/src/config.rs:64-68` (struct doc)
+  - `README.md:131-133` (operator docs)
+  - `crates/php-analyze/src/spike.rs:64-88` (consumer)
+- **Severity:** Minor (operator footgun; mitigated by spike being
+  dev-only).
+- **Description:** The doc comment on `Config::spike_log_path`
+  reads "An absolute path means 'create / append to this file'".
+  The README states `spike_log_path = "absolute path"` next to the
+  type column. But `from_ini_values` accepts any non-empty string
+  and `from_config` opens it verbatim — a relative path resolves
+  against PHP's cwd at `MINIT`, which is unpredictable under FPM
+  (and may not be writable). The operator gets a falls-back-to-stderr
+  warning at a path they don't expect.
+- **Suggestion:** Either (a) make the validator enforce the doc:
+  reject non-absolute paths with a `ConfigWarning::SpikeLogPathNotAbsolute`,
+  treating it like a soft misconfig (warn + fall back to stderr), or
+  (b) update the doc to "absolute path recommended; relative paths
+  resolve against the PHP process cwd". (a) costs ~10 lines and
+  removes the foot-gun.
+
+### S-9 (Minor) — Each observed call allocates two `String`s on the hot path
+
+- **File:** `crates/php-analyze/src/spike.rs:119-137`
+- **Severity:** Minor (spike-only; explicitly out of scope for
+  Phase 0 performance per the module doc, but worth flagging as a
+  trap for Phase 2 copy-paste).
+- **Description:** `begin` calls `format!("entry: {}", fqn(&info))`,
+  and `fqn` itself returns an owned `String`. Each observed entry
+  therefore allocates twice (once inside `fqn`, once inside
+  `format!`). `end` is the same. The module doc claims the spike is
+  "slow, unbounded" and the README repeats the warning, so this is
+  acceptable for the spike — but if Phase 2's Recorder copies the
+  same shape (it will be tempting; the shape is clear), the hot-path
+  zero-alloc assertion AC-RC-5 will fail.
+- **Suggestion:** No change needed in the spike. **Add an inline
+  comment** near `begin` / `end` like:
+  ```rust
+  // NOTE for Phase 2: this is two allocations per call. The
+  // Recorder's hot path must reuse a thread-local buffer (per
+  // AC-RC-5). Do not copy this shape verbatim.
+  ```
+  Cheap; saves Phase 2 from rediscovering AC-RC-5 the hard way.
+
+### S-10 (Minor) — Integration test's `assert_pair` accepts duplicate hits silently
+
+- **File:** `crates/php-analyze/tests/spike_observer.rs:215-230`
+- **Severity:** Minor (false-positive risk for a few categories).
+- **Description:** `assert_pair` asserts `entry_hits >= 1` and
+  `exit_hits >= 1`. C-5 records that several of the fixtures call
+  each function exactly once and the table is `yes (one
+  entry/exit)`. If `begin`/`end` ever started double-firing for the
+  same call (a real risk if the observer registration changes), the
+  test would still pass. For `array_map`, C-5 specifically says the
+  callback fires "three times" for `[1, 2, 3]` — so the integration
+  test should be asserting `entry_hits == 3` for the closure
+  events, not `>= 1`.
+- **Suggestion:** Tighten the matchers per fixture: for `only_me()`,
+  `(new C)->m()`, `bad()`, the user-closure, and each non-specialised
+  internal, assert `entry_hits == 1 && exit_hits == 1`. For the
+  `array_map` arrow-fn closure, add a separate assertion that the
+  count equals 3. The current loose check buys nothing here and
+  silently allows regressions.
+
+### S-11 (Nit) — `tests/php-spike/run.sh` shells out to `python3` for a single JSON field
+
+- **File:** `tests/php-spike/run.sh:32-35`
+- **Severity:** Nit (portability; `python3` isn't a documented
+  test-host dependency).
+- **Description:** The script uses
+  `cargo metadata … | python3 -c "import sys, json; ..."` to
+  extract `target_directory`. `python3` is not listed in
+  `SPECIFICATION.md` §7.1 build-toolchain requirements, nor in
+  README §Build. A test-host without `python3` (a minimal Alpine
+  CI image, for instance) skips with a cryptic "python3 not found"
+  rather than the autotools-style exit 77.
+- **Suggestion:** Either (a) use `cargo metadata --no-deps
+  --format-version 1 | jq -r .target_directory` (and add `jq` to
+  test-host requirements — also not currently there), (b) parse
+  the JSON in a here-doc with `python3` *and* document the
+  dependency, or (c) compute the target dir with shell:
+  ```bash
+  TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+  ```
+  Option (c) is the cheapest and is correct unless the operator
+  is doing something exotic. Add a fall-back guard
+  (`command -v python3 >/dev/null || { echo "skipping" >&2; exit
+  77; }`) if you keep python.
+
+### S-12 (Nit) — `with_sink` constructor is `#[cfg(test)]` but only used by unit tests, not the integration test
+
+- **File:** `crates/php-analyze/src/spike.rs:93-99`
+- **Severity:** Nit (naming/documentation).
+- **Description:** The doc says "Used by the `fqn`-and-log unit
+  tests below; not part of the production surface." That's correct.
+  But it reads as if it might also be reachable from the
+  integration test under `tests/spike_observer.rs`. It isn't —
+  `tests/` integration crates can't see `#[cfg(test)]` items from
+  the library (they get the regular `cargo build` view). The doc
+  is true but easy to misread.
+- **Suggestion:** Rephrase to "Test-only constructor; visible
+  exclusively to the in-module `mod tests` below." One-liner.
+
+### S-13 (Nit) — Doc comment on `should_observe` makes an unverified caching claim
+
+- **Files:**
+  - `crates/php-analyze/src/spike.rs:42-48` (struct doc)
+  - `crates/php-analyze/src/spike.rs:112-117` (method)
+- **Severity:** Nit (documented behaviour rests on an unverified
+  assumption).
+- **Description:** Both doc blocks state that PHP caches the
+  `should_observe` result per unique function (so an inactive
+  observer pays one virtual call per unique function, then
+  nothing). C-5's evidence shows the observer is hit on every call
+  in the fixture, but does not prove the caching claim: the
+  fixtures all have `should_observe -> true`. The "cached forever
+  when false" claim is plausible from the `ext-php-rs` source
+  reading C-5 cites, but no test demonstrates it. If the claim is
+  wrong, the production-default cost is one virtual call per
+  *observed event*, not one per *unique function* — still cheap,
+  but a different cost model than the doc promises.
+- **Suggestion:** Either (a) cite the upstream line that
+  implements the caching (likely in
+  `ext_php_rs::zend::observer`'s C glue), or (b) soften the doc:
+  "PHP **may** cache this per unique function; assuming it does,
+  the inactive cost is one virtual call per unique function".
+  If a Phase-2 spike covers this directly, link from here.
+
+### S-14 (Nit) — `LocalFcallInfo::empty()` is reachable only from `extract_info`'s null-pointer branch
+
+- **File:** `crates/php-analyze/src/spike.rs:157-167`,
+  `spike.rs:188-190`
+- **Severity:** Nit (dead-ish defensive code; reaches `fqn`'s
+  `(unknown)` fallback).
+- **Description:** `extract_info` returns
+  `LocalFcallInfo::empty()` only when `(*execute_data).func` is
+  null. Per the observer-API contract this should never happen for
+  a normal `begin`/`end`. If it does, `fqn` then formats
+  `function:(unknown):0:(unknown)` or `closure:(unknown):0`, which
+  is at least debuggable but is silently misleading.
+- **Suggestion:** Log a one-shot `E_NOTICE` ("php-analyze spike: null
+  function pointer in observer callback — this should not happen,
+  please file an issue") and skip the `write_line` entirely. The
+  spike is a diagnostics tool; encountering this case without
+  logging it defeats the purpose.
+
+### Specification compliance
+
+- ✅ §10 Phase 0 deliverables — small extension prints `entry:` /
+  `exit:` for every call; coverage evidence captured in C-5 with
+  PHP-version caveat for 8.3 carried forward as follow-up.
+- ✅ §11 R-2 — updated to "Closed for PHP 8.4; partially closed for
+  PHP 8.3 (pending verification)", consistent with C-5.
+- ✅ §3.5 — two new directives registered at `PHP_INI_SYSTEM` with
+  documented defaults; `phpinfo()` renders both plus a banner when
+  the spike is on; both default to off.
+- ⚠️ §6.3 — token redaction guarantee preserved (test
+  `rows_redact_auth_token_even_when_spike_is_enabled` covers the
+  spike-on path); but S-3 adds a second potential `E_WARNING`
+  source outside the single-startup-warning posture.
+- ⚠️ AD-4 / NFR-USE-2 — silent-disable posture honoured for the
+  bootstrap layer; the spike layer (S-2 / S-3) breaks the "no
+  startup warnings beyond the disable-summary" invariant when a
+  stale `spike_log_path` is left in `php.ini`.
+- ⚠️ §3.2 AC-RC-5 future risk — the spike's two-allocation hot path
+  (S-9) is acceptable for the spike but is a copy-paste trap for
+  Phase 2.
+
+### Overall recommendation
+
+**REQUEST CHANGES** for the items that affect operator-visible
+behaviour or carry forward into Phase 2 (S-1, S-2, S-3). The rest
+(S-4 through S-14) are cheap follow-up items.
+
+Per CLAUDE.md's "one change per branch" rule, the cleanest path is:
+
+1. **On this branch**, before merging:
+   - Land S-2 (skip file-open when inactive) and S-3 (route spike
+     warnings through the same channel, or downgrade to `E_NOTICE`).
+     Both are operator-UX fixes that defend the silent-disable
+     posture C-5 leans on.
+   - Land S-1 in the type-honest form (option 1). The diff is small
+     and the spike then ships a sound lifetime story that Phase 2
+     can copy without paying a future audit.
+
+2. **As follow-up OpenSpec changes** (each its own branch):
+   - `spike-graceful-degrade-on-missing-config` — S-4.
+   - `spike-tidy-fqn-and-deadcode` — S-5, S-6, S-12, S-14.
+   - `spike-tighten-integration-assertions` — S-10.
+   - `spike-portable-run-sh` — S-11 (or fold into the change that
+     adds PHP 8.3 verification, since both touch test harness).
+   - `directive-table-spike-defaults-drift-guard` — S-7 (small
+     enough to fold into the existing R-7 follow-up
+     `lock-readme-directive-table`).
+   - `spike-log-path-validate-absolute` — S-8.
+   - `spike-doc-cleanup` — S-9 inline comment, S-13 doc
+     softening / citation.
+
+Phase 0's acceptance criterion ("Architect confirms `zend_observer`
+covers internal calls") is met by C-5's evidence for PHP 8.4. The
+explicit PHP 8.3 verification gap is correctly carried in C-5 as a
+hard blocker for Phase 2; reaffirming that here so the next reviewer
+doesn't reopen R-2 prematurely.
+
+## Review-fix status — 2026-05-21 (round 1 on the spike branch)
+
+S-1, S-2, and S-3 (the reviewer's "REQUEST CHANGES" set for the
+spike branch) have been addressed on this same branch
+(`feat/spike-zend-observer`) as additional commits under the
+existing `spike-zend-observer` OpenSpec change. The archived
+change's `tasks.md` §11 records the per-finding work; validation
+gates (`fmt`, `clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all`) are clean, and the
+`PHP_ANALYZE_RUN_SPIKE=1 cargo test --test spike_observer` end-to-end
+integration test still passes on PHP 8.4.21. Unit-test count moved
+from 46 to 50 (4 new tests covering S-2's gate + the extracted
+`open_spike_sink` helper).
+
+### Addressed on this branch
+
+- **S-1** (`zend_string_to_str` returned an unsound `&'static str`) —
+  took the type-honest option (1) from the review. The free
+  function is now `unsafe fn zend_string_to_str<'a>(zs: *mut
+  ffi::zend_string) -> Option<&'a str>`, `extract_info<'a>` is
+  parameterised on the input `&'a ExecuteData`, and
+  `LocalFcallInfo<'a>`'s lifetime parameter is no longer dead.
+  `LocalFcallInfo::empty()` retains its `LocalFcallInfo<'static>`
+  return because the most-general lifetime coerces (covariantly)
+  into any caller-chosen `'a`. The doc-comment "convenient fiction"
+  apology is gone; the lifetime story is now what the type says.
+  No new tests are needed for S-1 itself — every fqn test exercises
+  `LocalFcallInfo<'static>` (which is the most-general instance),
+  and the integration test exercises the live `&'a ExecuteData`
+  path. S-6 (the "dead lifetime parameter" finding) is fixed by the
+  same change.
+- **S-2** (`from_config` opened the log file even with the spike
+  inactive) — the constructor now short-circuits to an
+  `inactive_sink()` (an `io::sink()`-backed no-op writer) when
+  `active = enabled && spike_observer` is `false`. The file-open
+  logic is extracted into a pure `open_spike_sink(Option<&Path>) ->
+  (Box<dyn Write + Send>, Option<String>)` helper so the warning
+  string is unit-testable without invoking `php_error`. Three new
+  tests cover the gate:
+  - `open_spike_sink_returns_stderr_and_no_warning_when_path_is_none`
+  - `open_spike_sink_warns_and_falls_back_when_path_cannot_be_opened`
+  - `from_config_with_spike_disabled_does_not_open_the_log_path`
+  - `from_config_with_extension_disabled_does_not_open_the_log_path`
+  The `php_error` call in `from_config`'s active path is wrapped in
+  a `#[cfg(not(test))]` shim (`emit_spike_log_warning`) so the
+  test binary does not need to resolve `php_error_docref`. The
+  active-with-bad-path warning string is still unit-tested
+  via `open_spike_sink`; the wired-up `php_error` call is exercised
+  in the `tests/spike_observer.rs` integration test against a real
+  PHP process.
+- **S-3** (the spike warning could co-exist with the bootstrap
+  warning, appearing to violate "single startup `E_WARNING`") — per
+  user decision: leave the spike's `E_WARNING` in place and document
+  the invariant. With S-2 landed, the spike warning fires only on
+  explicit-on AND the bootstrap warning fires only on extension-
+  disabled (which forces `active=false`). The two paths are mutually
+  exclusive; at most one warning per process. Recorded as **C-6**
+  above and mirrored in the `from_config` doc comment.
+
+### Queued as follow-up OpenSpec changes (not this branch)
+
+Listed by reviewer's overall recommendation §2. Each gets its own
+change + branch per the "one change per branch" rule.
+
+- **S-4** (`build_spike_observer` panics if `Config::global()` is
+  unset). Follow-up `spike-graceful-degrade-on-missing-config`.
+  Add a public `SpikeObserver::inactive()` sibling of `from_config`
+  and downgrade the `expect` to a `let-else` returning the inactive
+  observer. (The private `inactive_sink()` added in this round
+  already does the work; the follow-up just promotes it to the
+  public API and wires `build_spike_observer` to use it.)
+- **S-5** (`fqn` has an unreachable `unwrap_or` after the closure
+  branch). Folded into `spike-tidy-fqn-and-deadcode` together with
+  S-12 and S-14.
+- **S-6** (dead lifetime parameter on `LocalFcallInfo`) — **fixed
+  here as part of S-1**. No follow-up needed.
+- **S-7** (drift guard does not cover the two new spike
+  directives). Follow-up `directive-table-spike-defaults-drift-guard`,
+  or fold into the existing R-7 follow-up
+  `lock-readme-directive-table`.
+- **S-8** (`spike_log_path` documented as absolute but not
+  validated). Follow-up `spike-log-path-validate-absolute`.
+- **S-9** (each observed call allocates two `String`s on the hot
+  path). Inline `// NOTE for Phase 2` comment is the suggested
+  output; folded into `spike-doc-cleanup`.
+- **S-10** (integration test's `assert_pair` accepts duplicate hits
+  silently). Follow-up `spike-tighten-integration-assertions`.
+- **S-11** (`tests/php-spike/run.sh` shells out to `python3` for
+  one JSON field). Follow-up `spike-portable-run-sh` (or fold into
+  the PHP-8.3 verification change since both touch the harness).
+- **S-12** (`with_sink` doc comment is easy to misread). Folded
+  into `spike-tidy-fqn-and-deadcode`.
+- **S-13** (`should_observe` caching claim is unverified). Soften
+  the doc or cite the upstream line that implements the caching.
+  Folded into `spike-doc-cleanup`.
+- **S-14** (`LocalFcallInfo::empty()` is reachable only via the
+  null-`func` defensive branch and produces a silently-misleading
+  fqn). Folded into `spike-tidy-fqn-and-deadcode`.
 
