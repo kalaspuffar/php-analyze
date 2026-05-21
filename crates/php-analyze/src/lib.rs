@@ -28,12 +28,17 @@
 //!   (`php_analyze.spike_observer = 0`). Reached only through the
 //!   `BootObserver::Spike` variant; production loads with the default
 //!   directive set route through `BootObserver::Recorder`.
+//! - [`wire`] — serde-derived types matching `SPECIFICATION.md` §4.2
+//!   (the MessagePack batch schema the Phase-4 shipper will encode and
+//!   the `stub-ingest` crate decodes). Production-side encode-only in
+//!   this slice: no Recorder→Wire conversion until Phase 4.
 
 pub mod bootstrap;
 pub mod clocks;
 pub mod config;
 pub mod recorder;
 pub mod spike;
+pub mod wire;
 
 pub use config::initialise_from_ini;
 pub use config::{Config, ConfigError, ConfigWarning, DisableReason, RawIni, TokenSource};

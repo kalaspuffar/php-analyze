@@ -41,10 +41,23 @@ rustc-hash = "2"
 # new crates in the lockfile. `ext-php-rs::ffi` only re-exports Zend
 # types, not POSIX clock symbols.
 libc = "0.2"
+# `serde` + `rmp-serde` are Phase 3 additions: the `wire` module derives
+# `Serialize`/`Deserialize` on the §4.2 MessagePack schema types, and
+# `rmp_serde::to_vec_named` / `from_slice` are the encoder/decoder pair
+# the Phase-4 shipper and the `stub-ingest` crate share. `serde` was
+# already a transitive dep via `ext-php-rs`; we promote it to a direct
+# dep so the wire derive isn't relying on a transitive supply chain.
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
 
 [dev-dependencies]
 # Used by the `auth_token_file` precedence tests in §4.6/§4.7/§4.8.
 tempfile = "3"
+# `rmpv` lets a handful of `wire::tests` hand-construct MessagePack maps
+# (e.g. the forward-compat "extra unknown field" test) without writing a
+# raw-bytes encoder by hand. It is *not* part of the production crate's
+# closure — the Phase-4 shipper uses `rmp-serde` directly.
+rmpv = "1"
 
 [features]
 # Diagnostic-only: enables a `recorder::dump` module that writes the
