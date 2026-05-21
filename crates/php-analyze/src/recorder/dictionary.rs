@@ -75,6 +75,16 @@ impl Dictionary {
         fn_id
     }
 
+    /// `true` if `key` is already interned. Cheap — a single hashmap
+    /// probe — and added in slice 3 (`recorder-depth-and-cap-drops`)
+    /// so the cap-gate can project whether a begin would incur a
+    /// dictionary-miss allocation without itself triggering the
+    /// allocation. The cap-gate uses this read **before** staging so
+    /// a dropped begin never leaves a half-interned key behind.
+    pub fn contains_key(&self, key: &FunctionKey) -> bool {
+        self.intern.contains_key(key)
+    }
+
     /// Drain and return all `DictEntry`s staged since the last call.
     /// The interning map is left intact, so repeat lookups continue to
     /// return the same `fn_id`s without staging fresh entries.

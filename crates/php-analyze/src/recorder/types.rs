@@ -15,10 +15,12 @@
 //! fails loudly if any future edit pulls the wire layer up into the
 //! substrate.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::clocks;
+use crate::recorder::accounting;
 use crate::recorder::Dictionary;
 
 /// Categorisation of a PHP function for dictionary-key purposes.
@@ -225,6 +227,23 @@ pub struct RequestIdentity {
     pub uri_or_script: String,
 }
 
+/// Per-trace cap thresholds, plumbed from `Config` into [`Trace::new`].
+///
+/// Slice 3 (`recorder-depth-and-cap-drops`) caches `Config::max_depth`
+/// and `Config::buffer_cap_bytes` onto the `Trace` itself so the hot
+/// path (`begin_with_snapshots`) never needs to touch `Config::global()`
+/// and tests can construct a `Trace` with arbitrary thresholds without
+/// poking the global config.
+///
+/// `max_depth` widens from `Config::max_depth: u16` to `u32` so the
+/// comparison against `Trace::virtual_depth: u32` happens without a
+/// cast on the hot path. The widening is lossless.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceLimits {
+    pub max_depth: u32,
+    pub buffer_cap_bytes: usize,
+}
+
 /// Per-request recorder state, owned by the PHP request thread.
 ///
 /// Mirrors `SPECIFICATION.md` §4.1.2 with two implementation choices
@@ -244,24 +263,37 @@ pub struct RequestIdentity {
 /// ## Field visibility and the size-estimate invariant
 ///
 /// The mutable state fields (`stack`, `buffer`, `dictionary`,
-/// `buffer_estimated_bytes`, `call_id_seq`) are `pub(crate)`, not `pub`.
-/// External callers go through the accessor methods ([`push_record`],
-/// [`push_dict_entry_via_intern`], [`next_call_id`]) so the invariant
-/// can be enforced:
+/// `buffer_estimated_bytes`, `call_id_seq`, `virtual_depth`,
+/// `dropped_begins`) are `pub(crate)`, not `pub`. External callers
+/// go through the accessor methods ([`push_record`],
+/// [`push_dict_entry_via_intern`], [`next_call_id`], [`record_drop`])
+/// so the invariants can be enforced:
 ///
-/// **Invariant**: `buffer_estimated_bytes` is always
+/// **Invariant (estimator)**: `buffer_estimated_bytes` is always
 /// [`estimate_batch_bytes`]`(&dictionary.new_entries, &buffer)`.
 ///
-/// Slice 3 (`recorder-depth-and-cap-drops`) extends this invariant to
-/// include the in-progress dictionary and to drive the `flush_bytes` /
-/// `buffer_cap_bytes` thresholds. Phase-2 slice 2's observer wiring
-/// touches the state only through the accessors below, so an
-/// independently-evolved hot-path cannot desync the estimator from the
-/// buffer contents.
+/// **Invariant (LIFO pairing)**: `virtual_depth - dropped_begins ==
+/// stack.len()` after every balanced begin/end pair. Equivalently,
+/// every `record_drop` is matched by exactly one
+/// `dropped_begins -= 1` inside `finish_call_record`'s LIFO consume
+/// branch.
+///
+/// **Invariant (atomic budget)**: with the `accounting`
+/// reset-for-test guard held and one trace alive,
+/// `accounting::snapshot()` equals `buffer_estimated_bytes` after
+/// every accept or drop, and returns to zero after the matching
+/// `rshutdown_release_trace`.
+///
+/// Slice 2's observer wiring touches the state only through the
+/// accessors below; slice 3 extends the accessors with the
+/// per-trace `record_drop()` helper and routes the `push_record`
+/// record-byte bill through [`accounting::add`] so the process-wide
+/// budget stays consistent across concurrent FPM workers.
 ///
 /// [`push_record`]: Self::push_record
 /// [`push_dict_entry_via_intern`]: Self::push_dict_entry_via_intern
 /// [`next_call_id`]: Self::next_call_id
+/// [`record_drop`]: Self::record_drop
 #[derive(Debug)]
 pub struct Trace {
     pub trace_id: [u8; 16],
@@ -270,18 +302,41 @@ pub struct Trace {
     pub pid: u32,
     pub sapi: Arc<str>,
     pub uri_or_script: String,
+
+    /// Per-trace `Arc<AtomicU64>` drop counter (AD-9). Phase 4 clones
+    /// the `Arc` into `PendingBatch::drop_counter` so the shipper
+    /// reads it at encode time without re-entering the recorder. The
+    /// counter is monotonic-increase from zero and is never
+    /// decremented; cross-thread reads use `Ordering::Acquire`.
+    pub drop_counter: Arc<AtomicU64>,
+
     pub(crate) call_id_seq: u64,
-    // Slice 2 (`recorder-observer-hooks-and-trace-lifecycle`) is the
-    // first non-test reader: the begin handler pushes a `CallFrame` on
-    // entry, the end handler pops on exit. Until then dead-code
-    // analysis would flag the field — but removing it would force a
-    // slice-2 type-shape change, which is exactly what this substrate
-    // slice exists to avoid.
-    #[allow(dead_code)]
     pub(crate) stack: Vec<CallFrame>,
     pub(crate) buffer: Vec<CallRecord>,
     pub(crate) dictionary: Dictionary,
     pub(crate) buffer_estimated_bytes: usize,
+
+    /// PHP-side call depth — incremented on every observed `begin`,
+    /// decremented on every observed `end`, regardless of accept /
+    /// drop. The depth gate compares this against [`max_depth`].
+    /// `u32` ceiling is comfortably above `Config::max_depth`'s
+    /// `u16` range; overflow is not a realistic concern.
+    pub(crate) virtual_depth: u32,
+
+    /// LIFO matcher for begin/end pairing through drops. Incremented
+    /// when a begin is dropped; decremented when the matching end
+    /// arrives. Per-thread LIFO is guaranteed by the Zend Engine, so
+    /// a single counter suffices — no per-call state is needed.
+    pub(crate) dropped_begins: u32,
+
+    /// Cached threshold from `Config::max_depth`. Widened from `u16`
+    /// to `u32` so the hot-path comparison with `virtual_depth`
+    /// happens without a cast. Slice-3 design D-1.
+    pub(crate) max_depth: u32,
+
+    /// Cached threshold from `Config::buffer_cap_bytes`. Slice-3
+    /// design D-3 / D-4.
+    pub(crate) buffer_cap_bytes: usize,
 }
 
 impl Trace {
@@ -292,7 +347,12 @@ impl Trace {
     /// arrives in Phase 4. `start_time_realtime_ns` is captured here, at
     /// construction, because the recorder needs the request anchor as
     /// early as possible and `clocks::realtime_now_ns` is cheap.
-    pub fn new(identity: RequestIdentity) -> Self {
+    ///
+    /// `limits` carries the cached `max_depth` and `buffer_cap_bytes`
+    /// thresholds (slice 3 design D-1 / D-3). A fresh `Arc<AtomicU64>`
+    /// drop counter is constructed here, per AD-9 — every trace gets
+    /// its own counter so cross-trace contamination is impossible.
+    pub fn new(identity: RequestIdentity, limits: TraceLimits) -> Self {
         let RequestIdentity {
             host,
             sapi,
@@ -306,11 +366,16 @@ impl Trace {
             pid,
             sapi,
             uri_or_script,
+            drop_counter: Arc::new(AtomicU64::new(0)),
             call_id_seq: 0,
             stack: Vec::new(),
             buffer: Vec::new(),
             dictionary: Dictionary::new(),
             buffer_estimated_bytes: 0,
+            virtual_depth: 0,
+            dropped_begins: 0,
+            max_depth: limits.max_depth,
+            buffer_cap_bytes: limits.buffer_cap_bytes,
         }
     }
 
@@ -329,15 +394,28 @@ impl Trace {
         self.call_id_seq
     }
 
-    /// Push a completed `CallRecord` into the pending buffer and update
-    /// the size-estimate by exactly the §3.2 per-record contribution.
+    /// Push a completed `CallRecord` into the pending buffer.
     ///
     /// This is the only sanctioned way to grow `buffer`; going through
     /// the accessor keeps `buffer_estimated_bytes` aligned with the
-    /// invariant documented on [`Trace`].
+    /// estimator invariant documented on [`Trace`].
+    ///
+    /// ## Billing split (slice-3 design D-3)
+    ///
+    /// Slice 3 routes the per-record `CALL_RECORD_FIXED_BYTES`
+    /// contribution through both the per-trace estimator AND the
+    /// process-wide [`accounting`] atomic. The dict-miss portion of
+    /// a call's budget is billed at `begin` time (inside
+    /// [`push_dict_entry_via_intern`]) so the cap-gate has the most
+    /// pessimistic projection; the record portion is billed at `end`
+    /// time (here) so the gate at begin still under-estimates by at
+    /// most one `CALL_RECORD_FIXED_BYTES`, which the gate's
+    /// `would_add = CALL_RECORD_FIXED_BYTES + dict_miss_cost`
+    /// projection compensates for.
     pub fn push_record(&mut self, record: CallRecord) {
         self.buffer.push(record);
         self.buffer_estimated_bytes += CALL_RECORD_FIXED_BYTES;
+        accounting::add(CALL_RECORD_FIXED_BYTES);
     }
 
     /// Intern a function key and update the size-estimate by the §3.2
@@ -346,6 +424,12 @@ impl Trace {
     ///
     /// Mirrors [`Dictionary::intern`]'s lazy-allocate contract: the
     /// `build` closure runs at most once, only on a miss.
+    ///
+    /// On a miss, the dict-entry portion of the §3.2 estimator is
+    /// added to **both** the per-trace `buffer_estimated_bytes`
+    /// **and** the process-wide [`accounting::BYTES_IN_MEMORY`]
+    /// atomic so the cap-gate's projection stays consistent across
+    /// concurrent FPM workers (slice-3 design D-3 / D-4).
     pub fn push_dict_entry_via_intern(
         &mut self,
         key: FunctionKey,
@@ -354,9 +438,26 @@ impl Trace {
         let estimate = &mut self.buffer_estimated_bytes;
         self.dictionary.intern(key, |fn_id| {
             let entry = build(fn_id);
-            *estimate += DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len();
+            let contribution = DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len();
+            *estimate += contribution;
+            accounting::add(contribution);
             entry
         })
+    }
+
+    /// Record a dropped begin: bump the `Arc<AtomicU64>` drop counter
+    /// (shared with the future shipper) and increment the LIFO
+    /// `dropped_begins` matcher (consumed by `finish_call_record`).
+    ///
+    /// Centralises the two-step drop so the begin-gate call sites
+    /// (depth gate, cap gate) stay readable. `Ordering::Relaxed` on
+    /// the atomic increment is sufficient because the only
+    /// cross-thread reader is Phase 4's shipper, which will use
+    /// `Ordering::Acquire` on the load side and is published through
+    /// the channel-send happens-before edge anyway.
+    pub(crate) fn record_drop(&mut self) {
+        self.drop_counter.fetch_add(1, Ordering::Relaxed);
+        self.dropped_begins = self.dropped_begins.saturating_add(1);
     }
 }
 
@@ -446,8 +547,8 @@ mod tests {
     }
 
     /// Build a `RequestIdentity` from string literals. Centralises the
-    /// boilerplate so tests stay readable; one slice-2-and-later caller
-    /// fills in `Trace::new`'s only argument.
+    /// boilerplate so tests stay readable; slice-2-and-later callers
+    /// fill in `Trace::new`'s first argument.
     fn sample_identity(host: &str, sapi: &str, pid: u32, uri_or_script: &str) -> RequestIdentity {
         RequestIdentity {
             host: Arc::from(host),
@@ -457,9 +558,37 @@ mod tests {
         }
     }
 
+    /// Slice-3 [`TraceLimits`] preset matching the directive-table
+    /// defaults from `config.rs` — a tall depth ceiling and a 64-MiB
+    /// budget — so tests that don't care about the gates inherit the
+    /// "uncapped" behaviour the slice-2 tests had before slice 3.
+    pub(super) fn permissive_limits() -> TraceLimits {
+        TraceLimits {
+            max_depth: 1024,
+            buffer_cap_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    /// Build a `Trace` with permissive limits — the slice-3 shorthand
+    /// that keeps the slice-2 test bodies short while still exercising
+    /// the new `Trace::new` signature.
+    pub(super) fn trace_with(identity: RequestIdentity) -> Trace {
+        Trace::new(identity, permissive_limits())
+    }
+
+    /// Acquire the slice-3 accounting test-lock for the duration of a
+    /// test that touches the process-wide budget. Callers also call
+    /// `accounting::reset_for_test()` after acquiring.
+    pub(super) fn account_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::recorder::accounting::acquire_test_lock()
+    }
+
     #[test]
     fn trace_new_produces_the_documented_initial_state() {
-        let trace = Trace::new(sample_identity(
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let trace = trace_with(sample_identity(
             "host.example",
             "cli",
             12345,
@@ -475,6 +604,8 @@ mod tests {
         assert!(trace.stack.is_empty(), "fresh stack must be empty");
         assert!(trace.buffer.is_empty(), "fresh buffer must be empty");
         assert_eq!(trace.buffer_estimated_bytes, 0);
+        assert_eq!(trace.virtual_depth, 0);
+        assert_eq!(trace.dropped_begins, 0);
         assert!(
             trace.start_time_realtime_ns > 0,
             "start_time_realtime_ns must be populated from CLOCK_REALTIME"
@@ -499,7 +630,7 @@ mod tests {
 
     #[test]
     fn trace_next_call_id_is_monotonic_from_one() {
-        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
+        let mut trace = trace_with(sample_identity("host", "cli", 1, "/s.php"));
         let ids: Vec<u64> = (0..5).map(|_| trace.next_call_id()).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(trace.call_id_seq, 5);
@@ -507,7 +638,10 @@ mod tests {
 
     #[test]
     fn trace_push_record_appends_to_buffer_and_bumps_the_estimate_by_64() {
-        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with(sample_identity("host", "cli", 1, "/s.php"));
         let before = trace.buffer_estimated_bytes;
         trace.push_record(sample_call_record());
         assert_eq!(trace.buffer.len(), 1, "buffer must hold the new record");
@@ -516,11 +650,19 @@ mod tests {
             CALL_RECORD_FIXED_BYTES,
             "estimate must grow by exactly the §3.2 per-record constant"
         );
+        assert_eq!(
+            accounting::snapshot(),
+            CALL_RECORD_FIXED_BYTES,
+            "push_record must also bill the process-wide atomic (slice-3 D-3)",
+        );
     }
 
     #[test]
     fn trace_push_dict_entry_via_intern_bumps_estimate_only_on_a_miss() {
-        let mut trace = Trace::new(sample_identity("host", "cli", 1, "/s.php"));
+        let _guard = account_guard();
+        accounting::reset_for_test();
+
+        let mut trace = trace_with(sample_identity("host", "cli", 1, "/s.php"));
 
         let key = FunctionKey::Internal {
             name: Arc::from("strlen"),
@@ -544,9 +686,15 @@ mod tests {
             expected_dict_contribution,
             "miss must grow estimate by the §3.2 per-dict-entry formula"
         );
+        assert_eq!(
+            accounting::snapshot(),
+            expected_dict_contribution,
+            "miss must also bill the process-wide atomic (slice-3 D-4)",
+        );
 
         // Hit: estimate must not change, build closure must not run.
         let estimate_before_hit = trace.buffer_estimated_bytes;
+        let snapshot_before_hit = accounting::snapshot();
         let mut build_ran = false;
         let second = trace.push_dict_entry_via_intern(key, |fn_id| {
             build_ran = true;
@@ -563,6 +711,11 @@ mod tests {
         assert_eq!(
             trace.buffer_estimated_bytes, estimate_before_hit,
             "hit must leave the estimate unchanged"
+        );
+        assert_eq!(
+            accounting::snapshot(),
+            snapshot_before_hit,
+            "hit must leave the process-wide atomic unchanged",
         );
     }
 
@@ -608,12 +761,112 @@ mod tests {
             pid: 4242,
             uri_or_script: "/srv/app/index.php?route=/api/v1/users".to_owned(),
         };
-        let trace = Trace::new(identity.clone());
+        let trace = Trace::new(identity.clone(), permissive_limits());
 
         assert_eq!(&*trace.host, &*identity.host);
         assert_eq!(&*trace.sapi, &*identity.sapi);
         assert_eq!(trace.pid, identity.pid);
         assert_eq!(trace.uri_or_script, identity.uri_or_script);
+    }
+
+    // --- Slice-3 tests ------------------------------------------------
+
+    #[test]
+    fn trace_new_initialises_drop_counter_to_zero_and_arc_is_unique_per_call() {
+        let trace_a = trace_with(sample_identity("h", "cli", 1, "/a.php"));
+        assert_eq!(
+            trace_a.drop_counter.load(Ordering::Acquire),
+            0,
+            "fresh drop counter must read zero",
+        );
+
+        let trace_b = trace_with(sample_identity("h", "cli", 1, "/b.php"));
+
+        // Mutate `trace_a`'s counter; `trace_b`'s must stay zero.
+        trace_a.drop_counter.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(trace_a.drop_counter.load(Ordering::Acquire), 7);
+        assert_eq!(
+            trace_b.drop_counter.load(Ordering::Acquire),
+            0,
+            "second trace's counter must be independent (AD-9)",
+        );
+
+        // The Arc itself is distinct, not a clone of the same allocation.
+        assert!(
+            !Arc::ptr_eq(&trace_a.drop_counter, &trace_b.drop_counter),
+            "each Trace::new must allocate a fresh Arc<AtomicU64>",
+        );
+    }
+
+    #[test]
+    fn trace_new_initialises_virtual_depth_and_dropped_begins_to_zero() {
+        let trace = trace_with(sample_identity("h", "cli", 1, "/a.php"));
+        assert_eq!(trace.virtual_depth, 0);
+        assert_eq!(trace.dropped_begins, 0);
+    }
+
+    #[test]
+    fn trace_new_caches_max_depth_and_buffer_cap_bytes_from_request_limits() {
+        let limits = TraceLimits {
+            max_depth: 42,
+            buffer_cap_bytes: 99,
+        };
+        let trace = Trace::new(sample_identity("h", "cli", 1, "/a.php"), limits);
+        assert_eq!(trace.max_depth, 42);
+        assert_eq!(trace.buffer_cap_bytes, 99);
+    }
+
+    #[test]
+    fn record_drop_bumps_both_counter_and_dropped_begins() {
+        let mut trace = trace_with(sample_identity("h", "cli", 1, "/a.php"));
+        let counter_before = trace.drop_counter.load(Ordering::Acquire);
+        let lifo_before = trace.dropped_begins;
+
+        trace.record_drop();
+
+        assert_eq!(
+            trace.drop_counter.load(Ordering::Acquire),
+            counter_before + 1,
+            "Arc<AtomicU64> drop counter must bump by 1",
+        );
+        assert_eq!(
+            trace.dropped_begins,
+            lifo_before + 1,
+            "LIFO matcher must bump by 1",
+        );
+
+        // Three more drops should yield exactly three more increments
+        // on both counters — confirming the centralisation invariant.
+        trace.record_drop();
+        trace.record_drop();
+        trace.record_drop();
+        assert_eq!(
+            trace.drop_counter.load(Ordering::Acquire),
+            counter_before + 4
+        );
+        assert_eq!(trace.dropped_begins, lifo_before + 4);
+    }
+
+    #[test]
+    fn two_consecutive_traces_have_independent_arc_drop_counters() {
+        // Sanity check on AD-9: even after the previous trace bumps
+        // its counter heavily, the next allocation must start fresh.
+        let trace_one = trace_with(sample_identity("h", "cli", 1, "/a.php"));
+        for _ in 0..50 {
+            trace_one.drop_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(trace_one.drop_counter.load(Ordering::Acquire), 50);
+
+        let trace_two = trace_with(sample_identity("h", "cli", 1, "/a.php"));
+        assert_eq!(
+            trace_two.drop_counter.load(Ordering::Acquire),
+            0,
+            "AD-9: per-trace Arc<AtomicU64> must not inherit previous trace's count",
+        );
+        assert!(
+            !Arc::ptr_eq(&trace_one.drop_counter, &trace_two.drop_counter),
+            "the Arc itself must be a fresh allocation, not a clone",
+        );
     }
 
     #[test]
