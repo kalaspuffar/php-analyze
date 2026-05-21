@@ -3389,3 +3389,470 @@ openspec validate shipper-thread-and-channel --strict            valid
   in this slice as a side benefit; the queued OpenSpec change can
   be removed from the follow-up list.
 
+## Code Review — branch `feat/shipper-thread-and-channel` (round 1)
+
+**Branch:** `feat/shipper-thread-and-channel`
+**Reviewer:** Claude Code
+**Date:** 2026-05-21
+**Base:** `main` @ `b3635bf` · **Head:** `e219a74`
+**Specification:** `SPECIFICATION.md` §3.3 (Shipper), §3.4 (Process-wide
+bootstrap & shutdown), §5.3 (Recorder→Shipper channel), AC-BS-4,
+AC-PB-1, AC-PB-2, R-10.
+**Diff scope:** 6 files, +1190 / −10. Net new code in
+`crates/php-analyze/src/shipper/mod.rs` (739 lines including 15
+unit tests) and ~230 lines into `crates/php-analyze/src/bootstrap.rs`
+(of which ~145 are 5 new lifecycle tests). One-line additions to
+`lib.rs`, `Cargo.toml`, and `Cargo.lock`.
+
+### Summary
+
+Slice-1 substrate for Phase 4 is in solid shape. The two-phase
+`run_loop` state machine is well-isolated as a pure function over
+a `Receiver`, the four termination conditions are each exercised
+by a focused unit test, and the CAS-guarded lazy spawn / mutex-held
+sender are the right primitives for the FPM lifecycle. The
+`Mutex<Option<Sender>>` deviation from the proposal's `OnceLock`
+sketch is well-justified and well-documented (C-13 #1). The
+bootstrap-side `fn(Option<&Config>)` helpers make R-10
+silent-disable empirically testable end-to-end. Manual host
+verification on PHP 8.4.21 covers AC-PB-1 / AC-PB-2 / AC-BS-4 and
+the "Disabled extension spawns no background threads" scenario.
+
+That said, one design call carries a latent slice-2 hazard worth
+flagging now (#R-1 below), and there are two minor doc / type-shape
+items that would clean up the substrate before more code lands on
+top.
+
+### Major issues (fix before slice 2 lands)
+
+#### R-1 (Major): `grace` deadline is silently bypassed when the channel is full at MSHUTDOWN
+
+**File:** `crates/php-analyze/src/shipper/mod.rs:271-281`
+
+`drain_and_join_at_mshutdown` uses `Sender::try_send` to deliver
+`ShipperMessage::Drain { deadline }`:
+
+```rust
+let _ = sender.try_send(ShipperMessage::Drain { deadline });
+drop(sender);
+```
+
+If the channel is saturated (`crossbeam_channel::TrySendError::Full`),
+`try_send` returns `Err` and the `Drain` message — which is what
+carries the deadline into `run_loop` — is **never delivered**. The
+shipper therefore stays in its pre-drain phase blocking on
+`recv()`. The `drop(sender)` closes the channel from the sender
+side, but crossbeam semantics keep queued items receivable until
+empty, so the shipper consumes the entire backlog before
+`Err(Disconnected)` lets it return with `drain_completed: true,
+batches_abandoned_at_deadline: 0`. **No deadline check ever runs.**
+
+In slice 1 this is harmless: dropping a batch is a few instructions
+and the backlog drains in microseconds (the 1000-batch test exits
+under 250 ms). The moment slice 2 adds `rmp_serde::to_vec_named` +
+`ureq` POST + per-attempt timeout × `retry_count + 1` retries per
+batch, an FPM worker recycled by `pm.max_requests` with a full
+queue could spend `shipper_queue_depth × retry_count × max(
+http_timeout_ms, retry_backoff_ms × 2^attempt)` finishing the
+backlog — i.e. 8 × 3 × 2 s = 48 s with default config — directly
+violating AC-BS-4 / AC-PB-2 (`shutdown_grace_ms + 200 ms`).
+
+**Suggestion:** at minimum, leave a `TODO(slice-2)` comment on the
+`try_send` line so the assumption is recorded. Better, fix it now
+in one of two ways:
+
+1. Use `send_timeout(Drain, grace)` instead — the Drain message
+   then either lands or fails within the grace itself, and the
+   recv-loop sees the deadline either way.
+2. Stash the deadline in a sibling `Mutex<Option<Instant>>` (or
+   `OnceLock<Instant>`) that the shipper checks at the head of
+   each loop iteration when no Drain has been seen yet — letting
+   the pre-drain phase also honour the deadline.
+
+Option 2 is closer to the spec's hint in §3.4 ("wrap the shipper
+to self-exit at the deadline and signal via a separate completion
+channel"). Option 1 is a one-line change for slice 1 that gets us
+deadline coverage essentially for free.
+
+Either way, this needs to be sorted **before** slice 2 wires
+real work into `run_loop`, otherwise AC-BS-4 / AC-PB-2 will fail
+under any backpressure scenario.
+
+#### R-2 (Major): `ShipperExit` carries an implicit invariant — make it unrepresentable
+
+**File:** `crates/php-analyze/src/shipper/mod.rs:58-77`
+
+`ShipperExit { batches_drained, drain_completed, batches_abandoned_at_deadline }`
+encodes a tacit invariant: `drain_completed == true` iff
+`batches_abandoned_at_deadline == 0`. Today's `run_loop` upholds
+it, but the struct shape lets slice-2/3 code accidentally construct
+`{ drain_completed: false, batches_abandoned_at_deadline: 0 }` (a
+deadline pass with nothing abandoned — semantic nonsense) or
+`{ drain_completed: true, batches_abandoned_at_deadline: 17 }`
+(clean close with 17 records lost — would mis-route the future
+`E_NOTICE` log line). CLAUDE.md "Rust Code Style" calls this out
+directly: *"Types over conventions — use newtypes, enums, `Result`,
+`Option` to make invalid states unrepresentable."*
+
+**Suggestion:** model the exit as an enum:
+
+```rust
+pub(crate) enum ShipperExit {
+    /// Channel closed cleanly (pre-drain or post-drain). All
+    /// queued batches were consumed.
+    Drained { batches: u64 },
+    /// Drain phase ran out of grace; abandoned batches were still
+    /// queued at the deadline.
+    DeadlinePassed { drained: u64, abandoned: u64 },
+}
+```
+
+The slice-2 encoder and the slice-3 `E_NOTICE` writer can then
+`match` on the variant; impossible states stay impossible. Costs
+~20 lines of churn in `run_loop` and the tests, no behaviour change.
+The tasks.md §2.3 rationale ("named fields rather than a tuple so
+future fields can be added") still applies — each variant keeps
+named fields.
+
+### Minor issues (recommended but not blocking)
+
+#### R-3 (Minor): Incorrect comment in `install_panicking_handle_for_test`
+
+**File:** `crates/php-analyze/src/shipper/mod.rs:375-377`
+
+```rust
+// Give the joiner a stable observation: panic immediately,
+// before any recv. The unused `_rx` is dropped at the test
+// teardown via `reset_for_test`.
+panic!("intentional panic for drain_and_join_at_mshutdown test");
+```
+
+`_rx` is a local binding inside `install_panicking_handle_for_test`;
+it is dropped when the function returns — well before
+`reset_for_test` runs at the end of the test. The comment is
+misleading. Suggested rewrite:
+
+```rust
+// Panic immediately, before any recv. The locally-bound `_rx`
+// drops when this function returns; the panicking thread never
+// touches the receiver.
+```
+
+#### R-4 (Minor): `startup` lacks an explicit `catch_unwind` around the new install call
+
+**File:** `crates/php-analyze/src/bootstrap.rs:154-173`
+
+All other lifecycle FFI hooks in this file wrap their bodies in
+`std::panic::catch_unwind` (MSHUTDOWN at L215, RINIT at L267,
+RSHUTDOWN at L320). `startup` does not, and the new
+`install_shipper_if_enabled(Config::global())` call is now inside
+that unwrapped frame. The actual panic risk is low: the validated
+`shipper_queue_depth` is clamped to `[1, 1024]`, mutex poisoning
+is handled via `unwrap_or_else(|e| e.into_inner())`, and the
+`bounded(depth)` allocation is bounded. But the inconsistency
+invites future trouble — slice 2's `ureq::Agent` configuration at
+MINIT, if it lands in `startup`, would be a much more plausible
+panic site.
+
+**Suggestion:** either factor `startup`'s post-warning body into a
+`startup_body()` and wrap it in `catch_unwind` (matching the
+`mshutdown`/`rinit`/`rshutdown` pattern), or add a `// Safety:` /
+`// Panic-safe by inspection` block to the doc comment listing the
+panic-free properties currently relied on. The first option is
+~6 lines of change and removes the future-trap.
+
+#### R-5 (Minor): `spawn_if_needed_at_rinit` leaves `SENDER_SLOT` populated on `thread::Builder::spawn` failure
+
+**File:** `crates/php-analyze/src/shipper/mod.rs:245-251`
+
+```rust
+let handle = thread::Builder::new()
+    .name("php-analyze-shipper".to_owned())
+    .spawn(move || run_loop(rx))
+    .expect("OS thread spawn for the shipper failed");
+```
+
+If the OS refuses the spawn (EAGAIN, EMFILE — the textbook FPM
+resource-exhaustion case), this `.expect` panics. The RINIT
+`catch_unwind` correctly contains the panic. But the resulting
+process state is: `SHIPPER_SPAWNED == true`, `SHIPPER_HANDLE == None`
+(spawn never returned, so the stash never ran), `RECEIVER_SLOT ==
+None` (taken just before the spawn attempt at L237), and
+**`SENDER_SLOT` still holds a live Sender**. A Recorder doing
+`try_send` later in the same request will succeed (the channel has
+capacity) but no thread is reading. `drain_and_join_at_mshutdown`
+will then take the Sender, `try_send(Drain)`, drop the Sender, take
+the empty `SHIPPER_HANDLE` slot, and correctly return
+`NotInstalled` — but every batch sent in the interim is silently
+queued and dropped at MSHUTDOWN unaccounted-for.
+
+Slice 1 has no Recorder producer, so this is dormant. Slice 2
+needs to either:
+1. Clear `SENDER_SLOT` (and reset `SHIPPER_SPAWNED`) on the spawn-
+   failure path before re-panicking, so subsequent `try_send`s see
+   no channel and skip the work.
+2. Replace the `.expect` with a `Result`-returning function that
+   bubbles up to a silent-disable + one `E_WARNING` (matches the
+   AD-4 posture).
+
+Worth at least a `TODO(slice-2)` next to the `.expect` so the
+state-leak is documented for the next pass.
+
+#### R-6 (Minor): Deadline-pass-under-backlog has no end-to-end automated test
+
+**File:** `crates/php-analyze/src/shipper/mod.rs:689-715`
+
+`drain_and_join_at_mshutdown_respects_the_grace_deadline_under_a_backlog`
+sends 1000 batches with `grace = 50 ms` and asserts
+`JoinOutcome::Clean(_)` plus a 250 ms wall-time bound. Because
+slice-1 `run_loop` drops batches in microseconds, the run almost
+always terminates via `Err(Disconnected)` (channel closes faster
+than the grace), not via `Err(Timeout)`. The deadline-pass branch
+is only exercised by the pure
+`run_loop_with_drain_past_deadline_abandons_queued_batches` (which
+uses a `now - 1 ms` deadline to force Timeout).
+
+Acceptable for slice 1's contract, but slice 2 must add a real
+backpressure-under-deadline integration test (e.g. inject an
+`on_batch` callback that sleeps `100 ms`, run with `grace = 200 ms`,
+assert `JoinOutcome::Clean(ShipperExit::DeadlinePassed { .. })`
+and a non-zero `abandoned` count). Tracking it now so it doesn't
+slip with slice 2's PR.
+
+#### R-7 (Minor): Thread name truncated to 15 chars — operators see `php-analyze-shi`
+
+**Files:** `crates/php-analyze/src/shipper/mod.rs:246`, `COMMENTS.md` C-13 #4
+
+`thread::Builder::new().name("php-analyze-shipper".to_owned())`
+spawns a 19-char-named thread, but Linux's `TASK_COMM_LEN = 16`
+(15 chars + NUL) truncates `/proc/<pid>/task/<tid>/comm` to
+`php-analyze-shi`. Operators running `top -H -p <pid>` or
+`ps -L -p <pid>` see the truncated form, which looks like a
+half-corrupted name and is awkward to grep for. C-13 #4 records
+this is "not amended in code".
+
+**Suggestion:** rename to fit in 15 chars, e.g. `phpz-shipper`
+(12), `phpa-shipper` (12), `php-an-shipper` (14), or
+`pa-shipper` (10). Cosmetic only — does not affect any spec or
+test — but it removes a small operator-confusion footgun for one
+line of code change.
+
+### Nits
+
+- **Test surface is broad.** Eight `#[cfg(test)] pub(crate) fn`
+  accessors live at the module's top level (`sender_is_installed`,
+  `handle_is_installed`, `spawned_flag`, `receiver_is_installed`,
+  `clone_sender_for_test`, `install_panicking_handle_for_test`,
+  `acquire_test_lock`, `reset_for_test`). Could be grouped into a
+  `test_support` submodule or a single `TestProbe` struct returning
+  the booleans. Not blocking; just a maintenance cost as Phase 4
+  grows.
+- **Defensive `Ok(ShipperMessage::Drain { .. }) => {}`** at
+  `mod.rs:178` is defended in the doc and in C-13 #5. CLAUDE.md
+  "types over conventions" would prefer `debug_assert!(false,
+  "spec violation: second Drain")` in debug + silent ignore in
+  release. Style call; current code is acceptable.
+- **`unwrap_or_else(|e| e.into_inner())`** is repeated 10+ times.
+  Could be factored to a one-liner helper `fn lock_panic_safe(...)`
+  in the module. Minor DRY.
+- **`run_loop` doc** advertises "a fourth termination condition
+  via an `on_batch` callback" (mod.rs:153-155). Slice 1 has no
+  such callback; the doc reads as if the code is incomplete.
+  Suggest s/will grow/is the slice-2 hook for/ to make the
+  forward-pointing intent explicit.
+
+### Positive highlights
+
+- **Pure `run_loop` separation** from process-global state is
+  exactly the right shape — every state-machine transition is
+  testable with hand-built channels in microseconds, no
+  serialisation gymnastics required.
+- **CAS-with-revert** at `spawn_if_needed_at_rinit` handles the
+  no-channel-installed case cleanly, and
+  `concurrent_spawn_calls_race_to_a_single_thread` (Barrier-
+  coordinated, three threads) is the right stress test for the
+  CAS guard.
+- **`Mutex<Option<Sender>>` deviation** from the proposal's
+  `OnceLock<Sender>` sketch is well-justified (empty-channel
+  shutdown would otherwise burn the entire deadline). C-13 #1 and
+  the module-level doc both record the rationale crisply.
+- **Bootstrap-side `fn(Option<&Config>)` helpers** make R-10
+  silent-disable empirically testable. The five new
+  `bootstrap::tests` form a clean matrix — disabled-startup-no-
+  channel, enabled-startup-installs-channel, disabled-mshutdown-
+  noop, disabled-full-lifecycle-no-thread, enabled-full-lifecycle-
+  spawns-and-drains.
+- **Manual §10 verification** on real PHP 8.4.21 covers AC-PB-1,
+  AC-PB-2, AC-BS-4, and the modified "Disabled extension spawns
+  no background threads" scenario. The 37 / 51 / 61 ms shutdown
+  timings are well below the 5200 ms envelope.
+- **Forward-pointing doc comments** on `ShipperExit`, `JoinOutcome`,
+  and `run_loop` cite the slice-2 / slice-3 readers explicitly.
+  That keeps the trail between current code and queued work
+  navigable for a multi-slice phase.
+
+### Specification compliance
+
+- ✅ §3.4 / AC-PB-1 — one shipper thread per process after first
+  RINIT (verified via `/proc/<pid>/task` on the build host).
+- ✅ §3.4 / AC-PB-2 — MSHUTDOWN returns within `shutdown_grace +
+  200 ms` on an empty/zero-work backlog (verified manually and via
+  `drain_and_join_at_mshutdown_with_an_empty_channel_returns_clean_in_milliseconds`).
+  **⚠️ Caveat:** the full-channel hazard (R-1) means this contract
+  is **not** met in the worst case once slice 2 lands real work.
+- ✅ §3.1 AC-BS-4 — same caveat as AC-PB-2.
+- ✅ §3.1 R-10 — `mshutdown_body` short-circuits on
+  `!config.enabled`; `bootstrap_mshutdown_with_disabled_config_is_a_noop`
+  and `bootstrap_full_lifecycle_with_disabled_config_keeps_shipper_globals_empty`
+  verify the silent-disable posture end-to-end.
+- ✅ §1.4 OQ-5 — `crossbeam-channel = "0.5"` added as a direct dep.
+- ✅ §5.3 — bounded channel sized by `shipper_queue_depth` (clamped
+  `[1, 1024]` in `config.rs`).
+- ⚠️ §3.3 — `run_loop` drops batches silently; this is the
+  documented slice-1 scope. Encoding + POST + retry land in slice 2.
+- ❌ Out-of-scope-by-design — AC-SH-1..6 (encode + POST + retries),
+  threshold-driven flushes from the Recorder, `drop_counter`
+  stamping, R-13 channel-full-vs-buffer-cap distinction. All queued
+  for slice 2 / slice 3.
+
+### Overall recommendation
+
+**REQUEST CHANGES — narrow scope.**
+
+Fix R-1 (full-channel grace bypass: at minimum a `TODO(slice-2)`
+comment so slice 2 doesn't re-derive this from a bug report;
+ideally the one-line `send_timeout` swap) and R-3 (incorrect
+`_rx`-drop comment). Those two are the only items worth holding
+the PR for.
+
+R-2 (enum-shape `ShipperExit`), R-4 (`startup` catch_unwind), R-5
+(spawn-failure state leak), R-6 (deadline-pass automated test),
+R-7 (15-char thread name) are all worth doing but can be folded
+into slice-2's PR if they grow the diff too far. The nits are
+purely optional.
+
+Once R-1 and R-3 land, this slice is ready to merge — the
+substrate is exactly the right shape for slice 2's encoder + POST
+work to land on top without a refactor.
+
+---
+
+## C-14: Shipper-substrate round-1 review-fix status (branch `feat/shipper-thread-and-channel`)
+
+**Date:** 2026-05-21
+**Reviewer findings:** R-1 … R-7 plus four nits (see "Code Review —
+branch `feat/shipper-thread-and-channel` (round 1)" above).
+**Implementer response:** the reviewer's blocking set — R-1 (Major)
+and R-3 (Minor) — lands on this branch as a fix-round, following the
+precedent set by C-9 (slice-2 round-2 fix-commits), C-11 (slice-3
+round-1 fix-commits), and C-12 (wire-and-stub round-1 fix-commits).
+The five non-blocking items (R-2, R-4, R-5, R-6, R-7) and four nits
+are queued as follow-up OpenSpec changes per the reviewer's own
+§"Overall recommendation" guidance ("can be folded into slice-2's
+PR if they grow the diff too far"). Where the reviewer explicitly
+deferred a structural change to slice 2 (R-1's option-2 deadline
+exposure, R-5's spawn-failure recovery, R-6's deadline-pass
+integration test), the deferral is recorded inline in the source as a
+`TODO(slice-2)` comment so slice 2 inherits the work cleanly.
+
+### What changed on this branch in the fix-round
+
+| ID | Status | Implementation |
+| --- | --- | --- |
+| R-1 | Closed (slice-1 portion) | `drain_and_join_at_mshutdown` now uses `Sender::send_timeout(ShipperMessage::Drain { deadline }, grace)` rather than `Sender::try_send`. With `try_send`, a saturated channel would silently swallow the Drain message and the shipper would drain the entire backlog *without* ever seeing the deadline — harmless in slice 1 (each batch is a few instructions, the backlog drains in microseconds) but a worst-case `shipper_queue_depth × retry_count × max(http_timeout_ms, retry_backoff_ms × 2^attempt)` AC-BS-4 / AC-PB-2 violation once slice 2 wires real per-batch work into `run_loop`. `send_timeout(grace)` caps the wait at the grace itself; if it elapses before the channel accepts the Drain, the subsequent `drop(sender)` still closes the channel and the shipper exits via `Disconnected`. A `TODO(slice-2)` block above the `send_timeout` call records the remaining gap: even a delivered Drain is not enough when per-batch work is slow — slice 2 must expose the deadline to the recv-loop head (e.g. a sibling `OnceLock<Instant>` or `AtomicI64`-as-`Instant`) so the loop can self-exit before the Drain message surfaces. The existing `drain_and_join_at_mshutdown_respects_the_grace_deadline_under_a_backlog` test (1000 batches, grace = 50 ms) continues to pass; a true `send_timeout`-timeout-branch regression test is not reachable in slice 1 (the shipper drains too fast to fill the channel) and is queued for slice 2's PR. `crates/php-analyze/src/shipper/mod.rs:271-294`. |
+| R-3 | Closed | Corrected the misleading comment on the `panic!` body in `install_panicking_handle_for_test`. The previous wording said the unused `_rx` "is dropped at the test teardown via `reset_for_test`"; `_rx` is a local binding inside `install_panicking_handle_for_test` and drops when the function returns, well before `reset_for_test` runs at the end of the test. The new wording — "the locally-bound `_rx` drops when `install_panicking_handle_for_test` returns; the panicking thread itself never touches the receiver" — matches the reviewer's suggested rewrite verbatim in intent. `crates/php-analyze/src/shipper/mod.rs:375-378`. |
+
+### Deferred to follow-up OpenSpec changes (R-2, R-4 – R-7, nits)
+
+Each gets its own change + branch per the "one change per branch"
+rule. Listed in the reviewer's overall-recommendation order so the
+next session can pick them up without re-reading the full review:
+
+- **R-2** (`ShipperExit` is a struct with an implicit
+  `drain_completed ⇔ batches_abandoned_at_deadline == 0` invariant;
+  the struct shape lets slice 2/3 code construct semantically-nonsense
+  states). Follow-up `shipper-exit-as-enum`: model the exit as
+  `enum ShipperExit { Drained { batches }, DeadlinePassed { drained,
+  abandoned } }`, with each variant carrying named fields so future
+  counters can still grow without breaking match exhaustiveness.
+  ~20-line churn in `run_loop` and the unit tests, no behaviour
+  change. Naturally pairs with slice 2's encoder, which is the first
+  in-production reader of the variant.
+- **R-4** (`startup` lacks the `std::panic::catch_unwind` wrap that
+  every other lifecycle hook in `bootstrap.rs` carries — MSHUTDOWN at
+  L215, RINIT at L267, RSHUTDOWN at L320). The actual panic risk is
+  low (validated `shipper_queue_depth`, mutex-poison-tolerant locks,
+  bounded `crossbeam_channel::bounded` allocation), but the
+  inconsistency invites future trouble — slice 2's `ureq::Agent`
+  configuration at MINIT, if it lands in `startup`, would be a much
+  more plausible panic site. Follow-up `startup-catch-unwind`:
+  factor `startup`'s post-warning body into `startup_body()` and
+  wrap it in `catch_unwind` to match the
+  `mshutdown`/`rinit`/`rshutdown` pattern. ~6 lines of change.
+  Should land before any panic-producing code (encoder /
+  HTTP-client config) lands in `startup`.
+- **R-5** (`spawn_if_needed_at_rinit`'s `.expect("OS thread spawn for
+  the shipper failed")` leaves `SENDER_SLOT` populated when the OS
+  refuses the spawn — EAGAIN / EMFILE under FPM resource exhaustion).
+  Slice 1 has no producer so the state-leak is dormant. Follow-up
+  `spawn-failure-recovery`, must land in or before slice 2: either
+  (a) clear `SENDER_SLOT` (and reset `SHIPPER_SPAWNED`) on the
+  spawn-failure path before re-panicking, so subsequent `try_send`s
+  see no channel and skip the work, or (b) replace `.expect` with a
+  `Result`-returning helper that bubbles up to a silent-disable +
+  one `E_WARNING` (matches the AD-4 posture). A `TODO(slice-2)`
+  next to the `.expect` is the minimum bar; it has not been added
+  in this fix-round because the reviewer flagged R-5 as non-
+  blocking and the same line already carries a load-bearing
+  invariant comment. The follow-up change will own both the
+  comment and the recovery logic in one place.
+- **R-6** (`drain_and_join_at_mshutdown_respects_the_grace_deadline_under_a_backlog`
+  asserts the 250 ms wall-time bound but almost always exits via
+  `Err(Disconnected)` rather than `Err(Timeout)` — the deadline-
+  pass branch is only exercised by the pure
+  `run_loop_with_drain_past_deadline_abandons_queued_batches` test).
+  Acceptable for slice 1; follow-up `shipper-deadline-pass-integration-test`
+  must land with slice 2's encoder: inject an `on_batch` callback
+  that sleeps `100 ms`, run with `grace = 200 ms`, assert
+  `JoinOutcome::Clean(ShipperExit::DeadlinePassed { .. })` (or the
+  struct-form equivalent if R-2 has not landed yet) and a non-zero
+  `abandoned` count.
+- **R-7** (thread name `"php-analyze-shipper"` is 19 chars; Linux's
+  `TASK_COMM_LEN = 16` truncates `/proc/<pid>/task/<tid>/comm` to
+  `php-analyze-shi`, which looks half-corrupted in `top -H` /
+  `ps -L` output). Cosmetic but operator-confusing. Follow-up
+  `shipper-thread-name-fits-task-comm`: rename to one of the
+  reviewer's suggestions — `pa-shipper` (10), `phpz-shipper` (12),
+  or `php-an-shipper` (14). One-line code change; recorded in
+  `C-13 #4` already as "not amended in code".
+- **Nits** (test-surface breadth, defensive second-Drain-`Ok` arm,
+  repeated `unwrap_or_else(|e| e.into_inner())`, forward-pointing
+  `run_loop` doc): grouped under a `shipper-substrate-tidy`
+  follow-up if any one of them grows past a one-line edit. All
+  optional per the reviewer.
+
+### Gates evidence (post-fix-round, build host PHP 8.4.21)
+
+```
+cargo fmt --all --check                                          clean
+cargo clippy --all-targets --all-features -- -D warnings         clean
+cargo test --all --all-features                                  172 + 1 + 1 + 0 + 12 = 186, 0 failed
+openspec validate shipper-thread-and-channel --strict            valid
+```
+
+The integration test `recorder_observer` continues to pass against
+`php8.4` on this host; PHP 8.3 coverage continues to ride CI per C-7.
+
+### Test-count delta
+
+- `php-analyze` lib tests: unchanged (the R-1 swap does not add a
+  new test — see "What changed" above; the R-3 fix is doc-only).
+- Stub round-trip tests: unchanged.
+- Workspace integration tests: unchanged.
+
+Total workspace test count delta in this fix-round: **0**. The
+fix-round is two surgical edits — one production-code line swap
+plus a doc-string rewrite — both targeting the reviewer's
+explicit "before slice 2 lands" wording, with no behaviour change
+visible to existing tests.
+
