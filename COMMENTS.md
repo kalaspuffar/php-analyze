@@ -81,21 +81,21 @@ in place.
 
 ### P0 — Spec compliance gaps
 
-- **`startup-catch-unwind`** — factor `bootstrap::startup`'s
-  post-warning body into `startup_body()` and wrap it in
-  `catch_unwind`, matching the existing pattern on `mshutdown` /
-  `rinit` / `rshutdown`. Overdue: the shipper-thread spawn is now
-  wired into `startup`, so any panic in the shipper's setup path
-  currently aborts the PHP process. Required before any failure mode
-  in `startup` is exercised against real PHP.
-- **`spawn-failure-recovery`** — clear `SENDER_SLOT` and reset
-  `SHIPPER_SPAWNED` on shipper-thread spawn failure (or replace the
-  `.expect` with a `Result`-returning helper that bubbles up to a
-  silent-disable + one `E_WARNING`). Currently a spawn failure
-  panics with no recovery path. Pairs with `startup-catch-unwind`.
 - **`notice-on-master-switch-off`** — emit `E_NOTICE` on
   `MasterSwitchOff` so operators of disabled extensions see a single
   log line. One line in `bootstrap`.
+
+(`startup-catch-unwind` and `spawn-failure-recovery` were closed by
+the `bootstrap-startup-panic-safety` change — wraps the `MINIT` body
+in `catch_unwind` and converts shipper-thread spawn failure into
+state cleanup + one `E_WARNING` + silent-disable. See the archived
+OpenSpec change for the spec deltas, design rationale, and the test
+surface that pins both contracts.)
+
+The Open Questions from `bootstrap-startup-panic-safety`'s
+`design.md` are queued in the P2 band below:
+`minfo-catch-unwind` (Q-1) and
+`shipper-spawn-failure-in-disable-reason` (Q-2).
 
 ### P1 — Phase 5: hot-path tuning and benchmarks (§10 Phase 5)
 
@@ -163,6 +163,22 @@ file they touch is open for another reason.
   section header reads `php_analyze` not `php-analyze` (R-9).
 - `single-source-trim` — collapse the defensive double-trim between
   bootstrap and config (R-11).
+- `minfo-catch-unwind` — wrap `bootstrap::minfo`'s body in
+  `catch_unwind` to match the contract that
+  `bootstrap-startup-panic-safety` established for the other four
+  lifecycle hooks. `minfo` runs only in response to operator-driven
+  `phpinfo()` / `php --ri`, so a panic there is operator-visible
+  but does not abort a running PHP process — lower priority, but
+  consistent treatment is desirable. (Q-1 of
+  `bootstrap-startup-panic-safety`'s `design.md`.)
+- `shipper-spawn-failure-in-disable-reason` — surface
+  `SHIPPER_SPAWN_FAILED` via a new `DisableReason::ShipperSpawnFailed`
+  so `phpinfo()` / `php --ri` reflects the failed state alongside
+  the E_WARNING in the error log. Requires widening `Config` from
+  "set once at MINIT, immutable" to "set at MINIT, narrowable at
+  RINIT", which is invasive. Deferred unless operators ask for the
+  MINFO surface. (Q-2 of
+  `bootstrap-startup-panic-safety`'s `design.md`.)
 
 #### Phase-0 spike tidy-up
 
