@@ -69,18 +69,43 @@ in place.
   **AC-SH-2** (always-500 → drop after `retry_count + 1` attempts)
   and the §5.2 step-4 `E_NOTICE` line shape, including **AC-SH-4**
   (token never appears in any log).
-- **`stub-ingest-slow-mode`** — add `--simulate-slow` so the
-  MSHUTDOWN-drains-within-grace integration test can land. Binding
-  evidence for **AC-SH-3** (per-attempt timeout at
-  `http_timeout_ms ± 100ms`) and **AC-BS-4** / **AC-PB-2**
-  (`MSHUTDOWN` returns within `shutdown_grace_ms + 200ms`).
-- **`shipper-deadline-pass-integration-test`** — inject an `on_batch`
-  callback that sleeps `100 ms` with `grace = 200 ms` and assert
-  `JoinOutcome::Clean(ShipperExit::DeadlinePassed { .. })` with
-  non-zero `abandoned`. Should land alongside `stub-ingest-slow-mode`.
+- **`stub-ingest-slow-mode`** — the stub-side `--simulate-slow`
+  flag landed (PR pending merge to `main`); the matching
+  PHP-level integration test for AC-BS-4 / AC-PB-2 is **deferred
+  to `shipper-deadline-mid-retry`** (see P0 below) because it
+  surfaced a spec/code parity gap when first attempted. The
+  stub-side AC-SH-3 binding (a `ureq::Agent` with
+  `timeout_global = 200ms` against `--simulate-slow 5000`) ships
+  in `stub-ingest-slow-mode` itself.
+- **`shipper-deadline-pass-integration-test`** was closed by the
+  in-crate `SlowRecordingOnBatch` test
+  (`crates/php-analyze/src/shipper/mod.rs:1867`) added during
+  `shipper-deadline-at-recv-loop-head`. That Rust-level test binds
+  the deadline arithmetic via the `OnBatch` trait seam; it does
+  not exercise the production `RmpEncodeAndHttpPost`. See the
+  `shipper-deadline-mid-retry` entry below for the unbound
+  production-path scenario.
 
 ### P0 — Spec compliance gaps
 
+- **`shipper-deadline-mid-retry`** — production code change:
+  thread the `DRAIN_DEADLINE` snapshot into the pre-drain
+  `drained_consume` call so an in-flight batch's
+  `run_with_retry` loop sees a deadline published *after* the
+  batch was already picked up from the channel. Today,
+  `run_loop`'s pre-drain arm calls
+  `drained_consume(&batch, ..., None, ...)` (see
+  `crates/php-analyze/src/shipper/mod.rs:316`); if MSHUTDOWN
+  publishes the deadline cell after the shipper has dequeued
+  the batch but before the retry loop completes, the retry
+  loop runs its full `(retry_count + 1) × http_timeout_ms +
+  cumulative_backoff` budget against the slow upstream
+  regardless of the deadline. See C-18 in §3 for the full
+  surfacing context; the fix is small (snapshot + threaded
+  param) but is a real production-code change with its own
+  review surface. Unblocks the `mshutdown_drain.php` integration
+  test that was attempted under `stub-ingest-slow-mode` and
+  surfaced this gap.
 - **`notice-on-master-switch-off`** — emit `E_NOTICE` on
   `MasterSwitchOff` so operators of disabled extensions see a single
   log line. One line in `bootstrap`.
@@ -442,6 +467,83 @@ in-flight work.
 `now + shutdown_grace_ms`" and AC-BS-4 / AC-PB-2 wording unchanged;
 this change makes the existing wording self-consistent under per-batch
 work without amending the spec text.
+
+### C-18 — Pre-drain `drained_consume` passes `None` deadline; deadline cell is only observed *between* batches
+
+**Surface**: `crates/php-analyze/src/shipper/mod.rs:316`. The
+shipper's `run_loop` reads `drain_deadline_snapshot()` at the
+head of each pre-drain iteration. Once observed `Some(_)`, the
+loop transitions to `run_drain_phase` which passes the deadline
+to every per-batch `drained_consume`. But while the shipper is
+mid-`drained_consume` on a batch picked up in the pre-drain
+phase, the call site is:
+
+```rust
+match rx.recv() {
+    Ok(ShipperMessage::Batch(batch)) => {
+        drained_consume(&batch, &mut on_batch, None, &mut batches_drained);
+        //                                    ^^^^ pre-drain phase
+```
+
+The deadline is `None` for the entire `run_with_retry` loop on
+that batch. If MSHUTDOWN publishes the deadline cell after the
+shipper has dequeued the batch but before its retry loop
+completes, the retry loop exhausts the full
+`(retry_count + 1) × http_timeout_ms + cumulative_backoff`
+budget against the slow upstream regardless of the deadline.
+
+**Surfaced by**: attempting to land an `mshutdown_drain.php`
+PHP-level integration test for AC-BS-4 / AC-PB-2 under
+`stub-ingest-slow-mode`. With `php_analyze.shutdown_grace = 200`,
+`http_timeout_ms = 200`, `retry_count = 5`, `retry_backoff_ms = 50`
+against `--simulate-slow 5000`, observed PHP wall-clock = 2806ms
+— within 50ms of the no-deadline-budget timeline of
+`6 × 200ms + (50+100+200+400+800)ms = 2750ms`. Expected ≤ 700ms
+if the deadline cell were honored mid-batch.
+
+**Spec parity**: `openspec/specs/shipper/spec.md` lines around
+the MSHUTDOWN-deadline requirement claim the contract holds
+*"even when … every in-flight batch is mid-`run_with_retry`
+against a black-holed upstream."* That clause is **spec-only,
+not bound by any current test**: the in-crate
+`SlowRecordingOnBatch` test pre-seeds the channel before
+spawning the shipper (so the deadline cell is observed
+between-batches, not mid-batch), and uses a 100ms-per-call
+`OnBatch` impl that doesn't go through `run_with_retry` at all.
+The PHP-level test under `stub-ingest-slow-mode` was the first
+attempted binding and surfaced the gap.
+
+**Fix sketch** (for `shipper-deadline-mid-retry`):
+`drained_consume` (and `encode_and_handle` and
+`run_with_retry`) accept a `deadline: Option<Instant>` already.
+The pre-drain `run_loop` arm should compute the deadline from
+the cell snapshot at the moment it picks up the batch and
+thread it through:
+
+```rust
+Ok(ShipperMessage::Batch(batch)) => {
+    let dl = drain_deadline_snapshot();
+    drained_consume(&batch, &mut on_batch, dl, &mut batches_drained);
+    drop(batch);
+}
+```
+
+`drain_deadline_snapshot` is a cheap mutex acquire on
+loopback-CPU. Snapshotting per batch (instead of per-attempt)
+keeps the change minimal — the retry loop already polls `now()`
+each iteration, so a deadline set after batch pickup gets
+honored on the next attempt boundary. A deadline set
+mid-attempt (during a `ureq` `send`) isn't honored, but
+`http_timeout_ms` is the per-attempt ceiling, so the worst-case
+slip is `http_timeout_ms` past the deadline — within the spec's
+`shutdown_grace + 200ms` margin as long as `http_timeout_ms ≤ 200`.
+
+**Stub-side `--simulate-slow` is the test seam** ready for
+`shipper-deadline-mid-retry` to consume. The `mshutdown_drain.php`
+fixture and the `try_round_trip_mshutdown_drain` helper drafted
+during `stub-ingest-slow-mode` were intentionally not committed;
+they will land in `shipper-deadline-mid-retry` once the
+production fix is in.
 
 ---
 
