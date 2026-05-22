@@ -37,15 +37,22 @@
 //! `try_round_trip_connection_reuse` against the
 //! `connection_reuse.php` fixture, using the
 //! `/debug/connection_count` endpoint added in the
-//! `stub-ingest-connection-counter` change. Tasks 7.5 (auth-header
-//! byte-equal) and 7.6 (User-Agent string) are unblocked by the
-//! prior `stub-ingest-header-capture` change but bound in a separate
-//! follow-up. Tasks 7.8 (retry-exhaust drop counter visible on the
-//! next batch), 7.9 (token never leaked to error log), and 7.10
-//! (MSHUTDOWN drain within grace) remain **deferred** — they need
-//! the `stub-ingest-configurable-failure` and `stub-ingest-slow-mode`
-//! endpoints (queued in `COMMENTS.md` §2 P0) or PHP error-log
-//! capture infrastructure.
+//! `stub-ingest-connection-counter` change.
+//!
+//! Task 7.8 (retry-exhaust drop counter + §5.2 step-4 `E_NOTICE`
+//! line shape) is bound in this file by
+//! `try_round_trip_retry_exhaust` against the
+//! `retry_exhaust.php` fixture, using the `--respond-with` flag
+//! added in the `stub-ingest-configurable-failure` change.
+//! The same round-trip also binds AC-SH-4 ("Bearer token never
+//! appears in any log output") via a sentinel-token grep over the
+//! captured PHP error log.
+//!
+//! Tasks 7.5 (auth-header byte-equal) and 7.6 (User-Agent string)
+//! are unblocked by the prior `stub-ingest-header-capture` change
+//! but bound in a separate follow-up. Task 7.10 (MSHUTDOWN drain
+//! within grace) remains **deferred** — it needs the
+//! `stub-ingest-slow-mode` endpoint (queued in `COMMENTS.md` §2 P0).
 
 use std::env;
 use std::io::{BufRead, BufReader};
@@ -95,15 +102,19 @@ fn shipper_round_trip_lands_one_batch_on_stub() {
         // Each fixture gets its own freshly-spawned stub: a single
         // PHP process opens one TCP connection to the stub's
         // ureq::Agent, but the second PHP process would inevitably
-        // open a second. Spawning two stubs (one per fixture) keeps
-        // each fixture's per-process invariants independent.
+        // open a second. Spawning three stubs (one per fixture)
+        // keeps each fixture's per-process invariants independent
+        // (connection counts, headers slot, batch store).
         let primary = try_round_trip(binary, &cdylib);
         let reuse = try_round_trip_connection_reuse(binary, &cdylib);
-        match (primary, reuse) {
-            (RoundTripOutcome::Passed, RoundTripOutcome::Passed) => exercised.push(binary),
-            (RoundTripOutcome::SkippedModuleApi, _) | (_, RoundTripOutcome::SkippedModuleApi) => {
-                skipped.push(binary)
+        let retry = try_round_trip_retry_exhaust(binary, &cdylib);
+        match (primary, reuse, retry) {
+            (RoundTripOutcome::Passed, RoundTripOutcome::Passed, RoundTripOutcome::Passed) => {
+                exercised.push(binary)
             }
+            (RoundTripOutcome::SkippedModuleApi, _, _)
+            | (_, RoundTripOutcome::SkippedModuleApi, _)
+            | (_, _, RoundTripOutcome::SkippedModuleApi) => skipped.push(binary),
         }
     }
 
@@ -313,6 +324,160 @@ fn try_round_trip_connection_reuse(php_binary: &str, cdylib: &Path) -> RoundTrip
     RoundTripOutcome::Passed
 }
 
+/// AC-SH-2 / AC-SH-4 / "Exactly one `E_NOTICE` per dropped batch"
+/// binding round-trip: drive the `retry_exhaust.php` fixture
+/// against a `crates/stub-ingest` spawned with
+/// `--respond-with 500`. The shipper makes `retry_count + 1 = 4`
+/// failed POSTs, exhausts retries, and emits one `E_NOTICE` of
+/// the §5.2 step-4 shape. Asserts:
+///
+/// 1. `/debug/batches.len() == 4` — AC-SH-2.
+/// 2. The captured error-log contains exactly one `E_NOTICE`
+///    matching the §5.2 step-4 drop-notice format, naming
+///    `http 500` and `(attempt 4)`.
+/// 3. The configured `auth_token` sentinel does NOT appear in
+///    the captured error-log bytes — AC-SH-4.
+///
+/// Closes task 7.8 of `shipper_round_trip.rs`'s deferred-test
+/// backlog.
+fn try_round_trip_retry_exhaust(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
+    // Sentinel token: a unique-looking string the operator
+    // wouldn't pick by accident. If any prefix or suffix of this
+    // string ever appears in the captured error-log bytes, the
+    // AC-SH-4 assertion fails loudly. See design D-7.
+    let token = "retry-exhaust-secret-do-not-leak-987654321";
+    let path = "/v1/ingest";
+
+    let stub = StubProcess::spawn_with_respond_with(token, path, 500);
+    let server_url = format!("http://127.0.0.1:{}{}", stub.port, path);
+
+    let tmpdir = tempfile::tempdir().expect("tempdir for retry-exhaust ini");
+    let ini_path = tmpdir.path().join("shipper_retry_exhaust.ini");
+    let error_log_path = tmpdir.path().join("php_errors.log");
+    // `retry_backoff_ms = 10` keeps the retry path under 1s of
+    // wall clock (sleeps of 10ms + 20ms + 40ms = 70ms, plus four
+    // ~5ms loopback round-trips). `http_timeout_ms = 200` caps
+    // each attempt — if the loopback ever stalls past that, the
+    // resulting `DropReason::Timeout` would mismatch the
+    // asserted `http 500` and the test would fail loudly.
+    // `shutdown_grace = 5000` is generous so the drain completes
+    // even on a slow CI runner. `error_log` + `log_errors = 1` +
+    // `error_reporting = E_ALL` route PHP's `E_NOTICE` to the
+    // tempfile.
+    let ini_body = format!(
+        concat!(
+            "extension={cdylib}\n",
+            "php_analyze.enabled          = 1\n",
+            "php_analyze.server_url       = \"{url}\"\n",
+            "php_analyze.auth_token       = \"{token}\"\n",
+            "php_analyze.spike_observer   = 0\n",
+            "php_analyze.retry_count      = 3\n",
+            "php_analyze.retry_backoff_ms = 10\n",
+            "php_analyze.http_timeout_ms  = 200\n",
+            "php_analyze.shutdown_grace   = 5000\n",
+            "error_log                    = \"{error_log}\"\n",
+            "log_errors                   = 1\n",
+            "error_reporting              = E_ALL\n",
+            "display_errors               = 0\n",
+        ),
+        cdylib = cdylib.display(),
+        url = server_url,
+        token = token,
+        error_log = error_log_path.display(),
+    );
+    std::fs::write(&ini_path, ini_body).expect("write shipper_retry_exhaust.ini");
+
+    let fixture = locate_fixture("retry_exhaust.php");
+    let output = Command::new(php_binary)
+        .arg("-n")
+        .arg("-c")
+        .arg(&ini_path)
+        .arg(&fixture)
+        .output()
+        .unwrap_or_else(|e| panic!("invoke {php_binary} {fixture:?}: {e}"));
+
+    // Read the captured PHP error log up front. With
+    // `log_errors = 1` + `display_errors = 0` + a file `error_log`,
+    // PHP's own startup warnings (including the module-API
+    // mismatch we use as a skip signal on hosts whose `php8.x`
+    // doesn't match the cdylib's build ABI) go to this file,
+    // NOT to stderr. The skip check therefore has to look in
+    // three places.
+    let error_log = std::fs::read_to_string(&error_log_path).unwrap_or_default();
+
+    if mentions_module_api_mismatch(&output.stdout)
+        || mentions_module_api_mismatch(&output.stderr)
+        || mentions_module_api_mismatch(error_log.as_bytes())
+    {
+        return RoundTripOutcome::SkippedModuleApi;
+    }
+
+    assert!(
+        output.status.success(),
+        "{php_binary} exited non-zero on retry_exhaust.php (status {:?}); stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // AC-SH-2: every attempt's body lands in the store (design
+    // D-3 of the stub-side change). `retry_count = 3` → 4 total
+    // attempts → 4 stored bodies.
+    let batches = stub.fetch_batches();
+    assert_eq!(
+        batches.len(),
+        4,
+        "{php_binary} retry_exhaust.php: expected exactly retry_count+1=4 stored bodies \
+         on the stub (AC-SH-2), got {} ({:?})",
+        batches.len(),
+        batches.iter().map(|b| b.calls.len()).collect::<Vec<_>>(),
+    );
+
+    // AC-SH-4: the configured token MUST NOT appear anywhere in
+    // the captured error-log bytes. The sentinel is unique
+    // enough that a partial-match would also be a real leak.
+    assert!(
+        !error_log.contains(token),
+        "{php_binary} retry_exhaust.php: bearer token leaked into PHP error log \
+         (AC-SH-4 violation). error_log contents:\n{error_log}",
+    );
+
+    // §5.2 step-4 / "Exactly one E_NOTICE per dropped batch":
+    // the captured error-log contains exactly one line matching
+    // the documented drop-notice shape. Substring assertions
+    // avoid coupling to PHP's surrounding
+    // `[<timestamp>] PHP Notice: ... in Unknown on line 0`
+    // wrapper which varies across PHP versions.
+    let drop_notice_lines: Vec<&str> = error_log
+        .lines()
+        .filter(|line| line.contains("php-analyze: dropped"))
+        .collect();
+    assert_eq!(
+        drop_notice_lines.len(),
+        1,
+        "{php_binary} retry_exhaust.php: expected exactly one drop-notice line \
+         in the PHP error log, got {} ({drop_notice_lines:?}); full error_log:\n{error_log}",
+        drop_notice_lines.len(),
+    );
+    let notice = drop_notice_lines[0];
+    assert!(
+        notice.contains("http 500"),
+        "{php_binary} retry_exhaust.php: drop notice must name `http 500`; got {notice:?}",
+    );
+    assert!(
+        notice.contains("(attempt 4)"),
+        "{php_binary} retry_exhaust.php: drop notice must name `(attempt 4)` \
+         (retry_count+1); got {notice:?}",
+    );
+    assert!(
+        notice.contains(&server_url),
+        "{php_binary} retry_exhaust.php: drop notice must name the server URL {server_url:?}; \
+         got {notice:?}",
+    );
+
+    drop(stub);
+    RoundTripOutcome::Passed
+}
+
 /// Spawned `stub-ingest` process. Holds the child handle and the
 /// bound port. The child is killed on `Drop` so a panicking test
 /// leaves no orphan process behind.
@@ -323,14 +488,37 @@ struct StubProcess {
 
 impl StubProcess {
     fn spawn(token: &str, path: &str) -> Self {
+        Self::spawn_with_args(token, path, &[])
+    }
+
+    /// Spawn the stub with a configured `--respond-with <status>`
+    /// for the retry-exhaust integration test. Other args
+    /// (`--auth-token`, `--bind`, `--path`) match `spawn`.
+    fn spawn_with_respond_with(token: &str, path: &str, respond_with: u16) -> Self {
+        let status = respond_with.to_string();
+        Self::spawn_with_args(token, path, &["--respond-with", &status])
+    }
+
+    /// Shared spawn body: builds the `Command`, applies the
+    /// standard `--bind 127.0.0.1:0` + `--auth-token` + `--path`
+    /// args, appends caller-supplied `extra_args`, and waits for
+    /// the bind protocol's `bound:` / `ready` handshake. The
+    /// `extra_args` slice lets callers opt into newer CLI flags
+    /// without growing this constructor's parameter list.
+    fn spawn_with_args(token: &str, path: &str, extra_args: &[&str]) -> Self {
         let bin = stub_ingest_binary();
-        let mut child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .arg("--bind")
             .arg("127.0.0.1:0")
             .arg("--auth-token")
             .arg(token)
             .arg("--path")
-            .arg(path)
+            .arg(path);
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
