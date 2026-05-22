@@ -42,6 +42,7 @@ CLI flags:
 | `--auth-token <token>` | *(required)* | Bearer token clients must present as `Authorization: Bearer <token>`. |
 | `--path <path>` | `/v1/ingest` | HTTP path on which the stub accepts ingest POSTs. The default matches `SPECIFICATION.md` OQ-3. |
 | `--respond-with <status>` | `200` | HTTP status to return on the ingest path's **success path** — after bearer/content-type/body-decode validation passes and the decoded batch has been pushed onto the store. Range `[100, 599]`. The body is still stored regardless of status, so retry-exhaust tests can count attempts via `/debug/batches.len() == retry_count + 1`. Does **not** override 401/415/400 validation failures — those status codes are themselves the integration-test signal. |
+| `--simulate-slow <ms>` | `0` | Sleep this many milliseconds on the success path **after** storing the batch and **before** responding. Integer milliseconds, any non-negative value. Used by AC-SH-3 / AC-BS-4 / AC-PB-2 MSHUTDOWN-drain integration tests to simulate a slow ingest server. Composes with `--respond-with` (the configured status is returned after the sleep). Does **not** delay validation failures (401/415/400) or `/debug/*` routes. Because `tiny_http`'s accept loop is single-threaded, subsequent client connections queue in the kernel TCP accept queue until the sleep completes. |
 
 ## Bind protocol
 

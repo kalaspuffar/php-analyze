@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use php_analyze::wire;
@@ -117,6 +118,26 @@ struct Args {
     /// success path's response code.
     #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u16).range(100..600))]
     respond_with: u16,
+
+    /// Sleep this many milliseconds on the ingest path's
+    /// *success path* (i.e. after bearer/content-type/body-decode
+    /// validation has passed AND the decoded batch has been
+    /// pushed onto the in-memory store), **before** the response
+    /// is built. Default `0` (no sleep).
+    ///
+    /// Used by MSHUTDOWN-drain integration tests (e.g.
+    /// `tests/php-shipper/mshutdown_drain.php`) to drive the
+    /// shipper's deadline cell + per-attempt timeout (AC-SH-3 /
+    /// AC-BS-4 / AC-PB-2) without standing up a separate slow
+    /// server.
+    ///
+    /// `--simulate-slow` composes with `--respond-with`: both
+    /// operate on the same success-path tail. The flag does NOT
+    /// delay the validation-failure paths (401/415/400) or the
+    /// `/debug/*` routes — only the success path of
+    /// `handle_ingest` sleeps.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
+    simulate_slow: u64,
 }
 
 fn main() {
@@ -283,6 +304,22 @@ fn handle_ingest(
     // `retry_count = 3`, the shipper makes 4 attempts and
     // `/debug/batches.len()` reports `4` — one per attempt body.
     // See `stub-ingest-configurable-failure`'s `design.md` D-3.
+    //
+    // `--simulate-slow <ms>` then sleeps before the response is
+    // built. Order matters: sleeping AFTER storage means a client
+    // that times out mid-sleep still leaves the body in the store
+    // (the `/debug/batches` invariant survives client timeouts).
+    // Sleeping BEFORE the response means the client perceives the
+    // delay as response-wait time, which is what AC-SH-3 /
+    // AC-BS-4 / AC-PB-2 binding tests exercise. tiny_http's
+    // `Server::recv()` is single-threaded, so the sleep blocks
+    // the stub's main accept thread; subsequent client
+    // connections queue in the kernel TCP accept queue until the
+    // sleep completes. See `stub-ingest-slow-mode`'s
+    // `design.md` D-1 / D-2.
+    if args.simulate_slow > 0 {
+        std::thread::sleep(Duration::from_millis(args.simulate_slow));
+    }
     respond_empty(request, args.respond_with);
 }
 
