@@ -99,86 +99,120 @@ The Open Questions from `bootstrap-startup-panic-safety`'s
 `minfo-catch-unwind` (Q-1) and
 `shipper-spawn-failure-in-disable-reason` (Q-2).
 
-### P1 — Phase 5: hot-path tuning and benchmarks (§10 Phase 5)
+### P1 — MVP closing pass (see §6 for the reframe)
 
-Required to validate **NFR-PERF-1** (geo-mean wall-time overhead
-≤ 2.0× vs. unprofiled) and **AC-RC-5** (zero heap allocations on the
-hot path). This is the largest unaddressed phase by effort.
+The operator's stated priorities (§6.1) reshape "what's between
+us and v1.0" significantly. The full original Phase-5 / Phase-6
+plan is summarised below as **Archived** (already shipped) and
+**Deferred** (revisit after MVP validation). The actual closing
+pass for handoff is four small changes; each is named in §6.3
+and reproduced here for the task-list view:
+
+- **`docs-mvp-reframe`** — pure docs. Captures the MVP posture
+  (this section + §6) and any residual `SPECIFICATION.md`
+  wording adjustment that surfaces during review.
+  ~half a day, no code.
+- **`fpm-integration-test`** — closes `SPECIFICATION.md` §1.3
+  #2 and AC-BS-3 with a real PHP-FPM run. Start fpm against a
+  test pool, hit `fpm_repeated.php` 100 times via a FastCGI
+  client, assert no crash + fresh `trace_id` per request +
+  bounded RSS + 100 distinct traces in stub-ingest. ~1-2 days.
+- **`xdebug-spot-check`** — one-shot accuracy validation, NOT
+  a CI-gated comparator. Shell script under
+  `tools/xdebug-spot-check/` produces a written report of
+  call-coverage overlap + per-function `(t_in, t_out)` delta
+  vs. Xdebug for a chosen representative fixture. Operator
+  reads the report, decides whether the data is trustworthy
+  enough for MVP. ~1 day.
+- **`capture-reference-batches`** — `tools/capture-fixtures.sh`
+  runs each canonical workload, captures the resulting
+  MessagePack batches from `stub-ingest`, dumps them under
+  `tools/captured-batches/<workload>/*.msgpack`. Gives the
+  `../php-tree-visualizer` repo concrete test fixtures.
+  Makes the wire-format-as-handoff-contract tangible.
+  ~half a day.
+
+After those four, the repo is in a "good handoff state" per
+§6.2; the visualizer team can pick up the wire-format-side
+work without blocking on us.
+
+### P1 — Archived (already shipped before the §6 reframe)
+
+These were the Phase-5 deliverables that landed under the
+pre-reframe priorities. They remain useful — the recorder is
+genuinely leaner — but their prioritisation was wrong in
+hindsight; see §6.1.
 
 - **`bench-criterion-skeleton`** (closed): scaffolded `criterion`,
   added the no-PHP per-call micro-bench (`recorder_hot_path`,
   ~178 ns observed) and the 10⁴-call workload-shape bench
   (`recorder_workload`).
 - **`bench-canonical-workloads`** (closed): resolved **OQ-7** with
-  three self-contained workloads (`flat_calls.php`, `json_batch.php`,
-  `recursive_walk.php`) and added the `workload_overhead` bench
-  that asserts the ≤ 2.0× geo-mean budget. **First observed run
-  reports a geo-mean of 8.89×** (`flat_calls` 30.61×, `json_batch`
-  2.11×, `recursive_walk` 10.89×) — the bench correctly fails the
-  assertion against the current hot path. See
-  `recorder-hot-path-tuning` below for the follow-up.
-- **`recorder-hot-path-tuning`** (partially closed): every
-  allocation-side optimisation the design promised is in place.
+  three self-contained workloads (`flat_calls.php`,
+  `json_batch.php`, `recursive_walk.php`) and the
+  `workload_overhead` bench. The bench's `≤ 2.0×` assertion
+  is structurally unreachable on `flat_calls.php` (see C-19);
+  the workload-set discussion is deferred under §6.4 as
+  `bench-canonical-workloads-revisit`.
+- **`recorder-zero-alloc-audit`** (closed): the `CountingAllocator`
+  audit harness binds AC-RC-5 in steady state for both the
+  bench-seam path and the production-path through
+  `categorise_lazy → begin_with_snapshots_lazy →
+  end_with_snapshots`. Widened by `recorder-hot-path-tuning`.
+- **`recorder-hot-path-tuning`** (closed): every allocation-side
+  optimisation the design promised landed.
   `categorise_lazy() → begin_with_snapshots_lazy()` is the new
-  production hot path; the dict-hit branch performs **zero heap
-  allocations**, bound by a widened
-  `recorder_production_hot_path_is_zero_alloc_in_steady_state`
-  audit test. `Dictionary::intern_ref()` (hashbrown raw-entry
-  borrow probe) replaces the previous `contains_key` +
-  `intern(key.clone(), …)` pair with a single hashmap
-  traversal; `FqnSpec::render()` defers the method/closure
-  `format!()` to the miss branch only. The in-process
-  `recorder_workload` bench improved -23% (1.85 ms → 1.35 ms
-  for 10⁴ calls; ~185 ns/call → ~135 ns/call).
-  **The geo-mean assertion does NOT pass at 9.08×** (down from
-  10.28× baseline; flat_calls 29.20×, json_batch **1.94×**,
-  recursive_walk 13.19×). The remaining gap is structural and
-  documented under C-19 below.
-- **`recorder-zero-alloc-audit`** — the audit harness that pins
-  **AC-RC-5**. See §5 of this file ("Phase 5 anchor") for the design
-  note. Includes the `// NOTE for Phase 5` markers near the remaining
-  `to_owned()` allocations in `begin_with_snapshots` (dict-miss path);
-  may require an arena or intern table for those allocations to clear
-  the zero-alloc bar. **Audit widened by `recorder-hot-path-tuning`**
-  to cover the production `categorise_lazy → begin_with_snapshots_lazy
-  → end_with_snapshots` chain (not just the bench-seam
-  `begin_with_snapshots` against a pre-built `Categorised`).
-- **`recorder-zero-alloc-audit`** — the audit harness that pins
-  **AC-RC-5**. See §5 of this file ("Phase 5 anchor") for the design
-  note. Includes the `// NOTE for Phase 5` markers near the remaining
-  `to_owned()` allocations in `begin_with_snapshots` (dict-miss path);
-  may require an arena or intern table for those allocations to clear
-  the zero-alloc bar.
+  production hot path; the dict-hit branch performs **zero
+  heap allocations**. `Dictionary::intern_ref()` (hashbrown
+  raw-entry borrow probe) replaces the previous `contains_key`
+  + `intern(key.clone(), …)` pair; `FqnSpec::render()` defers
+  fqn rendering to the miss branch only. Observed
+  `workload_overhead` geo-mean improved 10.28× → 9.08×
+  (-12%); in-process `recorder_workload` improved -23%
+  (185 ns/call → 135 ns/call).
+- **`recorder-cpu-snapshot-cadence`** (closed): adds the
+  `php_analyze.cpu_snapshot_mode` directive with `per-call`
+  (default; spec-current) and `off` (skip per-call `getrusage`,
+  emit `cpu_u_ns = cpu_s_ns = 0`). Saves ~1000 ns/call under
+  `off`. Observed geo-mean drops from 9.88× → **5.11×** under
+  `off` (-48%); `json_batch` falls to **1.87×**, individually
+  under budget. Spec amendments to `SPECIFICATION.md` §3.2 /
+  §3.5 / §11 R-11 land alongside.
 
-### P1 — Phase 6: hardening, docs, packaging (§10 Phase 6)
+### P1 — Deferred (revisit after MVP validation; see §6.4)
 
-These close the remaining `SPECIFICATION.md` §1.3 acceptance criteria.
+The following items were on the path to v1.0 before the §6
+reframe. They remain useful but are not MVP-blockers under
+the operator's restated priorities. Pick up after MVP
+validation if/when the specific concern they address actually
+matters in practice.
 
-- **`token-leak-grep-test`** — CI-level grep over all
-  integration-test logs for the configured token; must find zero hits.
-  Pairs with `stub-ingest-configurable-failure` which exercises the
-  `E_NOTICE` drop-line path (the natural place a leak would surface).
-  Closes **AC-SH-4** as a CI gate.
-- **`tls-system-ca-integration-test`** — **AC-SH-5** binding evidence:
-  stub server with a self-signed cert → connection MUST fail; with a
-  system-trusted cert (test CA injected for the test) → connection
-  MUST succeed.
-- **`cargo-audit-in-ci`** — wire `cargo audit` into
-  `.github/workflows/ci.yml`, warning-only initially per §9.6.
-- **`lock-readme-directive-table`** — parsing test that walks the
-  README directive table and matches against `DIRECTIVES`'s defaults
-  / ranges; covers the spike directives' drift guard. Required for
-  §1.3 #8 (README documents every directive).
-- **`source-distribution-tarball`** — recipe for the
-  source-distribution deliverable per §7.3 and **REQ R-8**. PECL
-  packaging is best-effort (SHOULD-not-MUST per R-8); revisit if cost
-  is reasonable.
-- **`fpm-integration-test`** — actual PHP-FPM integration test
-  (`fpm_repeated.php` from §9.2): 100 requests on one FPM worker,
-  assert no per-request RSS growth and each trace has a fresh
-  `trace_id`. Currently every recorder/shipper integration test runs
-  under PHP CLI. Closes **AC-BS-3** and **AC-PB-1** as binding
-  evidence rather than design-only mitigation.
+- **`spec-perf-budget-revision`** — re-frame NFR-PERF-1 to
+  match observed reality once we know whether perf matters in
+  Sam's actual workload.
+- **`bench-canonical-workloads-revisit`** — replace the
+  adversarial `flat_calls.php` with realistic operator
+  workloads (Symfony hello-world, WordPress homepage, etc.).
+- **Full Xdebug comparator harness (CI-gated)** — only if
+  v1→v2 risks accuracy regression. For v1 MVP, the spot-check
+  in `xdebug-spot-check` is sufficient evidence.
+- **`recorder-zero-alloc-audit` dict-miss closure** — eliminate
+  the remaining `to_owned()` allocations on first-sight calls
+  via an arena / intern table. Cost-incidental; current audit
+  binds the steady-state hit path which is the
+  operator-relevant case.
+- **Phase 6 hardening** — `token-leak-grep-test`,
+  `tls-system-ca-integration-test`, `cargo-audit-in-ci`,
+  `source-distribution-tarball`, PECL packaging. Production
+  hardening; none MVP-blocking. The token-leak grep would
+  pair with `stub-ingest-configurable-failure` which already
+  exercises the `E_NOTICE` drop-line path; the TLS test
+  closes **AC-SH-5**; cargo audit is per §9.6. Pick up if/when
+  MVP validation surfaces a specific need.
+- **`lock-readme-directive-table`** — parsing test that walks
+  the README directive table and matches against `DIRECTIVES`'s
+  defaults / ranges. Low priority; drift would surface as an
+  `OutOfRange` warning at MINIT.
 
 ### P2 — Quality / hygiene follow-ups (non-blocking)
 
@@ -566,10 +600,22 @@ against a `< 2000ms` test budget (was 2806ms without the fix).
 
 ### C-19 — `NFR-PERF-1` geo-mean budget unreachable under spec-mandated per-call `getrusage`
 
-**Status**: `workload_overhead` geo-mean is **9.08×** on the
-reference host after `recorder-hot-path-tuning`. The budget is
-**≤ 2.0×**. The gap is structural and documented here as a
-follow-up.
+> **Read §6 first.** This note was written under the
+> pre-reframe priorities where `NFR-PERF-1`'s 2.0× geo-mean
+> looked load-bearing. The operator subsequently clarified
+> (§6.1) that the 2.0× number was a vibe estimate, not a
+> constraint, and that MVP validation outranks the perf gate.
+> The analysis below remains technically correct as a
+> description of the recorder's syscall floor; its
+> **prioritisation conclusions** ("close the gap with one of
+> three follow-ups") are superseded by §6.4 which defers all
+> three of them.
+
+**Status**: `workload_overhead` geo-mean is **5.11×** on the
+reference host after `recorder-hot-path-tuning` +
+`recorder-cpu-snapshot-cadence` under `off` mode (or **9.08×**
+under `per-call`). The pre-reframe budget was **≤ 2.0×**. The
+gap is structural and documented here for historical reference.
 
 **Surface**: `crates/php-analyze/src/clocks.rs::cpu_times_now_ns`
 plus the two `EntrySnapshots::capture_now` / `ExitSnapshots::capture_now`
@@ -707,3 +753,207 @@ That follow-up's implementation will need either an arena/intern
 table for the dict-miss path or a justification that the dict-miss
 allocations are amortised across a trace and therefore acceptable
 under AC-RC-5's "steady state" wording.
+
+---
+
+## 6. MVP handoff posture
+
+### 6.1 The reframe (operator-stated priorities)
+
+Two changes (`recorder-hot-path-tuning`, `recorder-cpu-snapshot-cadence`)
+spent significant effort chasing `NFR-PERF-1`'s ≤ 2.0× geo-mean
+budget. During the post-archive conversation the operator
+clarified the actual priorities:
+
+1. **`NFR-PERF-1`'s 2.0× was a vibe estimate, not a constraint.**
+   Of the architect's offered `{2, 5, 10}` shortlist, `2` was
+   picked as "the most ambitious that didn't feel silly." It
+   wasn't derived from a measured operator pain point. The number
+   is documented in `REQUIREMENTS.md` §93 / §284 and reproduced
+   into `SPECIFICATION.md` §1.3 #3, but it carries less weight
+   than the source documents make it look.
+
+2. **Accuracy outranks speed.** If the recorder produces
+   misleading reports, that's worse than slow ones. A 5× slow
+   request that tells the truth is more useful than a 1.5× fast
+   request that miscounts calls.
+
+3. **MVP-validate first; tune later.** Before we know whether
+   perf even matters in practice, we need to know whether the
+   tool is useful at all — i.e., whether someone can point
+   `php-analyze` at a real workload, look at the resulting
+   trace, and form a useful opinion.
+
+This reframe **does not invalidate** the two perf changes — the
+zero-alloc audit, the hashbrown borrow-keyed probe, the
+`cpu_snapshot_mode` directive are all real improvements that
+make the recorder leaner. But it **does invalidate** the
+prioritisation that put them ahead of the
+accuracy-and-deployment-shape work the MVP actually depends on.
+Self-correction recorded so the next prioritisation conversation
+starts from the operator's priorities, not the spec's.
+
+### 6.2 System architecture (where this repo ends)
+
+The operator's design separates the data-producing extension
+from a downstream visualization stack:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                THIS REPO'S RESPONSIBILITY                       │
+│  ┌───────────────────────────────────────────┐                  │
+│  │  php-analyze (Rust cdylib in PHP)         │                  │
+│  │  - Records calls via zend_observer        │                  │
+│  │  - Buffers + batches                      │                  │
+│  │  - Ships batches over HTTPS               │                  │
+│  └───────────────────────────────────────────┘                  │
+│                        │                                        │
+│                        │  HTTP POST                             │
+│                        │  application/vnd.php-analyze.v1+msgpack│
+│                        │  ◀── THE HANDOFF LINE ──▶              │
+└────────────────────────┼────────────────────────────────────────┘
+                         │
+┌────────────────────────┼────────────────────────────────────────┐
+│                        ▼   ../php-tree-visualizer (separate)    │
+│  ┌────────────────────┐    ┌──────────────┐    ┌─────────────┐  │
+│  │ HTTP collector svc │───▶│  Ingester    │───▶│ Visualizer  │  │
+│  │ Sinks to           │    │  Source maps │    │ Web app     │  │
+│  │ mem/disk/S3        │    │  DB writer   │    │ Tree render │  │
+│  └────────────────────┘    └──────────────┘    └─────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The line is **the wire format + HTTP contract**
+(`SPECIFICATION.md` §4.2 + §5.2). As long as this repo emits
+batches that conform, the visualizer side is unblocked.
+Everything downstream — durable storage, source maps, DB
+schema, web UI — is `../php-tree-visualizer`'s problem.
+
+That makes the "stable handoff state" question crisp:
+
+> **This repo is in a good handoff state when it reliably
+> produces wire-format-correct batches in both supported
+> SAPIs.**
+
+The acceptance criteria from `SPECIFICATION.md` §1.3 sort into
+this framing as follows:
+
+| §1.3 criterion | Concerns the handoff line? | MVP-blocker? |
+| --- | --- | --- |
+| #1 builds for 8.3 + 8.4 | yes | ✓ done |
+| #2 CLI + FPM SAPIs | yes | ✗ FPM unverified — see §6.3 |
+| #3a emits §4 batches | yes (the format) | ✓ done |
+| #3b ≥99.5% coverage vs Xdebug | yes (data quality) | ✗ unbound — see §6.3 |
+| #3c ±5% timing vs Xdebug | yes (data quality) | ✗ unbound — see §6.3 |
+| #3d geo-mean ≤ 2.0× | no (downstream perf concern) | not for MVP |
+| #4 network failure | yes (the HTTP contract) | ✓ done |
+| #5 exception unwind | yes (data quality) | ✓ done |
+| #6 depth overflow | yes (data quality) | ✓ done |
+| #7 CI gates | meta | ✓ done |
+| #8 README directives | yes (operator-facing) | ✓-ish — see below |
+
+### 6.3 Closing pass (the MVP-shipping work)
+
+Four small changes, in order. Together they leave this repo in
+a clean handoff state. Each is sized to be a few days at most.
+
+1. **`docs-mvp-reframe`** — this section + the §2 P1
+   reorganisation below + a small `SPECIFICATION.md` note
+   pointing readers at §6 for the MVP posture. Pure docs; no
+   code. **Largely captured by this commit**; the OpenSpec
+   change that follows is whatever residual SPECIFICATION.md
+   wording adjustment surfaces during review.
+2. **`fpm-integration-test`** — closes §1.3 #2 and AC-BS-3 with
+   a real FPM run. Pattern: start php-fpm against a test pool,
+   hit `fpm_repeated.php` 100 times via a FastCGI client,
+   assert no crash + fresh `trace_id` per request + bounded
+   RSS + 100 distinct traces received by stub-ingest.
+3. **`xdebug-spot-check`** — NOT a CI-gated comparator
+   harness. A one-shot shell script under
+   `tools/xdebug-spot-check/` that runs `recursive_walk.php`
+   (or a chosen representative fixture) under Xdebug, then
+   under `php-analyze`, computes the call-set overlap and a
+   per-function `(t_in, t_out)` delta histogram, writes the
+   findings to `tools/xdebug-spot-check/REPORT.md`. The
+   operator reads the report once and decides whether the
+   data is trustworthy enough to hand to `../php-tree-visualizer`.
+4. **`capture-reference-batches`** — a tiny
+   `tools/capture-fixtures.sh` that runs each canonical
+   workload, captures the resulting MessagePack batches from
+   `stub-ingest`, dumps them under
+   `tools/captured-batches/<workload>/*.msgpack`, commits the
+   captures. Gives the visualizer repo concrete test
+   fixtures: "here's what real batches look like, parse these
+   in your tests." Makes the wire-format-as-handoff-contract
+   tangible.
+
+After those four land, the `SPECIFICATION.md` §1.3 acceptance
+criteria look like:
+
+```
+1. Builds from source        ✓
+2. CLI + FPM loadable        ✓ (after fpm-integration-test)
+3a. Emits §4 batches         ✓
+3b. ≥99.5% coverage          spot-checked (xdebug-spot-check)
+3c. ±5% timing vs Xdebug     spot-checked (xdebug-spot-check)
+3d. Geo-mean ≤ 2.0×          DEFERRED — not load-bearing for
+                              MVP per §6.1
+4. Network failure handling  ✓
+5. Exception unwind          ✓
+6. Depth overflow            ✓
+7. CI gates                  ✓
+8. README directives         ✓-ish
+
+→ MVP shippable. Hand to ../php-tree-visualizer. Validate.
+```
+
+### 6.4 Deferred work (look at again after MVP validation)
+
+The following changes were on the path to v1.0 before the
+reframe. They remain useful but are not MVP-blockers under
+the operator's restated priorities. Decide whether to pick
+them up only after MVP validation tells us whether the
+specific concern they address actually matters in practice.
+
+| Change | Concern | Why deferred |
+| --- | --- | --- |
+| `spec-perf-budget-revision` | NFR-PERF-1 wording matches reality | Wait until MVP tells us whether perf matters in operator's actual workload. |
+| `bench-canonical-workloads-revisit` | Replace adversarial `flat_calls.php` with realistic fixtures | Same. Don't pre-judge the workload set before someone has tried the tool on a real workload. |
+| Full Xdebug comparator harness (CI-gated) | Continuous accuracy verification on every commit | Build only if v1→v2 risks accuracy regression. For v1, the spot-check report is sufficient evidence. |
+| `recorder-zero-alloc-audit` dict-miss closure | Eliminate the remaining `to_owned()` allocations on first-sight calls | Cost-incidental; current audit binds the steady-state hit path which is the operator-relevant case. |
+| Phase 6 hardening (`token-leak-grep-test`, `tls-system-ca-integration-test`, `cargo-audit-in-ci`, `source-distribution-tarball`, PECL packaging) | Production hardening | Useful, none MVP-blocking. Pick up if/when MVP validation surfaces a specific need (e.g., an operator complaint, a security review). |
+| `lock-readme-directive-table` | Parsing test guards README drift against `DIRECTIVES` | Low priority. Drift would surface as an `OutOfRange` warning at MINIT and operators would catch it. |
+| Quality / hygiene cleanups under §2 P2 | Cosmetic | As-encountered, when a file is open for another reason. |
+
+### 6.5 What the visualizer team needs from us at the handoff line
+
+For the team working in `../php-tree-visualizer` (or whoever
+consumes our batches), the contract surface is small and
+already mostly documented elsewhere:
+
+- **Wire format**: `SPECIFICATION.md` §4.2. MessagePack with a
+  three-key top-level map (`meta`, `dict`, `calls`).
+  Schema-versioned (`meta.schema_version == 1` for v1).
+- **Media type**: `application/vnd.php-analyze.v1+msgpack` (OQ-2).
+- **HTTP contract**: `SPECIFICATION.md` §5.2. POST with bearer
+  token, JSON-free; 2xx = accepted, anything else = retry-or-drop.
+- **Reference implementation of a collector**: `crates/stub-ingest/`.
+  Read it as documentation of what a minimal compliant collector
+  looks like; it is **not** a production-ready collector
+  (in-memory only, no durability, no source maps, no DB).
+- **Reference batches** (after `capture-reference-batches`):
+  `tools/captured-batches/*/*.msgpack`. Real batches from each
+  canonical workload, suitable as test fixtures for the
+  visualizer's own tests.
+
+What the visualizer team needs to decide on their side (out of
+scope for this repo):
+- Durability strategy (mem / disk / S3).
+- Source-map storage (how do they know what file `fn_id=7`
+  came from when the source has changed since the trace ran?).
+- DB schema for ingester output.
+- Web UI for tree rendering.
+- Authentication / multi-tenant model (this repo emits a
+  static bearer token; the visualizer side may want
+  per-pool tokens, OIDC, etc.).
+
