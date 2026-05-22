@@ -49,6 +49,9 @@ use crate::recorder::types::PendingBatch;
 use on_batch::{OnBatch, OnBatchOutcome};
 
 use std::collections::VecDeque;
+use std::io;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -122,13 +125,44 @@ static RECEIVER_SLOT: Mutex<Option<Receiver<ShipperMessage>>> = Mutex::new(None)
 
 /// One-shot spawn guard. Set to `true` by the winner of the
 /// [`compare_exchange`](AtomicBool::compare_exchange) in
-/// [`spawn_if_needed_at_rinit`]. Reset back to `false` only if the
+/// [`spawn_if_needed_at_rinit`]. Reset back to `false` if the
 /// winner discovers the receiver slot is empty (the install step
-/// was skipped) so a later, properly-installed RINIT can still
-/// spawn. The reset window cannot leak in production because MINIT
-/// runs before any RINIT — but it shows up in tests and the
-/// invariant is small.
+/// was skipped), **or** if the OS refuses the
+/// `thread::Builder::spawn` call (see [`SHIPPER_SPAWN_FAILED`]). The
+/// reset window cannot leak in production because MINIT runs before
+/// any RINIT — but it shows up in tests and the invariant is small.
 static SHIPPER_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Sticky permanent-failure flag for the spawn helper. Set to `true`
+/// the first (and only) time `thread::Builder::spawn` returns `Err`
+/// — e.g. because `RLIMIT_NPROC` has been hit, or the OS otherwise
+/// refuses to create a new thread.
+///
+/// The flag is monotonic (`false → true`, never reset in production)
+/// and serves two purposes:
+///
+/// 1. Bound the number of `E_WARNING` emissions to **exactly one per
+///    process**. Subsequent RINITs that re-enter the spawn helper
+///    short-circuit on this flag before the CAS, before
+///    `make_on_batch` runs, and before any further warning could be
+///    emitted.
+/// 2. Make the spawn-failure state observable to tests via
+///    [`spawn_failed_flag`].
+///
+/// Production never clears the flag; [`reset_for_test`] does for the
+/// test harness only. Pairs with [`SHIPPER_SPAWNED`] (which gets
+/// reset back to `false` on the failure path so the CAS state stays
+/// internally consistent — the `SHIPPER_SPAWN_FAILED` short-circuit is
+/// what actually prevents a re-attempt).
+static SHIPPER_SPAWN_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Test-only counter for `E_WARNING` emissions from the spawn-failure
+/// path. Production builds use the `#[cfg(not(test))]` shim
+/// `emit_spawn_failure_warning` which calls `php_error`; the test
+/// shim bumps this counter instead so unit tests can assert the
+/// "exactly one warning per process" invariant.
+#[cfg(test)]
+static SPAWN_FAILURE_WARNINGS: AtomicU64 = AtomicU64::new(0);
 
 /// Stashed JoinHandle so [`drain_and_join_at_mshutdown`] can join the
 /// thread. Taken out at shutdown.
@@ -491,17 +525,78 @@ pub(crate) fn spawn_if_needed_at_rinit(config: &crate::config::Config) {
     });
 }
 
-/// Shared spawn machinery — does the CAS, takes the receiver, and
-/// spawns [`run_loop`] with the [`OnBatch`] produced by
-/// `make_on_batch`. The factory is invoked at most once per
-/// successful CAS; if the CAS loses or the receiver slot is empty,
-/// `make_on_batch` is never called.
+/// Shared spawn machinery — public production entry. Delegates to
+/// [`spawn_with_on_batch_factory_inner`] with [`default_spawn`] as
+/// the thread-creation strategy. Tests bypass this shim and call the
+/// inner helper directly with an injectable `spawn` closure so the
+/// spawn-failure path can be exercised without standing up an actual
+/// failing OS thread (which would require manipulating `RLIMIT_NPROC`).
 ///
 /// Visibility is `pub(crate)` so tests can plumb a
 /// [`on_batch::RecordingOnBatch`] without touching `Config::global()`.
 pub(crate) fn spawn_with_on_batch_factory<O: OnBatch + Send + 'static>(
     make_on_batch: impl FnOnce() -> O,
 ) {
+    spawn_with_on_batch_factory_inner(make_on_batch, default_spawn);
+}
+
+/// Production `thread::Builder::spawn` closure used by the public
+/// [`spawn_with_on_batch_factory`]. Erases the `OnBatch` generic into
+/// the boxed body so the inner helper's `F: Fn(name, body) ->
+/// io::Result<JoinHandle<…>>` signature is monomorphic on `O`.
+fn default_spawn(
+    name: &'static str,
+    body: Box<dyn FnOnce() -> ShipperExit + Send>,
+) -> io::Result<JoinHandle<ShipperExit>> {
+    thread::Builder::new().name(name.to_owned()).spawn(body)
+}
+
+/// Inner spawn helper, parameterised on the thread-creation strategy
+/// so tests can inject a closure that returns `Err` to exercise the
+/// spawn-failure recovery path. Production paths use
+/// [`spawn_with_on_batch_factory`] which passes [`default_spawn`].
+///
+/// On `Ok(handle)`: stash the handle in [`SHIPPER_HANDLE`] and return.
+///
+/// On `Err(_)`: run the four-step recovery sequence per the spec
+/// scenario "OS-thread-spawn failure resets bookkeeping and
+/// silent-disables the producer":
+///
+/// 1. `SHIPPER_SPAWNED → false` (`Relaxed`). Keeps the CAS-flag state
+///    internally consistent — without this, a hypothetical reader of
+///    `spawned_flag()` would see "spawned" with no actual thread.
+/// 2. `SHIPPER_SPAWN_FAILED → true` (`Relaxed`). Monotonic sticky
+///    flag; future invocations short-circuit on it at the head of
+///    this function.
+/// 3. Clear `SENDER_SLOT` (acquire its `Mutex`, write `None`). The
+///    recorder's producer-side `try_send` path observes "sender not
+///    installed" and silent-disables.
+/// 4. Emit exactly one `E_WARNING` via [`emit_spawn_failure_warning`].
+///
+/// `SHIPPER_HANDLE` stays `None` on the failure path; the
+/// `MSHUTDOWN`-side `drain_and_join_at_mshutdown` already handles
+/// the "no-handle-installed" case ([`JoinOutcome::NotInstalled`]) and
+/// short-circuits without panic. `RECEIVER_SLOT` is empty by the time
+/// we reach the spawn — the receiver was moved into the closure that
+/// was about to be spawned; on `Err` the closure is dropped, which
+/// drops the receiver.
+pub(crate) fn spawn_with_on_batch_factory_inner<O, F>(make_on_batch: impl FnOnce() -> O, spawn: F)
+where
+    O: OnBatch + Send + 'static,
+    F: FnOnce(
+        &'static str,
+        Box<dyn FnOnce() -> ShipperExit + Send>,
+    ) -> io::Result<JoinHandle<ShipperExit>>,
+{
+    // Permanent-failure short-circuit. A prior invocation in this
+    // process already failed and emitted its one `E_WARNING`;
+    // re-attempting would never succeed (the failure mode is
+    // process-wide: `RLIMIT_NPROC`, OOM, etc.) and would emit a
+    // second warning. `Relaxed` is sufficient — the flag is the
+    // only state we observe and we only care about monotonicity.
+    if SHIPPER_SPAWN_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
     // Success ordering: `Acquire`. Pairs with the install step's
     // mutex release, establishing a happens-before edge with the
     // subsequent receiver take. Failure ordering: `Relaxed`, since
@@ -524,22 +619,79 @@ pub(crate) fn spawn_with_on_batch_factory<O: OnBatch + Send + 'static>(
         return;
     };
     let on_batch = make_on_batch();
-    let handle = thread::Builder::new()
-        .name("php-analyze-shipper".to_owned())
-        .spawn(move || run_loop(rx, on_batch))
-        .expect("OS thread spawn for the shipper failed");
-    let mut handle_slot = SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
-    *handle_slot = Some(handle);
+    let body: Box<dyn FnOnce() -> ShipperExit + Send> = Box::new(move || run_loop(rx, on_batch));
+    match spawn("php-analyze-shipper", body) {
+        Ok(handle) => {
+            let mut handle_slot = SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+            *handle_slot = Some(handle);
+        }
+        Err(_) => {
+            // Order matters: see the function doc comment.
+            SHIPPER_SPAWNED.store(false, Ordering::Relaxed);
+            SHIPPER_SPAWN_FAILED.store(true, Ordering::Relaxed);
+            {
+                let mut sender = SENDER_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+                *sender = None;
+            }
+            emit_spawn_failure_warning();
+        }
+    }
+}
+
+/// `E_WARNING` emit shim for the spawn-failure recovery path.
+/// Production wires straight to `ext_php_rs::error::php_error`; the
+/// `cargo test` binary links without a live PHP runtime so the test
+/// shim counts emissions instead. The literal warning message is
+/// part of the operator-facing contract (operators grep their PHP
+/// error log for it) — any future rename surfaces as a deliberate
+/// decision via this single doc comment.
+///
+/// The message MUST NOT include any portion of `auth_token`,
+/// `server_url`, or any other operator secret; the static literal
+/// below is what guarantees AC-SH-4 by construction.
+#[cfg(not(test))]
+fn emit_spawn_failure_warning() {
+    ext_php_rs::error::php_error(
+        &ext_php_rs::flags::ErrorType::Warning,
+        "php-analyze: failed to spawn shipper thread; profiling disabled for this process",
+    );
+}
+
+#[cfg(test)]
+fn emit_spawn_failure_warning() {
+    SPAWN_FAILURE_WARNINGS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Test-only shim that mirrors slice 1's parameterless
 /// `spawn_if_needed_at_rinit` shape. Spawns with an always-`Sent`
 /// [`on_batch::RecordingOnBatch`] — the slice-1 "drain silently"
 /// behaviour is preserved exactly under the new generic
-/// [`run_loop`] signature.
+/// [`run_loop`] signature. Routes through the same inner helper as
+/// production (with [`default_spawn`]) so happy-path / failing-path
+/// tests share the same scaffolding.
 #[cfg(test)]
 pub(crate) fn spawn_if_needed_at_rinit_for_test() {
-    spawn_with_on_batch_factory(|| on_batch::RecordingOnBatch::new(Vec::new()));
+    spawn_with_on_batch_factory_inner(
+        || on_batch::RecordingOnBatch::new(Vec::new()),
+        default_spawn,
+    );
+}
+
+/// Test-only seam: invoke the inner spawn helper with a
+/// caller-supplied failing-spawn closure plus the canonical
+/// `RecordingOnBatch` factory. Lets sibling modules (e.g.
+/// `bootstrap::tests`) exercise the spawn-failure recovery path
+/// without needing visibility into the private `on_batch` module.
+/// The closure has the same shape as [`default_spawn`].
+#[cfg(test)]
+pub(crate) fn spawn_with_failing_factory_for_test<F>(spawn: F)
+where
+    F: FnOnce(
+        &'static str,
+        Box<dyn FnOnce() -> ShipperExit + Send>,
+    ) -> io::Result<JoinHandle<ShipperExit>>,
+{
+    spawn_with_on_batch_factory_inner(|| on_batch::RecordingOnBatch::new(Vec::new()), spawn);
 }
 
 /// Send `Drain { deadline: now + grace }`, drop the canonical
@@ -632,6 +784,8 @@ pub(crate) fn reset_for_test() {
     *SHIPPER_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *DRAIN_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SHIPPER_SPAWNED.store(false, Ordering::SeqCst);
+    SHIPPER_SPAWN_FAILED.store(false, Ordering::SeqCst);
+    SPAWN_FAILURE_WARNINGS.store(0, Ordering::SeqCst);
     DROP_NOTICE_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -682,6 +836,23 @@ pub(crate) fn handle_is_installed() -> bool {
 #[cfg(test)]
 pub(crate) fn spawned_flag() -> bool {
     SHIPPER_SPAWNED.load(Ordering::Relaxed)
+}
+
+/// Test-only: peek the sticky `SHIPPER_SPAWN_FAILED` flag. Reads
+/// `true` once the spawn-failure recovery path has run; stays `true`
+/// for the rest of the process (or until `reset_for_test`).
+#[cfg(test)]
+pub(crate) fn spawn_failed_flag() -> bool {
+    SHIPPER_SPAWN_FAILED.load(Ordering::Relaxed)
+}
+
+/// Test-only: peek the cumulative count of `E_WARNING` emissions
+/// from the spawn-failure path. Should read `1` after one failure
+/// and stay at `1` regardless of how many further invocations of the
+/// inner helper short-circuit on `SHIPPER_SPAWN_FAILED`.
+#[cfg(test)]
+pub(crate) fn spawn_failure_warnings_count() -> u64 {
+    SPAWN_FAILURE_WARNINGS.load(Ordering::Relaxed)
 }
 
 /// Test-only: peek the receiver slot's `is_some()` state.
@@ -1818,6 +1989,184 @@ mod tests {
             "Drain-message-only path leaves the cell empty",
         );
         assert_eq!(crate::recorder::accounting::snapshot(), 0);
+        reset_for_test();
+    }
+
+    // --- spawn-failure recovery -----------------------------------------
+    //
+    // These tests pin the `bootstrap-startup-panic-safety` shipper
+    // contract: when `thread::Builder::spawn` (or the injected
+    // test stand-in) returns `Err`, the inner helper cleans up the
+    // global state and emits exactly one `E_WARNING` per process.
+    //
+    // Each test follows the same scaffolding:
+    //   let _guard = lock();
+    //   reset_for_test();
+    //   <test body>
+    //   reset_for_test();
+    //
+    // The injected `spawn` closure has the same signature as
+    // `default_spawn` so a passing/failing pair is a one-line
+    // difference.
+
+    /// Build a closure that satisfies the inner helper's `spawn` slot
+    /// and always returns `Err(io::Error)` so the recovery path runs.
+    /// The closure body also captures a counter so a test can assert
+    /// "was this closure invoked at all?" — load-bearing for the
+    /// "second-call short-circuits" test below.
+    fn failing_spawn(
+        invocations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> impl FnOnce(
+        &'static str,
+        Box<dyn FnOnce() -> ShipperExit + Send>,
+    ) -> io::Result<JoinHandle<ShipperExit>> {
+        move |_name, _body| {
+            invocations.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::other("test-induced spawn failure"))
+        }
+    }
+
+    #[test]
+    fn shipper_spawn_failure_clears_state_and_emits_one_warning() {
+        let _guard = lock();
+        reset_for_test();
+        // Install a channel so the inner helper reaches the spawn
+        // step (otherwise it'd short-circuit on the empty
+        // RECEIVER_SLOT before the failure path).
+        install_channel_at_minit(8);
+        assert!(sender_is_installed(), "channel installed");
+        assert!(receiver_is_installed(), "receiver installed");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_with_on_batch_factory_inner(
+            || on_batch::RecordingOnBatch::new(Vec::new()),
+            failing_spawn(invocations.clone()),
+        );
+
+        assert_eq!(
+            invocations.load(Ordering::Relaxed),
+            1,
+            "failing spawn closure invoked exactly once",
+        );
+        assert!(
+            !spawned_flag(),
+            "SHIPPER_SPAWNED must be reset to false on failure",
+        );
+        assert!(
+            spawn_failed_flag(),
+            "SHIPPER_SPAWN_FAILED must be set to true on failure",
+        );
+        assert!(
+            !sender_is_installed(),
+            "SENDER_SLOT must be cleared on failure (silent-disable for producers)",
+        );
+        assert!(!handle_is_installed(), "no handle on failure",);
+        assert_eq!(
+            spawn_failure_warnings_count(),
+            1,
+            "exactly one E_WARNING per process on the failure path",
+        );
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn shipper_spawn_failure_silently_disables_subsequent_producers() {
+        let _guard = lock();
+        reset_for_test();
+        install_channel_at_minit(8);
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        spawn_with_on_batch_factory_inner(
+            || on_batch::RecordingOnBatch::new(Vec::new()),
+            failing_spawn(invocations.clone()),
+        );
+
+        // The producer-side surface the recorder uses is "is the
+        // sender slot populated?" — see `recorder::flush::try_send_batch`.
+        // After the failure path runs, the answer must be `false`,
+        // so the producer takes the "sender not installed"
+        // short-circuit rather than the "channel full / drop" arm.
+        assert!(!sender_is_installed());
+        // Belt-and-braces: clone_sender_for_test mirrors the same
+        // observation through the public test seam.
+        assert!(clone_sender_for_test().is_none());
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn shipper_second_spawn_after_failure_does_not_re_emit_warning() {
+        let _guard = lock();
+        reset_for_test();
+        install_channel_at_minit(8);
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // First invocation: failing spawn → cleanup, one warning.
+        spawn_with_on_batch_factory_inner(
+            || on_batch::RecordingOnBatch::new(Vec::new()),
+            failing_spawn(invocations.clone()),
+        );
+        assert_eq!(invocations.load(Ordering::Relaxed), 1);
+        assert!(spawn_failed_flag());
+        assert_eq!(spawn_failure_warnings_count(), 1);
+
+        // Re-install a channel so the second invocation cannot
+        // short-circuit on the empty receiver slot — only the
+        // `SHIPPER_SPAWN_FAILED` short-circuit at the head of
+        // the helper must keep the closure from running.
+        install_channel_at_minit(8);
+        assert!(sender_is_installed());
+
+        // Second invocation: the head-of-helper short-circuit must
+        // fire BEFORE the failing closure is invoked.
+        spawn_with_on_batch_factory_inner(
+            || on_batch::RecordingOnBatch::new(Vec::new()),
+            failing_spawn(invocations.clone()),
+        );
+        assert_eq!(
+            invocations.load(Ordering::Relaxed),
+            1,
+            "spawn closure must NOT be invoked on the second call \
+             (SHIPPER_SPAWN_FAILED short-circuit)",
+        );
+        assert_eq!(
+            spawn_failure_warnings_count(),
+            1,
+            "no second E_WARNING; the per-process cap is one",
+        );
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn shipper_spawn_happy_path_leaves_spawn_failed_flag_clear() {
+        let _guard = lock();
+        reset_for_test();
+        install_channel_at_minit(8);
+
+        // Production-shaped spawn: route through the inner helper
+        // with `default_spawn`, then drain so the thread joins
+        // cleanly and we leave the test surface clean.
+        spawn_with_on_batch_factory_inner(
+            || on_batch::RecordingOnBatch::new(Vec::new()),
+            default_spawn,
+        );
+        assert!(spawned_flag(), "happy spawn sets the CAS flag");
+        assert!(
+            !spawn_failed_flag(),
+            "happy spawn must NOT touch SHIPPER_SPAWN_FAILED",
+        );
+        assert_eq!(
+            spawn_failure_warnings_count(),
+            0,
+            "happy spawn emits no warning",
+        );
+        assert!(handle_is_installed(), "happy spawn stashes the handle");
+
+        // Tear down so the joined thread doesn't outlive the test.
+        let _ = drain_and_join_at_mshutdown(Duration::from_millis(200));
         reset_for_test();
     }
 }
