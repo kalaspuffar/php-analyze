@@ -527,6 +527,26 @@ impl Trace {
         })
     }
 
+    /// Pre-grow `self.buffer` and `self.stack` to the requested
+    /// capacities so subsequent `push_record` / observer-driven
+    /// stack pushes within those bounds are pointer-bump only
+    /// (no reallocation). Used by the `recorder-zero-alloc-audit`
+    /// regression test (`tests/recorder_zero_alloc.rs`) and the
+    /// recorder microbenches under `crates/php-analyze/benches/`
+    /// to establish the "steady state" precondition AC-RC-5
+    /// requires.
+    ///
+    /// Production code does NOT call this — `Trace::new` starts
+    /// with empty `Vec`s and they grow organically as records
+    /// land. This method exists solely for the bench / audit
+    /// surface; the alternative (promoting `buffer` and `stack`
+    /// fields to `pub`) was rejected to keep their visibility
+    /// scoped to the recorder module's internal callers.
+    pub fn pregrow_for_audit(&mut self, buffer_capacity: usize, stack_capacity: usize) {
+        self.buffer.reserve(buffer_capacity);
+        self.stack.reserve(stack_capacity);
+    }
+
     /// Record a dropped begin: bump the `Arc<AtomicU64>` drop counter
     /// (shared with the future shipper) and increment the LIFO
     /// `dropped_begins` matcher (consumed by `finish_call_record`).
