@@ -63,6 +63,20 @@ geo-mean.
 | `recorder_workload` | `10_000` tight-loop calls per criterion iteration against a fresh `Trace`. Simulates `flat_calls.php` from `SPECIFICATION.md` §9.2. | Workload-shape time: one cold dict miss + 9_999 hits per iteration. Closer to a real request's hit ratio than `recorder_hot_path`'s long-warm dictionary. |
 | `workload_overhead` | Three canonical PHP workloads under `tests/php-bench/` (`flat_calls.php` 10⁶ user calls; `json_batch.php` 10⁵ JSON rows; `recursive_walk.php` 1024-node tree × 40 passes), each timed 5× unprofiled + 5× profiled. Resolves OQ-7. | Geo-mean wall-time ratio (profiled / unprofiled) across the three workloads. Asserts the `≤ 2.0×` NFR-PERF-1 budget unless `PHP_ANALYZE_BENCH_NO_ASSERT=1` is set. |
 
+## Most recent observed numbers (after `recorder-hot-path-tuning`)
+
+Reference host (developer workstation, PHP 8.4.21, default
+sample-of-5 medians):
+
+| Bench | Result | Notes |
+| --- | --- | --- |
+| `recorder_workload` (10⁴ calls) | **≈ 1.35 ms** (~135 ns/call) | Down from 1.85 ms (~185 ns/call) before the change; `-23%`, p < 0.05. The kill-Arc-clone + single-traversal `Dictionary::intern_ref` is the load-bearing optimisation. |
+| `recorder_hot_path` (1 call) | 4.6–6.3 µs (high variance) | Single-call shape is dominated by syscall + bench-harness noise; `recorder_workload` is the reliable in-process number. |
+| `workload_overhead` flat_calls | **29.20×** | Was 30.56× baseline. Per-call unprofiled is ~60 ns; the syscall floor (~1000 ns per begin/end pair from two `getrusage` calls on this kernel) puts 2.0× structurally out of reach. See `COMMENTS.md` §3 C-19. |
+| `workload_overhead` json_batch | **1.94×** | Was 2.42× baseline. Individually under the 2.0× budget — heavyweight workloads where PHP-side cost dwarfs the recorder are within reach. |
+| `workload_overhead` recursive_walk | **13.19×** | Was 14.67× baseline. Same syscall-floor story as flat_calls. |
+| `workload_overhead` **geo-mean** | **9.08×** | Was 10.28× baseline (`-12%`). Does **not** satisfy NFR-PERF-1's ≤ 2.0× budget — see `COMMENTS.md` §3 C-19 for the gap analysis and proposed follow-ups (the CPU-snapshot amortisation under R-11 is the most realistic path). |
+
 ## What this is NOT
 
 - **A zero-alloc audit.** AC-RC-5 (zero heap allocations on the

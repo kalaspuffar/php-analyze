@@ -46,7 +46,13 @@ pub enum FunctionKind {
 /// profiling purposes. If a future PHP fixture reveals a case where
 /// closures-at-the-same-line need to be distinguished, the variant grows
 /// a pointer field in a follow-up change.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Hash` is implemented by hand (not derived) so that the bytes written
+/// to the hasher match [`FunctionKeyRef`]'s implementation byte-for-byte
+/// — required for the dictionary's `hashbrown::raw_entry` borrow-keyed
+/// probe (recorder-hot-path-tuning D-1). The mirror property is
+/// enforced by `function_key_and_ref_hash_identically` tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionKey {
     Function {
         file: Arc<str>,
@@ -64,6 +70,199 @@ pub enum FunctionKey {
     Internal {
         name: Arc<str>,
     },
+}
+
+/// Borrowed view of a [`FunctionKey`] whose construction does not
+/// allocate. Used by the recorder's hot path so the dict-hit branch
+/// can probe `Dictionary` without paying for an owning key's
+/// `Arc<str>` allocations on every call.
+///
+/// The variants and field order mirror [`FunctionKey`] exactly so the
+/// `Hash` impls write the same bytes to the hasher and the
+/// `FunctionKey::matches_ref` predicate compares structurally. The
+/// `to_owned` conversion materialises the `Arc<str>`s — call it only
+/// on a dictionary miss, never on the hit path.
+#[derive(Clone, Copy, Debug)]
+pub enum FunctionKeyRef<'a> {
+    Function {
+        file: &'a str,
+        function: &'a str,
+        line: u32,
+    },
+    Method {
+        class: &'a str,
+        method: &'a str,
+    },
+    Closure {
+        file: &'a str,
+        line: u32,
+    },
+    Internal {
+        name: &'a str,
+    },
+}
+
+/// Numeric variant tag used by both `Hash` impls so the bytes are
+/// stable across `FunctionKey` ↔ `FunctionKeyRef`. The values match
+/// the source order of the enum variants but are bound explicitly to
+/// guard against a future reorder breaking hash interop.
+const FN_KEY_TAG_FUNCTION: u8 = 0;
+const FN_KEY_TAG_METHOD: u8 = 1;
+const FN_KEY_TAG_CLOSURE: u8 = 2;
+const FN_KEY_TAG_INTERNAL: u8 = 3;
+
+impl std::hash::Hash for FunctionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            FunctionKey::Function {
+                file,
+                function,
+                line,
+            } => {
+                state.write_u8(FN_KEY_TAG_FUNCTION);
+                <str as std::hash::Hash>::hash(file, state);
+                <str as std::hash::Hash>::hash(function, state);
+                state.write_u32(*line);
+            }
+            FunctionKey::Method { class, method } => {
+                state.write_u8(FN_KEY_TAG_METHOD);
+                <str as std::hash::Hash>::hash(class, state);
+                <str as std::hash::Hash>::hash(method, state);
+            }
+            FunctionKey::Closure { file, line } => {
+                state.write_u8(FN_KEY_TAG_CLOSURE);
+                <str as std::hash::Hash>::hash(file, state);
+                state.write_u32(*line);
+            }
+            FunctionKey::Internal { name } => {
+                state.write_u8(FN_KEY_TAG_INTERNAL);
+                <str as std::hash::Hash>::hash(name, state);
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for FunctionKeyRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            FunctionKeyRef::Function {
+                file,
+                function,
+                line,
+            } => {
+                state.write_u8(FN_KEY_TAG_FUNCTION);
+                <str as std::hash::Hash>::hash(*file, state);
+                <str as std::hash::Hash>::hash(*function, state);
+                state.write_u32(*line);
+            }
+            FunctionKeyRef::Method { class, method } => {
+                state.write_u8(FN_KEY_TAG_METHOD);
+                <str as std::hash::Hash>::hash(*class, state);
+                <str as std::hash::Hash>::hash(*method, state);
+            }
+            FunctionKeyRef::Closure { file, line } => {
+                state.write_u8(FN_KEY_TAG_CLOSURE);
+                <str as std::hash::Hash>::hash(*file, state);
+                state.write_u32(*line);
+            }
+            FunctionKeyRef::Internal { name } => {
+                state.write_u8(FN_KEY_TAG_INTERNAL);
+                <str as std::hash::Hash>::hash(*name, state);
+            }
+        }
+    }
+}
+
+impl FunctionKey {
+    /// Structural equality against a borrowed view. Used by the
+    /// `Dictionary` borrow-keyed probe's predicate; returns `true`
+    /// when the borrowed components would round-trip to `self`.
+    #[inline]
+    pub fn matches_ref(&self, key_ref: &FunctionKeyRef<'_>) -> bool {
+        match (self, key_ref) {
+            (
+                FunctionKey::Function {
+                    file: f1,
+                    function: fn1,
+                    line: l1,
+                },
+                FunctionKeyRef::Function {
+                    file: f2,
+                    function: fn2,
+                    line: l2,
+                },
+            ) => &**f1 == *f2 && &**fn1 == *fn2 && l1 == l2,
+            (
+                FunctionKey::Method {
+                    class: c1,
+                    method: m1,
+                },
+                FunctionKeyRef::Method {
+                    class: c2,
+                    method: m2,
+                },
+            ) => &**c1 == *c2 && &**m1 == *m2,
+            (
+                FunctionKey::Closure { file: f1, line: l1 },
+                FunctionKeyRef::Closure { file: f2, line: l2 },
+            ) => &**f1 == *f2 && l1 == l2,
+            (FunctionKey::Internal { name: n1 }, FunctionKeyRef::Internal { name: n2 }) => {
+                &**n1 == *n2
+            }
+            _ => false,
+        }
+    }
+
+    /// Borrow the owning key as a [`FunctionKeyRef`] without
+    /// allocating. The reverse of `FunctionKeyRef::to_owned`.
+    #[inline]
+    pub fn as_ref(&self) -> FunctionKeyRef<'_> {
+        match self {
+            FunctionKey::Function {
+                file,
+                function,
+                line,
+            } => FunctionKeyRef::Function {
+                file,
+                function,
+                line: *line,
+            },
+            FunctionKey::Method { class, method } => FunctionKeyRef::Method { class, method },
+            FunctionKey::Closure { file, line } => FunctionKeyRef::Closure { file, line: *line },
+            FunctionKey::Internal { name } => FunctionKeyRef::Internal { name },
+        }
+    }
+}
+
+impl FunctionKeyRef<'_> {
+    /// Materialise the borrowed view into an owning [`FunctionKey`].
+    /// Each string field becomes a fresh `Arc<str>` — call only on a
+    /// dictionary miss, never on the hit path.
+    #[inline]
+    pub fn to_owned(self) -> FunctionKey {
+        match self {
+            FunctionKeyRef::Function {
+                file,
+                function,
+                line,
+            } => FunctionKey::Function {
+                file: Arc::from(file),
+                function: Arc::from(function),
+                line,
+            },
+            FunctionKeyRef::Method { class, method } => FunctionKey::Method {
+                class: Arc::from(class),
+                method: Arc::from(method),
+            },
+            FunctionKeyRef::Closure { file, line } => FunctionKey::Closure {
+                file: Arc::from(file),
+                line,
+            },
+            FunctionKeyRef::Internal { name } => FunctionKey::Internal {
+                name: Arc::from(name),
+            },
+        }
+    }
 }
 
 /// Stack-local per-call state captured at call entry, popped at call exit.
@@ -525,6 +724,40 @@ impl Trace {
             accounting::add(contribution);
             entry
         })
+    }
+
+    /// Borrow-keyed sibling of [`push_dict_entry_via_intern`]: probes
+    /// the dictionary by a borrowed [`FunctionKeyRef`] (zero
+    /// `Arc<str>` allocations on the hit path) and only invokes
+    /// `build` on a miss. On a miss the build closure materialises
+    /// both the owning `FunctionKey` (the dictionary's key) and the
+    /// staged `DictEntry` in one place — the same Arc<str> family
+    /// can back both if the caller chooses.
+    ///
+    /// Returns the `fn_id` only; the hit/miss split is collapsed
+    /// because the §3.2 cap-gate has already projected the miss cost
+    /// via [`crate::recorder::Dictionary::contains_key_ref`] before
+    /// calling this method.
+    ///
+    /// **Zero-alloc on hit**: the recorder hot path's binding test is
+    /// `recorder-zero-alloc-audit` (recorder-hot-path-tuning §6).
+    pub fn push_dict_entry_via_intern_ref<F>(
+        &mut self,
+        key_ref: &crate::recorder::types::FunctionKeyRef<'_>,
+        build: F,
+    ) -> u32
+    where
+        F: FnOnce(u32) -> (FunctionKey, DictEntry),
+    {
+        let estimate = &mut self.buffer_estimated_bytes;
+        let (fn_id, _outcome) = self.dictionary.intern_ref(key_ref, |fn_id| {
+            let (owning_key, entry) = build(fn_id);
+            let contribution = DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len();
+            *estimate += contribution;
+            accounting::add(contribution);
+            (owning_key, entry)
+        });
+        fn_id
     }
 
     /// Pre-grow `self.buffer` and `self.stack` to the requested
@@ -1292,5 +1525,168 @@ mod tests {
              `[serde-derive-name]` — wire encoding belongs to Phase 3's \
              wire.rs (design.md §D-5)"
         );
+    }
+
+    // --- FunctionKey ↔ FunctionKeyRef interop -----------------------------
+
+    /// Hash a single value with `FxBuildHasher` and return the finished
+    /// u64. Used to prove `FunctionKey` and `FunctionKeyRef` produce
+    /// identical hashes — required for the `Dictionary` borrow-keyed
+    /// probe to find an owning entry inserted under the same identity.
+    fn fx_hash_one<T: std::hash::Hash>(value: &T) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(value)
+    }
+
+    #[test]
+    fn function_key_and_ref_hash_identically_for_the_function_variant() {
+        let owned = FunctionKey::Function {
+            file: Arc::from("/a/b.php"),
+            function: Arc::from("noop"),
+            line: 42,
+        };
+        let borrowed = FunctionKeyRef::Function {
+            file: "/a/b.php",
+            function: "noop",
+            line: 42,
+        };
+        assert_eq!(fx_hash_one(&owned), fx_hash_one(&borrowed));
+    }
+
+    #[test]
+    fn function_key_and_ref_hash_identically_for_the_method_variant() {
+        let owned = FunctionKey::Method {
+            class: Arc::from("Ns\\Cls"),
+            method: Arc::from("doThing"),
+        };
+        let borrowed = FunctionKeyRef::Method {
+            class: "Ns\\Cls",
+            method: "doThing",
+        };
+        assert_eq!(fx_hash_one(&owned), fx_hash_one(&borrowed));
+    }
+
+    #[test]
+    fn function_key_and_ref_hash_identically_for_the_closure_variant() {
+        let owned = FunctionKey::Closure {
+            file: Arc::from("/a/b.php"),
+            line: 17,
+        };
+        let borrowed = FunctionKeyRef::Closure {
+            file: "/a/b.php",
+            line: 17,
+        };
+        assert_eq!(fx_hash_one(&owned), fx_hash_one(&borrowed));
+    }
+
+    #[test]
+    fn function_key_and_ref_hash_identically_for_the_internal_variant() {
+        let owned = FunctionKey::Internal {
+            name: Arc::from("strlen"),
+        };
+        let borrowed = FunctionKeyRef::Internal { name: "strlen" };
+        assert_eq!(fx_hash_one(&owned), fx_hash_one(&borrowed));
+    }
+
+    #[test]
+    fn function_key_matches_ref_returns_true_for_structurally_equal_views() {
+        let cases: &[(FunctionKey, FunctionKeyRef<'_>)] = &[
+            (
+                FunctionKey::Function {
+                    file: Arc::from("/x.php"),
+                    function: Arc::from("f"),
+                    line: 1,
+                },
+                FunctionKeyRef::Function {
+                    file: "/x.php",
+                    function: "f",
+                    line: 1,
+                },
+            ),
+            (
+                FunctionKey::Method {
+                    class: Arc::from("C"),
+                    method: Arc::from("m"),
+                },
+                FunctionKeyRef::Method {
+                    class: "C",
+                    method: "m",
+                },
+            ),
+            (
+                FunctionKey::Closure {
+                    file: Arc::from("/x.php"),
+                    line: 5,
+                },
+                FunctionKeyRef::Closure {
+                    file: "/x.php",
+                    line: 5,
+                },
+            ),
+            (
+                FunctionKey::Internal {
+                    name: Arc::from("array_map"),
+                },
+                FunctionKeyRef::Internal { name: "array_map" },
+            ),
+        ];
+        for (owned, borrowed) in cases {
+            assert!(
+                owned.matches_ref(borrowed),
+                "expected {owned:?} to match {borrowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_key_matches_ref_returns_false_for_cross_variant_or_mismatched_components() {
+        let owned = FunctionKey::Function {
+            file: Arc::from("/x.php"),
+            function: Arc::from("f"),
+            line: 1,
+        };
+        // Cross-variant.
+        assert!(!owned.matches_ref(&FunctionKeyRef::Internal { name: "f" }));
+        // Same variant, different line.
+        assert!(!owned.matches_ref(&FunctionKeyRef::Function {
+            file: "/x.php",
+            function: "f",
+            line: 2,
+        }));
+        // Same variant, different function name.
+        assert!(!owned.matches_ref(&FunctionKeyRef::Function {
+            file: "/x.php",
+            function: "g",
+            line: 1,
+        }));
+    }
+
+    #[test]
+    fn function_key_ref_round_trips_through_to_owned_and_back() {
+        let cases = [
+            FunctionKey::Function {
+                file: Arc::from("/a.php"),
+                function: Arc::from("f"),
+                line: 1,
+            },
+            FunctionKey::Method {
+                class: Arc::from("C"),
+                method: Arc::from("m"),
+            },
+            FunctionKey::Closure {
+                file: Arc::from("/a.php"),
+                line: 5,
+            },
+            FunctionKey::Internal {
+                name: Arc::from("array_map"),
+            },
+        ];
+        for original in &cases {
+            let borrowed = original.as_ref();
+            let round_tripped = borrowed.to_owned();
+            assert_eq!(*original, round_tripped);
+            assert!(original.matches_ref(&borrowed));
+            assert_eq!(fx_hash_one(original), fx_hash_one(&borrowed));
+        }
     }
 }

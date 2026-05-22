@@ -39,13 +39,35 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use php_analyze::recorder::observer::{
-    begin_with_snapshots, end_with_snapshots, Categorised, EntrySnapshots, ExitSnapshots,
+    begin_with_snapshots, begin_with_snapshots_lazy, categorise_lazy, end_with_snapshots,
+    Categorised, EntrySnapshots, ExitSnapshots, RawCallSite,
 };
 use php_analyze::recorder::types::{FunctionKey, FunctionKind, Trace, TraceLimits};
 use php_analyze::recorder::RequestIdentity;
+
+/// Serialises the two steady-state allocator-counting tests. Both
+/// read the same global `CountingAllocator` counters and assert
+/// strict `== 0` deltas across their measurement windows. Running
+/// them in parallel (cargo test's default within a binary) lets one
+/// test's *teardown* — dropping the test-local `Trace` and
+/// `Categorised`, which deallocates the buffer Vec, stack Vec,
+/// hashmap, dict entries, and a handful of `Arc<str>`s — land in
+/// the other test's measurement window. The first observed CI
+/// failure was the production-path test seeing `dealloc_delta=21`
+/// while only 5 alloc events ran in its own body — the classic
+/// shape of cross-test teardown contamination.
+///
+/// The `*_first_miss_does_allocate` siblings don't need this lock:
+/// they only assert `>= 1`, so any contamination only helps them.
+///
+/// `PoisonError` recovery on `.unwrap()` is acceptable here — a
+/// panicking test inside the lock pollutes the counters; the next
+/// test will likely fail too, which is correct behaviour
+/// (the failure points at the real problem rather than masking it).
+static AUDIT_LOCK: Mutex<()> = Mutex::new(());
 
 // --- Counting global allocator ----------------------------------------------
 
@@ -160,6 +182,9 @@ const MAX_DEPTH: usize = 1024;
 
 #[test]
 fn recorder_hot_path_is_zero_alloc_in_steady_state() {
+    // Serialise against `recorder_production_hot_path_is_zero_alloc_in_steady_state` —
+    // both read the global allocator counters. See AUDIT_LOCK doc.
+    let _audit_guard = AUDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut trace = make_trace();
     let categorised = make_categorised();
 
@@ -276,5 +301,149 @@ fn recorder_hot_path_first_miss_does_allocate() {
          The counter wiring is broken — the positive test's pass \
          would be meaningless. Investigate before trusting the \
          AC-RC-5 binding.",
+    );
+}
+
+// --- Widened audit: production hot path through `categorise_lazy` -----------
+//
+// The audit above exercises `begin_with_snapshots(trace, &Categorised, snap)`
+// against an already-constructed `Categorised<'static>` — that lifts the
+// `Arc::from(&str)` allocations out of the timed region. The recorder's
+// actual production path goes through `categorise_lazy(&RawCallSite) →
+// begin_with_snapshots_lazy(trace, &LazyCategorised, snap)`. This test
+// widens AC-RC-5 to cover that full path — the property the
+// `recorder-hot-path-tuning` change introduces (broader §6 wording in the
+// spec delta).
+//
+// Steady-state contract: a hand-built `RawCallSite<'static>` describing one
+// repeat-call function fed through `categorise_lazy → begin → end` per
+// iteration. After the cold-miss + warmup phases, the inner loop MUST be
+// allocation-free.
+
+/// A `RawCallSite` describing a `noop`-shaped user function. All
+/// string fields are `Cow::Borrowed(&'static str)` (no allocation on
+/// the way in).
+fn make_raw_call_site() -> RawCallSite<'static> {
+    RawCallSite {
+        function_name: Some(Cow::Borrowed("noop")),
+        class_name: None,
+        filename: Some(Cow::Borrowed("/test/fixture.php")),
+        lineno: 1,
+        is_internal: false,
+        execute_data_addr: 0,
+    }
+}
+
+#[test]
+fn recorder_production_hot_path_is_zero_alloc_in_steady_state() {
+    // Serialise against `recorder_hot_path_is_zero_alloc_in_steady_state` —
+    // both read the global allocator counters. See AUDIT_LOCK doc.
+    let _audit_guard = AUDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut trace = make_trace();
+    let raw = make_raw_call_site();
+
+    // Pre-warm phase 1 — dictionary cold miss. The lazy path's
+    // miss closure allocates the four-Arc FunctionKey and renders
+    // the fqn into a String. These allocations are *expected* on
+    // first sight; the snapshot-after pattern excludes them.
+    {
+        let lazy = categorise_lazy(&raw);
+        begin_with_snapshots_lazy(&mut trace, &lazy, ENTRY_SNAPSHOTS);
+        end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
+    }
+
+    // Pre-grow AFTER the cold-miss pre-warm so the Vecs have room
+    // for both the warmup window and the measurement region with
+    // no reallocation.
+    trace.pregrow_for_audit(WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
+
+    // Pre-warm phase 2 — `WARMUP_SIZE` hit-path iterations through
+    // the full `categorise_lazy → begin → end` chain. Mirrors the
+    // bench-seam test's warmup-window pattern to absorb any
+    // one-shot lazy initialisation that fires on first hit-path
+    // use. (Earlier attempts widened this window thinking CI
+    // failures were lazy-init residue; the real cause turned out
+    // to be cross-test counter contamination from parallel
+    // execution — see AUDIT_LOCK.)
+    for _ in 0..WARMUP_SIZE {
+        let lazy = categorise_lazy(&raw);
+        begin_with_snapshots_lazy(&mut trace, &lazy, ENTRY_SNAPSHOTS);
+        end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
+    }
+
+    // Snapshot the counters AFTER both pre-warm phases. The deltas
+    // below cover only the steady-state region: every legitimate
+    // one-shot init has had a chance to fire.
+    let (alloc_before, realloc_before, dealloc_before) = snapshot_counters();
+
+    // Measurement region: MEASUREMENT_SIZE additional calls. Each
+    // iteration re-runs `categorise_lazy` (which must be
+    // allocation-free on the dict-hit branch) and the lazy `begin`
+    // (which must be allocation-free against the pre-interned
+    // function key).
+    for _ in 0..MEASUREMENT_SIZE {
+        let lazy = categorise_lazy(&raw);
+        begin_with_snapshots_lazy(&mut trace, &lazy, ENTRY_SNAPSHOTS);
+        end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
+    }
+
+    let (alloc_after, realloc_after, dealloc_after) = snapshot_counters();
+    let alloc_delta = alloc_after - alloc_before;
+    let realloc_delta = realloc_after - realloc_before;
+    let dealloc_delta = dealloc_after - dealloc_before;
+
+    assert!(
+        alloc_delta == 0 && realloc_delta == 0,
+        "AC-RC-5 (widened) violated: steady-state PRODUCTION hot path \
+         allocated AFTER warmup. alloc_delta={alloc_delta}, \
+         realloc_delta={realloc_delta}, dealloc_delta={dealloc_delta} \
+         across {MEASUREMENT_SIZE} measurement calls (after {WARMUP_SIZE} \
+         warmup-phase-2 calls). Expected: 0 allocs, 0 reallocs. The \
+         widened audit covers `categorise_lazy → begin_with_snapshots_lazy \
+         → end_with_snapshots` — the same chain `Recorder::begin_handler` \
+         drives in production. \
+         \n\nIf `dealloc_delta` is >> (`alloc_delta` + `realloc_delta`), the \
+         most likely cause is cross-test counter contamination — the \
+         AUDIT_LOCK on this test is missing or broken. If the deltas are \
+         balanced (matching alloc/dealloc counts) and growing linearly \
+         with iteration count, the cause is a true per-call allocation \
+         site: a fresh `Arc::from(&str)` on the dict-hit branch of \
+         `categorise_lazy`, an `FqnSpec::render()` that fires even on a \
+         hit, an owning `FunctionKey` materialised outside the \
+         intern_ref build closure, or a new `Vec::new()` / `Box::new()` \
+         on the per-call path.",
+    );
+}
+
+#[test]
+fn recorder_production_hot_path_first_miss_does_allocate() {
+    // Negative control sibling of `recorder_hot_path_first_miss_does_allocate`,
+    // but exercises the production path through `categorise_lazy`. A
+    // single cold call through the production chain must trip the
+    // counter — proves the counter wiring is sensitive to the lazy
+    // path's first-sight allocations (the Arc<str>s in the
+    // FunctionKey, the rendered fqn String, the file String).
+    let mut trace = make_trace();
+    trace.pregrow_for_audit(WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
+
+    let raw = make_raw_call_site();
+    let (alloc_before, _, _) = snapshot_counters();
+    {
+        let lazy = categorise_lazy(&raw);
+        begin_with_snapshots_lazy(&mut trace, &lazy, ENTRY_SNAPSHOTS);
+        end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
+    }
+    let (alloc_after, _, _) = snapshot_counters();
+    let alloc_delta = alloc_after - alloc_before;
+
+    assert!(
+        alloc_delta >= 1,
+        "production-path negative-control failed: a dict-miss \
+         `(categorise_lazy, begin_with_snapshots_lazy, end)` triplet \
+         should allocate (intern a fresh FunctionKey with two Arc<str>s, \
+         render the fqn String, stage a DictEntry with two owned String \
+         fields), but alloc_delta={alloc_delta}. The counter wiring is \
+         broken for the production path — the widened-audit positive \
+         test's pass would be meaningless.",
     );
 }

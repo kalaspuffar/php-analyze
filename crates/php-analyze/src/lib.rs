@@ -81,10 +81,13 @@ pub use config::{Config, ConfigError, ConfigWarning, DisableReason, RawIni, Toke
 #[cfg(feature = "bench-seam")]
 pub mod bench_seam {
     pub use crate::recorder::observer::{
-        begin_with_snapshots, categorise, end_with_snapshots, Categorised, EntrySnapshots,
-        ExitSnapshots, RawCallSite,
+        begin_with_snapshots, begin_with_snapshots_lazy, categorise, categorise_lazy,
+        end_with_snapshots, Categorised, EntrySnapshots, ExitSnapshots, FqnSpec, LazyCategorised,
+        RawCallSite,
     };
-    pub use crate::recorder::types::{FunctionKey, FunctionKind, Trace, TraceLimits};
+    pub use crate::recorder::types::{
+        FunctionKey, FunctionKeyRef, FunctionKind, Trace, TraceLimits,
+    };
     pub use crate::recorder::RequestIdentity;
 }
 

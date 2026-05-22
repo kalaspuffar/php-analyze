@@ -48,8 +48,8 @@ use crate::config::Config;
 use crate::recorder::accounting;
 use crate::recorder::flush;
 use crate::recorder::types::{
-    CallFrame, CallRecord, DictEntry, FunctionKey, FunctionKind, PendingBatch, RequestIdentity,
-    Trace, TraceLimits, CALL_RECORD_FIXED_BYTES, DICT_ENTRY_FIXED_BYTES,
+    CallFrame, CallRecord, DictEntry, FunctionKey, FunctionKeyRef, FunctionKind, PendingBatch,
+    RequestIdentity, Trace, TraceLimits, CALL_RECORD_FIXED_BYTES, DICT_ENTRY_FIXED_BYTES,
 };
 use crate::spike::SpikeObserver;
 
@@ -211,14 +211,20 @@ pub struct EntrySnapshots {
 }
 
 impl EntrySnapshots {
-    /// Take snapshots from the production clock primitives.
+    /// Take snapshots from the production clock primitives. Routes
+    /// through [`clocks::snapshot_now`] so the recorder hot path has
+    /// one inlinable boundary per begin/end (recorder-hot-path-tuning
+    /// D-3). The syscall pattern is unchanged: same
+    /// `CLOCK_MONOTONIC` read, same `getrusage(RUSAGE_THREAD)`,
+    /// same `zend_memory_usage(true)`.
+    #[inline]
     fn capture_now() -> Self {
-        let cpu = clocks::cpu_times_now_ns();
+        let raw = clocks::snapshot_now();
         Self {
-            t_in_ns: clocks::monotonic_now_ns(),
-            cpu_u_in_ns: cpu.user_ns,
-            cpu_s_in_ns: cpu.system_ns,
-            mem_in_bytes: clocks::memory_usage_real_bytes(),
+            t_in_ns: raw.t_ns,
+            cpu_u_in_ns: raw.cpu_u_ns,
+            cpu_s_in_ns: raw.cpu_s_ns,
+            mem_in_bytes: raw.mem_bytes,
         }
     }
 }
@@ -235,13 +241,16 @@ pub struct ExitSnapshots {
 }
 
 impl ExitSnapshots {
+    /// Take snapshots from the production clock primitives. Mirror of
+    /// [`EntrySnapshots::capture_now`]; same one-syscall-pattern.
+    #[inline]
     fn capture_now() -> Self {
-        let cpu = clocks::cpu_times_now_ns();
+        let raw = clocks::snapshot_now();
         Self {
-            t_out_ns: clocks::monotonic_now_ns(),
-            cpu_u_now_ns: cpu.user_ns,
-            cpu_s_now_ns: cpu.system_ns,
-            mem_out_bytes: clocks::memory_usage_real_bytes(),
+            t_out_ns: raw.t_ns,
+            cpu_u_now_ns: raw.cpu_u_ns,
+            cpu_s_now_ns: raw.cpu_s_ns,
+            mem_out_bytes: raw.mem_bytes,
         }
     }
 }
@@ -539,6 +548,234 @@ fn unknown_placeholder(kind: &str, addr: usize) -> String {
     format!("({kind})@0x{addr:x}")
 }
 
+// --- Lazy categorisation (zero-alloc production path) -------------------
+
+/// Borrow-shaped description of a function's fully-qualified name.
+/// Constructed by [`categorise_lazy`] without allocating; rendered to
+/// an owning `String` only on a dictionary miss inside the
+/// [`begin_with_snapshots_lazy`] build closure.
+///
+/// The five variants cover the four [`FunctionKind`]s plus a
+/// fallback for the unknown-call-site case (RO-5). The `Borrowed`
+/// variant fits both `Internal { name }` and `Function { function }`
+/// — both render to the bare borrowed string with no formatting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FqnSpec<'a> {
+    /// `Internal` and user `Function` variants — fqn is the borrowed
+    /// function name itself.
+    Borrowed(&'a str),
+    /// `Method` variant — renders to `"<class>::<method>"`.
+    Method { class: &'a str, method: &'a str },
+    /// `Closure` variant — renders to `"closure:<file>:<line>"`.
+    Closure { file: &'a str, line: u32 },
+    /// RO-5 fallback — renders to `"(<kind_label>)@0x<addr>"`. The
+    /// `kind_label` is `"unknown"` or `"anonymous"` per the
+    /// branch's precedence row.
+    Unknown {
+        kind_label: &'static str,
+        addr: usize,
+    },
+}
+
+impl FqnSpec<'_> {
+    /// Render the borrowed spec into an owning `String`. Called only
+    /// on a dictionary miss; never on the hit path. The capacity hint
+    /// keeps the allocation right-sized for the bytes the format
+    /// emits.
+    pub fn render(&self) -> String {
+        match self {
+            FqnSpec::Borrowed(name) => (*name).to_owned(),
+            FqnSpec::Method { class, method } => {
+                let mut s = String::with_capacity(class.len() + 2 + method.len());
+                s.push_str(class);
+                s.push_str("::");
+                s.push_str(method);
+                s
+            }
+            FqnSpec::Closure { file, line } => {
+                // `closure:` (8) + file + `:` + line digits (≤ 10). The
+                // overshoot for short lines is one or two bytes; the
+                // alternative (counting digits) is more code for no win.
+                let mut s = String::with_capacity(8 + file.len() + 1 + 10);
+                s.push_str("closure:");
+                s.push_str(file);
+                s.push(':');
+                // `write!` into `String` is infallible.
+                use std::fmt::Write;
+                let _ = write!(&mut s, "{line}");
+                s
+            }
+            FqnSpec::Unknown { kind_label, addr } => unknown_placeholder(kind_label, *addr),
+        }
+    }
+
+    /// Length of the rendered `String` without rendering. Used by the
+    /// cap-gate's miss-cost projection in [`begin_with_snapshots_lazy`].
+    pub fn render_len(&self) -> usize {
+        match self {
+            FqnSpec::Borrowed(name) => name.len(),
+            FqnSpec::Method { class, method } => class.len() + 2 + method.len(),
+            FqnSpec::Closure { file, line } => {
+                let line_digits = if *line == 0 {
+                    1
+                } else {
+                    line.ilog10() as usize + 1
+                };
+                "closure:".len() + file.len() + 1 + line_digits
+            }
+            FqnSpec::Unknown { kind_label, addr } => {
+                // "(<label>)@0x<hex>" — hex digit count is the bit
+                // count of `addr` shifted down, rounded up to nibble
+                // boundary.
+                let hex_digits = if *addr == 0 {
+                    1
+                } else {
+                    (usize::BITS - addr.leading_zeros()).div_ceil(4) as usize
+                };
+                1 + kind_label.len() + 1 + 1 + 2 + hex_digits
+            }
+        }
+    }
+}
+
+/// Borrow-shaped, zero-alloc categorisation result. The production
+/// [`Recorder::begin_handler`] consumes this shape so the dict-hit
+/// branch never allocates a `FunctionKey`'s `Arc<str>` fields or a
+/// `String` for the rendered `fqn`. The owning `FunctionKey` is
+/// materialised only inside the [`begin_with_snapshots_lazy`] build
+/// closure on a dictionary miss.
+///
+/// The existing [`Categorised`] / [`categorise`] / [`begin_with_snapshots`]
+/// chain stays in place for the bench seam (re-exported from
+/// `lib.rs::bench_seam`) so unit tests asserting on
+/// `cat.key` / `cat.fqn` continue to pass against their owning
+/// shapes.
+#[derive(Debug)]
+pub struct LazyCategorised<'a> {
+    pub key_ref: FunctionKeyRef<'a>,
+    pub kind: FunctionKind,
+    pub fqn_spec: FqnSpec<'a>,
+    pub file: &'a str,
+    pub line: u32,
+}
+
+/// Categorise a [`RawCallSite`] without allocating. Mirrors
+/// [`categorise`]'s precedence ladder one-for-one (Internal → Method
+/// → Closure → Function with the RO-5 unknown-fallback path) but
+/// returns the borrow-shaped [`LazyCategorised`] used by the
+/// production hot path.
+///
+/// Identity rules (kept identical to [`categorise`] so the dictionary
+/// stays single-rooted across both entry points):
+///
+/// 1. Internal function → `FunctionKeyRef::Internal { name }` with
+///    `fqn_spec = Borrowed(name)`.
+/// 2. Method (scope is `Some`) →
+///    `FunctionKeyRef::Method { class, method }` with `fqn_spec =
+///    Method { class, method }`.
+/// 3. Closure (function_name starts with `{closure` OR function_name
+///    is `None` and file is `Some`) → `FunctionKeyRef::Closure {
+///    file, line }` with `fqn_spec = Closure { file, line }`.
+/// 4. Otherwise → `FunctionKeyRef::Function { file, function, line }`
+///    with `fqn_spec = Borrowed(function)`.
+///
+/// The unknown-fallback path materialises a per-call address-bearing
+/// `FqnSpec::Unknown` instead of allocating an `(unknown)@0x…`
+/// `String` up front — the rendering happens only on a dictionary
+/// miss. The `FunctionKeyRef` for the fallback shape is **not**
+/// zero-alloc-stable across distinct call sites (each call site has
+/// a distinct address, so each is a fresh dictionary miss); this is
+/// the same property the existing [`categorise`] has.
+///
+/// `pub` for the bench-seam and the broadened zero-alloc audit
+/// (recorder-hot-path-tuning §6) which exercise the production path
+/// without PHP.
+pub fn categorise_lazy<'a>(info: &'a RawCallSite<'a>) -> LazyCategorised<'a> {
+    let line = info.lineno;
+    let file: &'a str = info.filename.as_deref().unwrap_or("");
+
+    if info.is_internal {
+        // Branch 1: internal function.
+        let (key_ref, fqn_spec) = match info.function_name.as_deref() {
+            Some(name) => (FunctionKeyRef::Internal { name }, FqnSpec::Borrowed(name)),
+            None => {
+                // No name reported — feed the unknown-fallback through
+                // both the key (so two anonymous internals don't
+                // collide) and the fqn (so the rendered name carries
+                // the same diagnostic).
+                let addr = info.execute_data_addr;
+                // The fallback `FunctionKeyRef::Internal { name: "" }`
+                // would collapse every anonymous internal in this
+                // request to one dict entry. Steer them to the
+                // address-tagged Function variant so distinct call
+                // sites stay distinct (mirrors the RO-5 tiebreaker
+                // already in `categorise`).
+                (
+                    FunctionKeyRef::Function {
+                        file: "",
+                        function: "",
+                        line: addr as u32,
+                    },
+                    FqnSpec::Unknown {
+                        kind_label: "anonymous",
+                        addr,
+                    },
+                )
+            }
+        };
+        return LazyCategorised {
+            key_ref,
+            kind: FunctionKind::Internal,
+            fqn_spec,
+            file: "",
+            line: 0,
+        };
+    }
+
+    if let Some(class) = info.class_name.as_deref() {
+        // Branch 2: method.
+        let method = info.function_name.as_deref().unwrap_or("");
+        let key_ref = FunctionKeyRef::Method { class, method };
+        let fqn_spec = FqnSpec::Method { class, method };
+        return LazyCategorised {
+            key_ref,
+            kind: FunctionKind::Method,
+            fqn_spec,
+            file,
+            line,
+        };
+    }
+
+    let is_closure = match info.function_name.as_deref() {
+        Some(name) => name.starts_with("{closure"),
+        None => info.filename.is_some(),
+    };
+    if is_closure {
+        // Branch 3: closure.
+        return LazyCategorised {
+            key_ref: FunctionKeyRef::Closure { file, line },
+            kind: FunctionKind::Closure,
+            fqn_spec: FqnSpec::Closure { file, line },
+            file,
+            line,
+        };
+    }
+
+    // Branch 4: user function fall-through.
+    let function = info.function_name.as_deref().unwrap_or("");
+    LazyCategorised {
+        key_ref: FunctionKeyRef::Function {
+            file,
+            function,
+            line,
+        },
+        kind: FunctionKind::Function,
+        fqn_spec: FqnSpec::Borrowed(function),
+        file,
+        line,
+    }
+}
+
 // --- Recorder -------------------------------------------------------------
 
 /// The production observer. Zero-size; all per-request state lives in
@@ -574,8 +811,12 @@ impl Recorder {
 
         with_current_trace(|trace| {
             let snapshots = EntrySnapshots::capture_now();
-            let categorised = categorise(&info);
-            begin_with_snapshots(trace, &categorised, snapshots);
+            // Production path: zero-alloc on the dict-hit branch. The
+            // owning `FunctionKey` and rendered `fqn` are materialised
+            // only inside the `intern_ref` build closure on a miss
+            // (recorder-hot-path-tuning D-1 / D-2).
+            let lazy = categorise_lazy(&info);
+            begin_with_snapshots_lazy(trace, &lazy, snapshots);
         });
     }
 
@@ -671,8 +912,12 @@ pub fn begin_with_snapshots(
     // 3. Cap gate. `would_add` is the worst-case contribution this
     //    call will add to the budget if accepted: one record's fixed
     //    bytes plus, on a dictionary miss, the new dict entry's
-    //    bytes. On a dictionary hit the second term is zero.
-    let would_add = CALL_RECORD_FIXED_BYTES + dict_miss_cost(trace, categorised);
+    //    bytes. On a dictionary hit the second term is zero. The
+    //    probe uses `contains_key_ref` so the §3.2 projection does
+    //    not allocate an owning `FunctionKey` it would discard.
+    let key_ref = categorised.key.as_ref();
+    let would_add = CALL_RECORD_FIXED_BYTES
+        + dict_miss_cost_ref(trace, &key_ref, &categorised.fqn, &categorised.file);
     if accounting::snapshot().saturating_add(would_add) > trace.buffer_cap_bytes {
         trace.record_drop();
         return;
@@ -689,27 +934,112 @@ pub fn begin_with_snapshots(
     #[allow(clippy::cast_possible_truncation)]
     let depth = (trace.virtual_depth - 1) as u16;
 
-    // The `to_owned()` calls only fire on a dictionary miss (the
-    // `build` closure runs at most once per unique key, per slice-1
-    // `Dictionary::intern`'s lazy-allocate contract).
+    // The `to_owned()` calls only fire on a dictionary miss — the
+    // `intern_ref` build closure runs at most once per unique key.
+    // The bench-seam consumers reuse a single long-lived `Categorised`
+    // across many iterations, so the per-iteration `categorised.key`
+    // clone the previous version did is replaced by a single
+    // `categorised.key.as_ref()` probe.
     let kind = categorised.kind;
     let fqn: &str = categorised.fqn.as_ref();
     let file: &str = categorised.file.as_ref();
     let line = categorised.line;
-    let fn_id = trace.push_dict_entry_via_intern(categorised.key.clone(), |fn_id| {
-        // NOTE for Phase 5: these two `to_owned()` calls are the
-        // last allocations on the hot path. Phase 5's zero-alloc
-        // assertion (AC-RC-5) needs a thread-local interning buffer
-        // plus a `Cow<'static, str>` rewrite of `DictEntry::fqn` /
-        // `file`. Do not copy this shape verbatim into the future
-        // hot path.
-        DictEntry {
+    let fn_id = trace.push_dict_entry_via_intern_ref(&key_ref, |fn_id| {
+        let owning_key = categorised.key.clone();
+        let entry = DictEntry {
             fn_id,
             fqn: fqn.to_owned(),
             file: file.to_owned(),
             line,
             kind,
-        }
+        };
+        (owning_key, entry)
+    });
+
+    trace.stack.push(CallFrame {
+        call_id,
+        parent,
+        fn_id,
+        depth,
+        t_in_ns: snapshots.t_in_ns,
+        cpu_u_in_ns: snapshots.cpu_u_in_ns,
+        cpu_s_in_ns: snapshots.cpu_s_in_ns,
+        mem_in_bytes: snapshots.mem_in_bytes,
+    });
+}
+
+/// Zero-alloc production sibling of [`begin_with_snapshots`]. Accepts
+/// a [`LazyCategorised`] (borrow-shaped) and routes the dictionary
+/// probe + miss-cost projection through a single
+/// `Dictionary::intern_ref` traversal — no `Arc<str>` allocation on
+/// the dict-hit branch, no transient `String` for the rendered fqn.
+///
+/// Mirrors [`begin_with_snapshots`]'s slice-3 overflow policies
+/// step-for-step:
+///
+/// 1. Increment [`Trace::virtual_depth`].
+/// 2. Depth gate → `record_drop` if exceeded.
+/// 3. Cap gate → project miss cost via `contains_key_ref` +
+///    `fqn_spec.render_len()`; `record_drop` if it would push
+///    `bytes_in_memory` past `buffer_cap_bytes`.
+/// 4. Accept: probe-or-intern via `push_dict_entry_via_intern_ref`,
+///    push the `CallFrame`. The miss path materialises the owning
+///    `FunctionKey` (via `FunctionKeyRef::to_owned`), renders the
+///    `fqn`, and stages the `DictEntry` in one place.
+pub fn begin_with_snapshots_lazy(
+    trace: &mut Trace,
+    lazy: &LazyCategorised<'_>,
+    snapshots: EntrySnapshots,
+) {
+    // 1. Track PHP-side depth unconditionally.
+    trace.virtual_depth = trace.virtual_depth.saturating_add(1);
+
+    // 2. Depth gate.
+    if trace.virtual_depth > trace.max_depth {
+        trace.record_drop();
+        return;
+    }
+
+    // 3. Cap gate. `would_add` projection: `contains_key_ref` is a
+    //    zero-alloc hashmap probe, and `fqn_spec.render_len()`
+    //    computes the would-be `String::len` without rendering.
+    let would_add = if trace.dictionary.contains_key_ref(&lazy.key_ref) {
+        CALL_RECORD_FIXED_BYTES
+    } else {
+        CALL_RECORD_FIXED_BYTES
+            + DICT_ENTRY_FIXED_BYTES
+            + lazy.fqn_spec.render_len()
+            + lazy.file.len()
+    };
+    if accounting::snapshot().saturating_add(would_add) > trace.buffer_cap_bytes {
+        trace.record_drop();
+        return;
+    }
+
+    // 4. Accept path.
+    let call_id = trace.next_call_id();
+    let parent = trace.stack.last().map_or(0, |frame| frame.call_id);
+    #[allow(clippy::cast_possible_truncation)]
+    let depth = (trace.virtual_depth - 1) as u16;
+
+    let kind = lazy.kind;
+    let file = lazy.file;
+    let line = lazy.line;
+    let fqn_spec = lazy.fqn_spec;
+    let key_ref = lazy.key_ref;
+    let fn_id = trace.push_dict_entry_via_intern_ref(&lazy.key_ref, |fn_id| {
+        // Miss path: materialise owning key and stage entry. This is
+        // the **only** branch on which `Arc<str>` allocations and a
+        // rendered `fqn` `String` happen.
+        let owning_key = key_ref.to_owned();
+        let entry = DictEntry {
+            fn_id,
+            fqn: fqn_spec.render(),
+            file: file.to_owned(),
+            line,
+            kind,
+        };
+        (owning_key, entry)
     });
 
     trace.stack.push(CallFrame {
@@ -725,20 +1055,17 @@ pub fn begin_with_snapshots(
 }
 
 /// Project the §3.2 dict-miss cost: `0` on a hit, or
-/// `DICT_ENTRY_FIXED_BYTES + len(fqn) + len(file)` on a miss. Reads
-/// through `Dictionary::contains_key`, which is a single hashmap probe
-/// and does not stage any state. Used by the cap-gate in
-/// [`begin_with_snapshots`] to compute `would_add` without committing
-/// to an intern.
-///
-/// The function names "miss cost" by inverting "hit cost is zero" — a
-/// dictionary that already contains the key would not bill anything if
-/// the begin were accepted.
-fn dict_miss_cost(trace: &Trace, categorised: &Categorised<'_>) -> usize {
-    if trace.dictionary.contains_key(&categorised.key) {
+/// `DICT_ENTRY_FIXED_BYTES + len(fqn) + len(file)` on a miss. Probes
+/// the dictionary by borrowed key so no `Arc<str>` allocation
+/// happens to compute the projection. Used by
+/// [`begin_with_snapshots`]; [`begin_with_snapshots_lazy`] inlines
+/// the same logic against `FqnSpec::render_len` to avoid touching
+/// the rendered `fqn`'s `String`.
+fn dict_miss_cost_ref(trace: &Trace, key_ref: &FunctionKeyRef<'_>, fqn: &str, file: &str) -> usize {
+    if trace.dictionary.contains_key_ref(key_ref) {
         0
     } else {
-        DICT_ENTRY_FIXED_BYTES + categorised.fqn.len() + categorised.file.len()
+        DICT_ENTRY_FIXED_BYTES + fqn.len() + file.len()
     }
 }
 
@@ -2775,5 +3102,193 @@ mod tests {
         let r = BootObserver::Recorder(Recorder);
         rshutdown_release_trace();
         assert!(r.should_observe(&empty_fcall_info()));
+    }
+
+    // --- categorise_lazy parity with categorise ---------------------------
+    //
+    // `categorise_lazy` is the zero-alloc sibling of `categorise` used
+    // by the production hot path. These tests assert it routes every
+    // shape the existing `categorise` tests covered to the same
+    // `FunctionKind`, the same rendered fqn, the same file/line, and a
+    // `FunctionKeyRef` that round-trips to the same owning `FunctionKey`
+    // that `categorise` produces. The property is what lets the
+    // borrow-keyed dictionary probe and the owning-key probe agree on
+    // identity (recorder-hot-path-tuning §3).
+
+    #[test]
+    fn categorise_lazy_routes_methods_to_the_method_branch_with_matching_components() {
+        let info = stub_site(
+            Some("greet"),
+            Some("Greeter"),
+            Some("/srv/app.php"),
+            7,
+            false,
+        );
+        let owned = categorise(&info);
+        let lazy = categorise_lazy(&info);
+        assert_eq!(lazy.kind, owned.kind);
+        assert_eq!(lazy.kind, FunctionKind::Method);
+        assert!(matches!(
+            lazy.key_ref,
+            FunctionKeyRef::Method {
+                class: "Greeter",
+                method: "greet"
+            }
+        ));
+        assert_eq!(lazy.fqn_spec.render(), "Greeter::greet");
+        assert_eq!(lazy.fqn_spec.render(), owned.fqn.as_ref());
+        assert_eq!(lazy.file, "/srv/app.php");
+        assert_eq!(lazy.line, 7);
+        // Round-trip identity: the lazy key materialises to the same
+        // owning `FunctionKey` that `categorise` emits.
+        assert_eq!(lazy.key_ref.to_owned(), owned.key);
+    }
+
+    #[test]
+    fn categorise_lazy_routes_user_functions_to_the_function_branch_with_matching_components() {
+        let info = stub_site(Some("my_fn"), None, Some("/x.php"), 20, false);
+        let owned = categorise(&info);
+        let lazy = categorise_lazy(&info);
+        assert_eq!(lazy.kind, FunctionKind::Function);
+        assert!(matches!(
+            lazy.key_ref,
+            FunctionKeyRef::Function {
+                file: "/x.php",
+                function: "my_fn",
+                line: 20
+            }
+        ));
+        assert_eq!(lazy.fqn_spec.render(), "my_fn");
+        assert_eq!(lazy.fqn_spec.render(), owned.fqn.as_ref());
+        assert_eq!(lazy.key_ref.to_owned(), owned.key);
+    }
+
+    #[test]
+    fn categorise_lazy_routes_closures_via_function_name_prefix() {
+        let info = stub_site(
+            Some("{closure:/srv/app.php:42}"),
+            None,
+            Some("/srv/app.php"),
+            42,
+            false,
+        );
+        let owned = categorise(&info);
+        let lazy = categorise_lazy(&info);
+        assert_eq!(lazy.kind, FunctionKind::Closure);
+        assert!(matches!(
+            lazy.key_ref,
+            FunctionKeyRef::Closure {
+                file: "/srv/app.php",
+                line: 42
+            }
+        ));
+        assert_eq!(lazy.fqn_spec.render(), "closure:/srv/app.php:42");
+        assert_eq!(lazy.fqn_spec.render(), owned.fqn.as_ref());
+        assert_eq!(lazy.key_ref.to_owned(), owned.key);
+    }
+
+    #[test]
+    fn categorise_lazy_routes_closures_when_function_name_is_absent() {
+        let info = stub_site(None, None, Some("/x.php"), 1, false);
+        let lazy = categorise_lazy(&info);
+        assert_eq!(lazy.kind, FunctionKind::Closure);
+        assert!(matches!(
+            lazy.key_ref,
+            FunctionKeyRef::Closure {
+                file: "/x.php",
+                line: 1
+            }
+        ));
+        assert_eq!(lazy.fqn_spec.render(), "closure:/x.php:1");
+    }
+
+    #[test]
+    fn categorise_lazy_routes_internals_to_the_internal_branch() {
+        let info = stub_site(Some("array_map"), None, None, 0, true);
+        let owned = categorise(&info);
+        let lazy = categorise_lazy(&info);
+        assert_eq!(lazy.kind, FunctionKind::Internal);
+        assert!(matches!(
+            lazy.key_ref,
+            FunctionKeyRef::Internal { name: "array_map" }
+        ));
+        assert_eq!(lazy.fqn_spec.render(), "array_map");
+        assert_eq!(lazy.fqn_spec.render(), owned.fqn.as_ref());
+        assert_eq!(lazy.file, "");
+        assert_eq!(lazy.line, 0);
+        assert_eq!(lazy.key_ref.to_owned(), owned.key);
+    }
+
+    #[test]
+    fn fqn_spec_render_len_matches_actual_string_length_across_every_variant() {
+        let cases = [
+            FqnSpec::Borrowed("noop"),
+            FqnSpec::Method {
+                class: "Ns\\Cls",
+                method: "doThing",
+            },
+            FqnSpec::Closure {
+                file: "/srv/app.php",
+                line: 42,
+            },
+            FqnSpec::Closure {
+                file: "/x.php",
+                line: 0,
+            },
+            FqnSpec::Closure {
+                file: "/x.php",
+                line: 999_999,
+            },
+            FqnSpec::Unknown {
+                kind_label: "anonymous",
+                addr: 0xdead_beef,
+            },
+            FqnSpec::Unknown {
+                kind_label: "unknown",
+                addr: 0,
+            },
+        ];
+        for spec in &cases {
+            let rendered = spec.render();
+            assert_eq!(
+                spec.render_len(),
+                rendered.len(),
+                "render_len mismatch for {spec:?} (rendered `{rendered}`)",
+            );
+        }
+    }
+
+    #[test]
+    fn begin_with_snapshots_lazy_matches_begin_with_snapshots_on_a_simple_workload() {
+        // Two equivalent calls — one through the bench-seam (owning)
+        // path, one through the lazy (borrow) path — must produce the
+        // same `(call_id, parent, fn_id, depth)` and the same
+        // dictionary state.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+
+        let info = stub_site(Some("noop"), None, Some("/x.php"), 1, false);
+        let owned = categorise(&info);
+        let lazy = categorise_lazy(&info);
+
+        let mut trace_a = Trace::new(stub_identity(), permissive_limits());
+        let mut trace_b = Trace::new(stub_identity(), permissive_limits());
+
+        begin_with_snapshots(&mut trace_a, &owned, entry_snapshots());
+        begin_with_snapshots_lazy(&mut trace_b, &lazy, entry_snapshots());
+
+        assert_eq!(trace_a.stack.len(), 1);
+        assert_eq!(trace_b.stack.len(), 1);
+        let frame_a = trace_a.stack.last().unwrap();
+        let frame_b = trace_b.stack.last().unwrap();
+        assert_eq!(frame_a.call_id, frame_b.call_id);
+        assert_eq!(frame_a.parent, frame_b.parent);
+        assert_eq!(frame_a.fn_id, frame_b.fn_id);
+        assert_eq!(frame_a.depth, frame_b.depth);
+
+        // Both dictionaries staged the same `DictEntry`.
+        let staged_a = trace_a.dictionary.take_new_entries();
+        let staged_b = trace_b.dictionary.take_new_entries();
+        assert_eq!(staged_a, staged_b);
     }
 }
