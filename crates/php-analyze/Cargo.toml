@@ -125,3 +125,16 @@ harness = false
 [[bench]]
 name = "recorder_workload"
 harness = false
+
+# NFR-PERF-1 / OQ-7 binding: PHP-driven workload-overhead
+# bench that times each of three canonical workloads
+# unprofiled vs. profiled, computes the geo-mean ratio, and
+# asserts `≤ 2.0×`. Opt-in via `PHP_ANALYZE_RUN_BENCH=1`
+# (default `cargo bench` does NOT require PHP installed).
+# Uses `std::process::Command` + `std::time::Instant` directly,
+# no criterion: PHP-subprocess variance is dominated by
+# startup latency, not measurement precision. See
+# `bench-canonical-workloads`'s `design.md` D-6.
+[[bench]]
+name = "workload_overhead"
+harness = false

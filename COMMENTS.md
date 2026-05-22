@@ -105,14 +105,33 @@ Required to validate **NFR-PERF-1** (geo-mean wall-time overhead
 ≤ 2.0× vs. unprofiled) and **AC-RC-5** (zero heap allocations on the
 hot path). This is the largest unaddressed phase by effort.
 
-- **`bench-criterion-skeleton`** — add `criterion` to dev-deps and
-  scaffold `benches/` per `SPECIFICATION.md` §7.2 / §9.4. One
-  micro-benchmark (per-call overhead in nanoseconds for a tight loop
-  of identical calls) and one workload-shape benchmark.
-- **`bench-canonical-workloads`** — resolve **OQ-7** (currently
-  "Deferred"): pick the canonical workload set jointly with the
-  operator. Candidates from `REQUIREMENTS.md` §15.3. Each workload
-  runs once unprofiled, once profiled, geo-mean ratio computed.
+- **`bench-criterion-skeleton`** (closed): scaffolded `criterion`,
+  added the no-PHP per-call micro-bench (`recorder_hot_path`,
+  ~178 ns observed) and the 10⁴-call workload-shape bench
+  (`recorder_workload`).
+- **`bench-canonical-workloads`** (closed): resolved **OQ-7** with
+  three self-contained workloads (`flat_calls.php`, `json_batch.php`,
+  `recursive_walk.php`) and added the `workload_overhead` bench
+  that asserts the ≤ 2.0× geo-mean budget. **First observed run
+  reports a geo-mean of 8.89×** (`flat_calls` 30.61×, `json_batch`
+  2.11×, `recursive_walk` 10.89×) — the bench correctly fails the
+  assertion against the current hot path. See
+  `recorder-hot-path-tuning` below for the follow-up.
+- **`recorder-hot-path-tuning`** (new, P0-priority within P1) — bring
+  the `workload_overhead` geo-mean from 8.89× down to ≤ 2.0×. The
+  per-call profile points at the recorder kernel's overhead beyond
+  the in-process micro-bench's ~178 ns/call: with `flat_calls` at
+  ~2.2µs added per noop() call, the gap is the Zend-observer
+  trampoline + downstream `Trace::push_record` + memory traffic
+  the micro-bench can't measure. Likely paths: (a) batch the
+  observer-side captures into a single struct on the stack instead
+  of separate `EntrySnapshots` / `ExitSnapshots` reads;
+  (b) drop the `Arc<str>` clones in the categorise hit path (the
+  `FunctionKey::Function { file, function, ... }` construction
+  per call); (c) interning + arena allocation for the dict-miss
+  path. Should run after / alongside `recorder-zero-alloc-audit`
+  since the allocator-counting harness will point at the specific
+  allocations driving the cost.
 - **`recorder-zero-alloc-audit`** — the audit harness that pins
   **AC-RC-5**. See §5 of this file ("Phase 5 anchor") for the design
   note. Includes the `// NOTE for Phase 5` markers near the remaining

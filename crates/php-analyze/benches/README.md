@@ -1,16 +1,20 @@
 # `php-analyze` benchmarks
 
-`criterion`-based benchmarks measuring the recorder's hot-path
-cost without going through PHP. The recorder kernel
-(`begin_with_snapshots` / `end_with_snapshots`) is pure Rust by
-design (`SPECIFICATION.md` §3.2 / §7.2); the benches link
-against it directly via the `bench-seam` feature so anyone can
-run them on any host without `php-config` or a PHP runtime.
+Two families of benchmarks:
 
-## Run
+- **Recorder hot-path microbenches** (`recorder_hot_path`,
+  `recorder_workload`) — `criterion`-based, pure-Rust, no PHP
+  required. Measure the recorder kernel's per-call cost.
+- **Workload-overhead bench** (`workload_overhead`) — PHP-driven,
+  no criterion. Times the production cdylib against three
+  canonical PHP workloads, computes the geo-mean ratio across
+  workloads, and **asserts NFR-PERF-1's ≤ 2.0× budget**.
 
-The `bench-seam` feature is **required** — without it, each bench
-file's `compile_error!` block fires with a clear message:
+## Run — recorder hot-path microbenches
+
+The `bench-seam` feature is **required** — without it, each
+hot-path bench file's `compile_error!` block fires with a clear
+message:
 
 ```sh
 cargo bench -p php-analyze --features bench-seam
@@ -29,29 +33,52 @@ Compile-only (CI smoke gate, if added later):
 cargo bench -p php-analyze --features bench-seam --no-run
 ```
 
+## Run — workload-overhead bench (PHP-driven)
+
+The `PHP_ANALYZE_RUN_BENCH=1` env var is **required** — without
+it, the bench exits 0 with a one-line skip message so default
+`cargo bench` paths don't require PHP installed:
+
+```sh
+PHP_ANALYZE_RUN_BENCH=1 cargo bench -p php-analyze --bench workload_overhead
+```
+
+Disarm the assertion (for iterating on the hot path locally
+without the budget blocking progress):
+
+```sh
+PHP_ANALYZE_RUN_BENCH=1 PHP_ANALYZE_BENCH_NO_ASSERT=1 \
+    cargo bench -p php-analyze --bench workload_overhead
+```
+
+The bench prints a markdown table to stdout summarising
+unprofiled / profiled medians and the per-workload ratio + the
+geo-mean.
+
 ## Benches
 
 | Bench | Workload | What it measures |
 | --- | --- | --- |
 | `recorder_hot_path` | One `begin_with_snapshots + end_with_snapshots` pair per criterion iteration against a pre-allocated `Trace`. | Per-call cost in nanoseconds. The trace persists across iterations (huge limits keep the flush/cap gates quiet), so the dictionary is warm and the measurement reflects steady-state hit-path cost. |
 | `recorder_workload` | `10_000` tight-loop calls per criterion iteration against a fresh `Trace`. Simulates `flat_calls.php` from `SPECIFICATION.md` §9.2. | Workload-shape time: one cold dict miss + 9_999 hits per iteration. Closer to a real request's hit ratio than `recorder_hot_path`'s long-warm dictionary. |
+| `workload_overhead` | Three canonical PHP workloads under `tests/php-bench/` (`flat_calls.php` 10⁶ user calls; `json_batch.php` 10⁵ JSON rows; `recursive_walk.php` 1024-node tree × 40 passes), each timed 5× unprofiled + 5× profiled. Resolves OQ-7. | Geo-mean wall-time ratio (profiled / unprofiled) across the three workloads. Asserts the `≤ 2.0×` NFR-PERF-1 budget unless `PHP_ANALYZE_BENCH_NO_ASSERT=1` is set. |
 
 ## What this is NOT
 
-- **A pass criterion.** This change (`bench-criterion-skeleton`)
-  stands up the measurement infrastructure but doesn't pin a
-  per-call ceiling or a profiled-vs-unprofiled geo-mean budget.
-  Those land in the follow-up `bench-canonical-workloads` change
-  (which also resolves OQ-7 — the canonical workload set —
-  jointly with the operator).
 - **A zero-alloc audit.** AC-RC-5 (zero heap allocations on the
   hot path) is binding-evidence work for the
   `recorder-zero-alloc-audit` follow-up, which adds an allocator-
   counting harness over the same `bench_seam` surface.
-- **A PHP-driven end-to-end comparison.** The whole point of the
-  "hot path is pure Rust" architecture is that the recorder
-  kernel can be measured without PHP. PHP-level benchmarking
-  layers on top via `bench-canonical-workloads`.
+- **An Xdebug comparison.** REQ §15.1 #3 (≥ 99.5% call coverage
+  + ±5% per-call timing vs. Xdebug) is a separate measurement;
+  belongs to a future `bench-xdebug-comparison`.
+- **A criterion-reported number for the workload bench.** The
+  workload bench uses raw `Instant::now()` + `Duration` because
+  PHP-subprocess variance is dominated by startup latency, not
+  measurement precision. Criterion's nanosecond-precision
+  machinery is overkill at this scale — see
+  `openspec/changes/archive/<date>-bench-canonical-workloads/design.md`
+  D-6.
 
 ## Why the `bench-seam` feature exists
 
