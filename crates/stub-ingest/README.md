@@ -7,9 +7,10 @@ contract — it accepts MessagePack-encoded `wire::Batch` payloads on
 `POST /v1/ingest`, validates the bearer token, decodes the body via
 the production crate's [`php_analyze::wire`] module (so the schema is
 single-source-of-truth), and stores accepted batches in process
-memory. Three debug endpoints (`GET /debug/batches`,
-`GET /debug/last_request_headers`, and `POST /debug/reset`) let
-integration tests inspect and isolate scenarios.
+memory. Four debug endpoints (`GET /debug/batches`,
+`GET /debug/last_request_headers`, `GET /debug/connection_count`,
+and `POST /debug/reset`) let integration tests inspect and isolate
+scenarios.
 
 It is **not** a production ingest server. There is no TLS, no
 gzip, no body-size cap, and the bearer comparison is non-constant-
@@ -63,7 +64,8 @@ process's lifetime.
 | `POST` | `/v1/ingest` (configurable via `--path`) | `200`, `401`, `415`, `400`, `405` | Validate bearer + content-type, decode the MessagePack body via `wire::Batch`, push onto the in-memory store. |
 | `GET` | `/debug/batches` | `200` | Return the in-memory store as JSON (`Vec<wire::Batch>`). `Content-Type: application/json`. **No auth.** |
 | `GET` | `/debug/last_request_headers` | `200`, `404` | Return the headers of the most-recent ingest request as a JSON array of `{name, value}` objects; `404` if no ingest has been received since process start or last `/debug/reset`. Populated *before* bearer/content-type/body validation so rejected requests are still observable. **No auth.** |
-| `POST` | `/debug/reset` | `200` | Empty the in-memory store AND clear the `/debug/last_request_headers` slot. **No auth.** |
+| `GET` | `/debug/connection_count` | `200` | Return the number of distinct ingest-path TCP connections as JSON `{"count": N}`. `0` on a freshly-spawned stub. Each unique `remote_addr` seen on the ingest path counts once; HTTP/1.1 keep-alive on a single client agent therefore keeps the count at `1` regardless of how many sequential POSTs the agent sent. **No auth.** |
+| `POST` | `/debug/reset` | `200` | Empty the in-memory store, clear the `/debug/last_request_headers` slot, AND clear the `/debug/connection_count` set. **No auth.** |
 
 The `/debug/*` paths are unauthenticated — they are debug surfaces
 accessible only on the loopback bind, and integration tests use
