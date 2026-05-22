@@ -100,6 +100,23 @@ struct Args {
     /// `SPECIFICATION.md` OQ-3 path.
     #[arg(long, default_value = "/v1/ingest")]
     path: String,
+
+    /// HTTP status to return on the ingest path's *success path*
+    /// (i.e. after bearer/content-type/body-decode validation has
+    /// passed AND the decoded batch has been pushed onto the
+    /// in-memory store). Default `200`. Range `[100, 599]`.
+    ///
+    /// Used by retry-exhaust integration tests (e.g.
+    /// `tests/php-shipper/retry_exhaust.php`) to drive the
+    /// shipper's `DropReason::HttpStatus(N)` path without standing
+    /// up a separate failing server. `--respond-with` does NOT
+    /// override the existing validation-failure responses (401 on
+    /// bad bearer, 415 on wrong content-type, 400 on body-read or
+    /// decode failure): those status codes are themselves the
+    /// integration-test signal, and the flag only governs the
+    /// success path's response code.
+    #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u16).range(100..600))]
+    respond_with: u16,
 }
 
 fn main() {
@@ -259,7 +276,14 @@ fn handle_ingest(
             return;
         }
     }
-    respond_empty(request, 200);
+    // Storage happens BEFORE the response is built, so a
+    // configured failure status (`--respond-with 500`, etc.)
+    // still appends the decoded batch to the store. Retry-exhaust
+    // tests rely on this: with `--respond-with 500` and
+    // `retry_count = 3`, the shipper makes 4 attempts and
+    // `/debug/batches.len()` reports `4` — one per attempt body.
+    // See `stub-ingest-configurable-failure`'s `design.md` D-3.
+    respond_empty(request, args.respond_with);
 }
 
 fn handle_debug_batches(request: Request, store: &Store) {

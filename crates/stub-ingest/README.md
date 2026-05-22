@@ -41,6 +41,7 @@ CLI flags:
 | `--bind <addr>` | `127.0.0.1:0` | Address to bind. Port `0` lets the OS pick a free port; the bound port is then announced on stdout (see *Bind protocol* below). |
 | `--auth-token <token>` | *(required)* | Bearer token clients must present as `Authorization: Bearer <token>`. |
 | `--path <path>` | `/v1/ingest` | HTTP path on which the stub accepts ingest POSTs. The default matches `SPECIFICATION.md` OQ-3. |
+| `--respond-with <status>` | `200` | HTTP status to return on the ingest path's **success path** — after bearer/content-type/body-decode validation passes and the decoded batch has been pushed onto the store. Range `[100, 599]`. The body is still stored regardless of status, so retry-exhaust tests can count attempts via `/debug/batches.len() == retry_count + 1`. Does **not** override 401/415/400 validation failures — those status codes are themselves the integration-test signal. |
 
 ## Bind protocol
 
