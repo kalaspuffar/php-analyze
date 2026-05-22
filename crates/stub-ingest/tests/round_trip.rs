@@ -65,7 +65,7 @@ fn snapshot(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
 /// `bound:` and `ready` lines. Returns the guard + the parsed
 /// loopback address.
 fn spawn_stub(token: &str) -> (ChildGuard, SocketAddr) {
-    spawn_stub_at(token, "127.0.0.1:0")
+    spawn_stub_with_args(token, "127.0.0.1:0", &[])
 }
 
 /// Spawn the stub on an explicit `--bind <addr>` and block until it
@@ -73,9 +73,31 @@ fn spawn_stub(token: &str) -> (ChildGuard, SocketAddr) {
 /// scenario (WSI-1 #1) and any future test that needs to control the
 /// bind.
 fn spawn_stub_at(token: &str, bind: &str) -> (ChildGuard, SocketAddr) {
+    spawn_stub_with_args(token, bind, &[])
+}
+
+/// Spawn the stub with a configured `--respond-with <status>` on
+/// the success path. Used by retry-exhaust tests to drive the
+/// shipper's `DropReason::HttpStatus(N)` branch without a separate
+/// failing server. Other args (`--auth-token`, `--bind`) match
+/// `spawn_stub`'s defaults.
+fn spawn_stub_with_respond_with(token: &str, respond_with: u16) -> (ChildGuard, SocketAddr) {
+    let status = respond_with.to_string();
+    spawn_stub_with_args(token, "127.0.0.1:0", &["--respond-with", &status])
+}
+
+/// Shared spawn body: builds the `Command`, waits for the bind
+/// protocol's two stdout lines, attaches stdout/stderr drain
+/// threads, and returns the guard. `extra_args` are appended after
+/// the default `--auth-token` / `--bind` pair so callers can opt
+/// into newer CLI flags (`--respond-with`, `--path`, …) without
+/// adding a parameter to every variant.
+fn spawn_stub_with_args(token: &str, bind: &str, extra_args: &[&str]) -> (ChildGuard, SocketAddr) {
     let bin = env!("CARGO_BIN_EXE_stub-ingest");
+    let mut args: Vec<&str> = vec!["--auth-token", token, "--bind", bind];
+    args.extend_from_slice(extra_args);
     let mut child = Command::new(bin)
-        .args(["--auth-token", token, "--bind", bind])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -698,12 +720,13 @@ fn debug_reset_clears_the_captured_headers_slot() {
 }
 
 #[test]
-fn readme_documents_the_five_routes_and_bind_protocol() {
+fn readme_documents_the_five_routes_the_bind_protocol_and_respond_with() {
     // `include_str!` is resolved at compile time relative to this
     // test source file, so the README's content is pinned into the
-    // test binary alongside the assertions. The seven substrings
+    // test binary alongside the assertions. The eight substrings
     // come straight from the `stub-ingest-server/spec.md` scenario
-    // (widened from six → seven by `stub-ingest-connection-counter`).
+    // (widened from seven → eight by
+    // `stub-ingest-configurable-failure`).
     let readme = include_str!("../README.md");
     for needle in [
         "POST /v1/ingest",
@@ -712,6 +735,7 @@ fn readme_documents_the_five_routes_and_bind_protocol() {
         "GET /debug/connection_count",
         "POST /debug/reset",
         "--bind",
+        "--respond-with",
         "bound:",
     ] {
         assert!(
@@ -903,4 +927,113 @@ fn ureq_agent_no_status_err() -> ureq::Agent {
         .http_status_as_error(false)
         .build()
         .new_agent()
+}
+
+#[test]
+fn respond_with_200_is_the_default_behaviour_unchanged() {
+    // Regression guard: a stub spawned without `--respond-with`
+    // must behave exactly like the slice-3 default — `200 OK` on
+    // a valid POST, batch lands in the store. Pins the default in
+    // case clap's `default_value_t` ever drifts.
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer test-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "default --respond-with is 200; got {}",
+        response.status().as_u16(),
+    );
+    assert_eq!(
+        fetch_batches(&agent, addr).len(),
+        1,
+        "the batch lands in the store on a 200 response (slice-3 default)",
+    );
+}
+
+#[test]
+fn respond_with_500_returns_500_but_still_stores_the_batch() {
+    // Design D-3 binding: storage happens before the response is
+    // built, so a configured failure status still records the
+    // attempt body. This is what lets retry-exhaust tests count
+    // attempts via `/debug/batches.len()`.
+    let (_guard, addr) = spawn_stub_with_respond_with("test-token", 500);
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer test-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    assert_eq!(
+        response.status().as_u16(),
+        500,
+        "--respond-with 500 returns 500 on the success path; got {}",
+        response.status().as_u16(),
+    );
+    assert_eq!(
+        fetch_batches(&agent, addr).len(),
+        1,
+        "the body still lands in the store on a configured failure response",
+    );
+}
+
+#[test]
+fn respond_with_does_not_override_401() {
+    // Validation order is unchanged (design D-2): a bearer
+    // mismatch returns 401 even when `--respond-with 500` is
+    // configured. The 401 is itself the integration-test signal
+    // for "auth failed", so it must trump the configured 500.
+    let (_guard, addr) = spawn_stub_with_respond_with("real-token", 500);
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer wrong-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "bad-bearer 401 takes precedence over --respond-with 500; got {}",
+        response.status().as_u16(),
+    );
+    assert!(
+        fetch_batches(&agent, addr).is_empty(),
+        "the request never reached the store-push step; /debug/batches stays empty",
+    );
+}
+
+#[test]
+fn respond_with_does_not_affect_debug_routes() {
+    // `--respond-with` governs the ingest path only. The debug
+    // routes return their natural statuses regardless of the
+    // configured success-path response.
+    let (_guard, addr) = spawn_stub_with_respond_with("test-token", 500);
+    let agent = ureq_agent_no_status_err();
+
+    let response = agent
+        .get(url(addr, "/debug/batches"))
+        .call()
+        .expect("GET /debug/batches");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "GET /debug/batches returns 200 even when --respond-with is 500; got {}",
+        response.status().as_u16(),
+    );
 }
