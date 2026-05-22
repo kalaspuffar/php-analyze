@@ -495,16 +495,220 @@ fn explicit_bind_port_is_honoured() {
     assert_eq!(fetch_batches(&agent, addr).len(), 1);
 }
 
+/// Mirror of the stub's `HeaderPair` serialisation shape. Local
+/// to the integration test because the production `wire::*` types
+/// have no business with header capture.
+#[derive(serde::Deserialize, Debug)]
+struct HeaderPair {
+    name: String,
+    value: String,
+}
+
+/// Fetch `/debug/last_request_headers`. Returns `None` on the
+/// stub's 404 ("no ingest seen yet") and `Some(...)` on the 200
+/// (decoded JSON body). Mirrors `fetch_batches`'s pattern but
+/// distinguishes the two wire states the new endpoint exposes.
+fn fetch_last_request_headers(agent: &ureq::Agent, addr: SocketAddr) -> Option<Vec<HeaderPair>> {
+    let mut response = agent
+        .get(url(addr, "/debug/last_request_headers"))
+        .call()
+        .expect("GET /debug/last_request_headers");
+    match response.status().as_u16() {
+        404 => None,
+        200 => {
+            let body: Vec<u8> = response
+                .body_mut()
+                .read_to_vec()
+                .expect("read /debug/last_request_headers body");
+            Some(
+                serde_json::from_slice(&body)
+                    .expect("parse /debug/last_request_headers as Vec<HeaderPair>"),
+            )
+        }
+        other => panic!(
+            "GET /debug/last_request_headers returned unexpected status {other}; expected 200 or 404",
+        ),
+    }
+}
+
+fn find_header_value<'a>(headers: &'a [HeaderPair], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
+}
+
 #[test]
-fn readme_documents_the_three_routes_and_bind_protocol() {
+fn last_request_headers_returns_404_before_any_ingest() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let snapshot = fetch_last_request_headers(&agent, addr);
+    assert!(
+        snapshot.is_none(),
+        "a freshly-spawned stub has not received any ingest; \
+         /debug/last_request_headers must return 404, got {snapshot:?}",
+    );
+}
+
+#[test]
+fn last_request_headers_captures_authorization_content_type_and_user_agent_on_accepted_ingest() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    // Send a custom User-Agent so the assertion below is exact;
+    // the default ureq User-Agent would also work but ties the
+    // test to ureq's defaults.
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = agent
+        .post(url(addr, "/v1/ingest"))
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", wire::MEDIA_TYPE)
+        .header("User-Agent", "integration-test/1.0")
+        .send(&body[..])
+        .expect("POST /v1/ingest");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let captured = fetch_last_request_headers(&agent, addr)
+        .expect("after one accepted ingest the headers slot is populated");
+
+    assert_eq!(
+        find_header_value(&captured, "Authorization"),
+        Some("Bearer test-token"),
+        "captured Authorization must equal the byte-exact wire value; got {captured:?}",
+    );
+    assert_eq!(
+        find_header_value(&captured, "Content-Type"),
+        Some(wire::MEDIA_TYPE),
+        "captured Content-Type must equal wire::MEDIA_TYPE; got {captured:?}",
+    );
+    assert_eq!(
+        find_header_value(&captured, "User-Agent"),
+        Some("integration-test/1.0"),
+        "captured User-Agent must equal what the client sent; got {captured:?}",
+    );
+}
+
+#[test]
+fn last_request_headers_captures_authorization_on_401_rejected_ingest() {
+    let (_guard, addr) = spawn_stub("real-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer wrong-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "fixture sanity: the wrong bearer is rejected",
+    );
+
+    let captured = fetch_last_request_headers(&agent, addr)
+        .expect("a 401-rejected ingest still populates the headers slot (capture-before-validate)");
+    assert_eq!(
+        find_header_value(&captured, "Authorization"),
+        Some("Bearer wrong-token"),
+        "the captured Authorization must equal what the client sent on the rejected attempt; got {captured:?}",
+    );
+}
+
+#[test]
+fn last_request_headers_returns_only_the_most_recent_request() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+
+    let first = agent
+        .post(url(addr, "/v1/ingest"))
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", wire::MEDIA_TYPE)
+        .header("User-Agent", "first-agent/1.0")
+        .send(&body[..])
+        .expect("first POST /v1/ingest");
+    assert_eq!(first.status().as_u16(), 200);
+
+    let second = agent
+        .post(url(addr, "/v1/ingest"))
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", wire::MEDIA_TYPE)
+        .header("User-Agent", "second-agent/2.0")
+        .send(&body[..])
+        .expect("second POST /v1/ingest");
+    assert_eq!(second.status().as_u16(), 200);
+
+    let captured =
+        fetch_last_request_headers(&agent, addr).expect("slot populated after two ingests");
+    assert_eq!(
+        find_header_value(&captured, "User-Agent"),
+        Some("second-agent/2.0"),
+        "most-recent-wins: second ingest's User-Agent must be visible; got {captured:?}",
+    );
+    assert!(
+        captured.iter().all(|h| h.value != "first-agent/1.0"),
+        "no captured value should equal the first ingest's User-Agent; got {captured:?}",
+    );
+}
+
+#[test]
+fn last_request_headers_does_not_capture_debug_batches_request() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    // Drive a request that does NOT target the ingest path.
+    // /debug/batches is the natural choice — every test calls it,
+    // so a regression where it accidentally populated the slot
+    // would surface fast.
+    let batches = fetch_batches(&agent, addr);
+    assert!(
+        batches.is_empty(),
+        "fixture sanity: fresh store starts empty",
+    );
+
+    let snapshot = fetch_last_request_headers(&agent, addr);
+    assert!(
+        snapshot.is_none(),
+        "/debug/batches must NOT populate /debug/last_request_headers; got {snapshot:?}",
+    );
+}
+
+#[test]
+fn debug_reset_clears_the_captured_headers_slot() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    post_valid_batch(&agent, addr, "test-token", &sample_batch());
+    assert!(
+        fetch_last_request_headers(&agent, addr).is_some(),
+        "fixture sanity: an accepted ingest populates the headers slot",
+    );
+
+    reset_store(&agent, addr);
+
+    let snapshot = fetch_last_request_headers(&agent, addr);
+    assert!(
+        snapshot.is_none(),
+        "POST /debug/reset must clear the captured headers slot; got {snapshot:?}",
+    );
+}
+
+#[test]
+fn readme_documents_the_four_routes_and_bind_protocol() {
     // `include_str!` is resolved at compile time relative to this
     // test source file, so the README's content is pinned into the
-    // test binary alongside the assertions. The five substrings come
-    // straight from the `stub-ingest-server/spec.md` scenario.
+    // test binary alongside the assertions. The six substrings come
+    // straight from the `stub-ingest-server/spec.md` scenario
+    // (widened from five → six by `stub-ingest-header-capture`).
     let readme = include_str!("../README.md");
     for needle in [
         "POST /v1/ingest",
         "GET /debug/batches",
+        "GET /debug/last_request_headers",
         "POST /debug/reset",
         "--bind",
         "bound:",
