@@ -642,11 +642,21 @@ overhead.
 
 **Proposed follow-ups** (queued for §2 P1 once authored):
 
-- `recorder-cpu-snapshot-cadence` — implements one of the
-  options above, behind a `php_analyze.cpu_snapshot_mode`
-  directive that defaults to the spec-current "per-call" but
-  permits a "coarse" or "off" mode for performance-critical
-  pools. Spec deviation; needs operator sign-off.
+- `recorder-cpu-snapshot-cadence` (in progress on
+  `feat/recorder-cpu-snapshot-cadence`) — ships the
+  `php_analyze.cpu_snapshot_mode` directive with two values:
+  `per-call` (default; spec-current) and `off` (skip the
+  `getrusage` syscall, emit `cpu_u_ns = cpu_s_ns = 0`).
+  **Observed on the reference dev host**: geo-mean **9.88×
+  → 5.11×** under `off` (flat_calls 33.09× → 12.38×,
+  json_batch 2.30× → **1.87× under budget**, recursive_walk
+  12.65× → 5.77×). Half the recorder's overhead on this host
+  was the per-call getrusage syscall — matches the C-19
+  hypothesis closely. The `coarse` mode (sampled CPU
+  amortisation) is deferred to a follow-up; the all-or-nothing
+  trade-off was the smallest sufficient design surface for v1.
+  Spec amendments to §3.2 / §3.5 / R-11 + README directive
+  table land in the same change.
 - `bench-canonical-workloads-revisit` — re-evaluate whether
   `flat_calls.php` (10⁶ noop calls) is a meaningful canonical
   workload given that no realistic PHP application looks like

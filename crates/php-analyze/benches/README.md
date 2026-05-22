@@ -63,6 +63,50 @@ geo-mean.
 | `recorder_workload` | `10_000` tight-loop calls per criterion iteration against a fresh `Trace`. Simulates `flat_calls.php` from `SPECIFICATION.md` §9.2. | Workload-shape time: one cold dict miss + 9_999 hits per iteration. Closer to a real request's hit ratio than `recorder_hot_path`'s long-warm dictionary. |
 | `workload_overhead` | Three canonical PHP workloads under `tests/php-bench/` (`flat_calls.php` 10⁶ user calls; `json_batch.php` 10⁵ JSON rows; `recursive_walk.php` 1024-node tree × 40 passes), each timed 5× unprofiled + 5× profiled. Resolves OQ-7. | Geo-mean wall-time ratio (profiled / unprofiled) across the three workloads. Asserts the `≤ 2.0×` NFR-PERF-1 budget unless `PHP_ANALYZE_BENCH_NO_ASSERT=1` is set. |
 
+## `cpu_snapshot_mode` operator lever (`recorder-cpu-snapshot-cadence`)
+
+The `php_analyze.cpu_snapshot_mode` directive lets operators trade
+per-call CPU attribution for ~1000 ns of saved syscall cost per PHP
+function. Two modes:
+
+- `per-call` (default) — spec-current. Every begin/end snapshot calls
+  `getrusage(RUSAGE_THREAD)`.
+- `off` — skip the `getrusage` call entirely; `cpu_u_ns` and `cpu_s_ns`
+  are emitted as `0` in every `CallRecord`. Saves ~1000 ns/call on
+  hosts without vDSO for that syscall (most Linux x86_64).
+
+The `workload_overhead` bench can toggle the mode via the
+`PHP_ANALYZE_BENCH_CPU_MODE` env var:
+
+```sh
+# Default mode (per-call):
+PHP_ANALYZE_RUN_BENCH=1 cargo bench -p php-analyze --bench workload_overhead
+
+# Performance-optimised mode (off):
+PHP_ANALYZE_RUN_BENCH=1 PHP_ANALYZE_BENCH_CPU_MODE=off \
+    cargo bench -p php-analyze --bench workload_overhead
+```
+
+Observed numbers on the reference dev host (5-sample medians):
+
+| Workload | `per-call` | `off` | Improvement |
+| --- | --- | --- | --- |
+| `flat_calls` | 33.09× | **12.38×** | -63% |
+| `json_batch` | 2.30× | **1.87×** (under budget) | -19% |
+| `recursive_walk` | 12.65× | **5.77×** | -54% |
+| **geo-mean** | **9.88×** | **5.11×** | **-48%** |
+
+**Recommendation for high-volume pools**: `off` is a credible
+operator lever — roughly half the recorder's overhead on this host
+disappears. The trade-off is **all `CallRecord::cpu_u_ns` /
+`cpu_s_ns` read as 0**; downstream consumers that need per-call CPU
+attribution must stay on `per-call`. The 2.0× NFR-PERF-1 budget is
+still not reached under either mode; closing the residual gap
+requires re-evaluating whether the canonical workloads
+(`flat_calls.php` in particular) represent realistic PHP traffic —
+see `COMMENTS.md` C-19's `bench-canonical-workloads-revisit`
+follow-up.
+
 ## Most recent observed numbers (after `recorder-hot-path-tuning`)
 
 Reference host (developer workstation, PHP 8.4.21, default

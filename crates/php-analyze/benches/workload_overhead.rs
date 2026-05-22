@@ -214,6 +214,20 @@ fn locate_bench_fixture(name: &str) -> PathBuf {
 /// upstream.
 fn make_profiled_ini(cdylib: &Path, tmpdir: &Path) -> PathBuf {
     let ini_path = tmpdir.join("profiled.ini");
+    // Optional CPU-snapshot mode override
+    // (recorder-cpu-snapshot-cadence). `PHP_ANALYZE_BENCH_CPU_MODE`
+    // accepts the same vocabulary as the directive itself:
+    // `per-call` (default; current spec) or `off` (skip
+    // `getrusage`). Anything unrecognised is passed verbatim; the
+    // extension's parser will log one warning and fall back. Used
+    // by operators to quantify the `off` mode's saving on their
+    // own host.
+    let cpu_mode_line = match std::env::var("PHP_ANALYZE_BENCH_CPU_MODE").ok().as_deref() {
+        Some(value) if !value.is_empty() => {
+            format!("php_analyze.cpu_snapshot_mode = \"{value}\"\n")
+        }
+        _ => String::new(),
+    };
     let ini_body = format!(
         concat!(
             "extension={cdylib}\n",
@@ -223,8 +237,10 @@ fn make_profiled_ini(cdylib: &Path, tmpdir: &Path) -> PathBuf {
             "php_analyze.spike_observer    = 0\n",
             "php_analyze.shutdown_grace_ms = 200\n",
             "php_analyze.http_timeout_ms   = 200\n",
+            "{cpu_mode_line}"
         ),
         cdylib = cdylib.display(),
+        cpu_mode_line = cpu_mode_line,
     );
     std::fs::write(&ini_path, ini_body).expect("write profiled.ini");
     ini_path
