@@ -211,14 +211,20 @@ pub struct EntrySnapshots {
 }
 
 impl EntrySnapshots {
-    /// Take snapshots from the production clock primitives.
+    /// Take snapshots from the production clock primitives. Routes
+    /// through [`clocks::snapshot_now`] so the recorder hot path has
+    /// one inlinable boundary per begin/end (recorder-hot-path-tuning
+    /// D-3). The syscall pattern is unchanged: same
+    /// `CLOCK_MONOTONIC` read, same `getrusage(RUSAGE_THREAD)`,
+    /// same `zend_memory_usage(true)`.
+    #[inline]
     fn capture_now() -> Self {
-        let cpu = clocks::cpu_times_now_ns();
+        let raw = clocks::snapshot_now();
         Self {
-            t_in_ns: clocks::monotonic_now_ns(),
-            cpu_u_in_ns: cpu.user_ns,
-            cpu_s_in_ns: cpu.system_ns,
-            mem_in_bytes: clocks::memory_usage_real_bytes(),
+            t_in_ns: raw.t_ns,
+            cpu_u_in_ns: raw.cpu_u_ns,
+            cpu_s_in_ns: raw.cpu_s_ns,
+            mem_in_bytes: raw.mem_bytes,
         }
     }
 }
@@ -235,13 +241,16 @@ pub struct ExitSnapshots {
 }
 
 impl ExitSnapshots {
+    /// Take snapshots from the production clock primitives. Mirror of
+    /// [`EntrySnapshots::capture_now`]; same one-syscall-pattern.
+    #[inline]
     fn capture_now() -> Self {
-        let cpu = clocks::cpu_times_now_ns();
+        let raw = clocks::snapshot_now();
         Self {
-            t_out_ns: clocks::monotonic_now_ns(),
-            cpu_u_now_ns: cpu.user_ns,
-            cpu_s_now_ns: cpu.system_ns,
-            mem_out_bytes: clocks::memory_usage_real_bytes(),
+            t_out_ns: raw.t_ns,
+            cpu_u_now_ns: raw.cpu_u_ns,
+            cpu_s_now_ns: raw.cpu_s_ns,
+            mem_out_bytes: raw.mem_bytes,
         }
     }
 }

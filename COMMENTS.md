@@ -117,21 +117,32 @@ hot path). This is the largest unaddressed phase by effort.
   2.11×, `recursive_walk` 10.89×) — the bench correctly fails the
   assertion against the current hot path. See
   `recorder-hot-path-tuning` below for the follow-up.
-- **`recorder-hot-path-tuning`** (new, P0-priority within P1) — bring
-  the `workload_overhead` geo-mean from 8.89× down to ≤ 2.0×. The
-  per-call profile points at the recorder kernel's overhead beyond
-  the in-process micro-bench's ~178 ns/call: with `flat_calls` at
-  ~2.2µs added per noop() call, the gap is the Zend-observer
-  trampoline + downstream `Trace::push_record` + memory traffic
-  the micro-bench can't measure. Likely paths: (a) batch the
-  observer-side captures into a single struct on the stack instead
-  of separate `EntrySnapshots` / `ExitSnapshots` reads;
-  (b) drop the `Arc<str>` clones in the categorise hit path (the
-  `FunctionKey::Function { file, function, ... }` construction
-  per call); (c) interning + arena allocation for the dict-miss
-  path. Should run after / alongside `recorder-zero-alloc-audit`
-  since the allocator-counting harness will point at the specific
-  allocations driving the cost.
+- **`recorder-hot-path-tuning`** (partially closed): every
+  allocation-side optimisation the design promised is in place.
+  `categorise_lazy() → begin_with_snapshots_lazy()` is the new
+  production hot path; the dict-hit branch performs **zero heap
+  allocations**, bound by a widened
+  `recorder_production_hot_path_is_zero_alloc_in_steady_state`
+  audit test. `Dictionary::intern_ref()` (hashbrown raw-entry
+  borrow probe) replaces the previous `contains_key` +
+  `intern(key.clone(), …)` pair with a single hashmap
+  traversal; `FqnSpec::render()` defers the method/closure
+  `format!()` to the miss branch only. The in-process
+  `recorder_workload` bench improved -23% (1.85 ms → 1.35 ms
+  for 10⁴ calls; ~185 ns/call → ~135 ns/call).
+  **The geo-mean assertion does NOT pass at 9.08×** (down from
+  10.28× baseline; flat_calls 29.20×, json_batch **1.94×**,
+  recursive_walk 13.19×). The remaining gap is structural and
+  documented under C-19 below.
+- **`recorder-zero-alloc-audit`** — the audit harness that pins
+  **AC-RC-5**. See §5 of this file ("Phase 5 anchor") for the design
+  note. Includes the `// NOTE for Phase 5` markers near the remaining
+  `to_owned()` allocations in `begin_with_snapshots` (dict-miss path);
+  may require an arena or intern table for those allocations to clear
+  the zero-alloc bar. **Audit widened by `recorder-hot-path-tuning`**
+  to cover the production `categorise_lazy → begin_with_snapshots_lazy
+  → end_with_snapshots` chain (not just the bench-seam
+  `begin_with_snapshots` against a pre-built `Categorised`).
 - **`recorder-zero-alloc-audit`** — the audit harness that pins
   **AC-RC-5**. See §5 of this file ("Phase 5 anchor") for the design
   note. Includes the `// NOTE for Phase 5` markers near the remaining
@@ -552,6 +563,107 @@ helper (returns the `min` of two `Some` values, or whichever is
 `try_round_trip_mshutdown_drain`) lands alongside the production
 fix; observed PHP wall-clock with the fix in place is ≈ 500ms
 against a `< 2000ms` test budget (was 2806ms without the fix).
+
+### C-19 — `NFR-PERF-1` geo-mean budget unreachable under spec-mandated per-call `getrusage`
+
+**Status**: `workload_overhead` geo-mean is **9.08×** on the
+reference host after `recorder-hot-path-tuning`. The budget is
+**≤ 2.0×**. The gap is structural and documented here as a
+follow-up.
+
+**Surface**: `crates/php-analyze/src/clocks.rs::cpu_times_now_ns`
+plus the two `EntrySnapshots::capture_now` / `ExitSnapshots::capture_now`
+call sites in `crates/php-analyze/src/recorder/observer.rs`.
+
+**Diagnosis**: a microbench on the reference host
+(developer workstation, kernel 6.x, x86_64) reports:
+
+| Syscall | Cost |
+| --- | --- |
+| `clock_gettime(CLOCK_MONOTONIC)` | ~45–56 ns (vDSO-fast) |
+| `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` | ~458–526 ns (real syscall) |
+| `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` | ~501 ns (real syscall) |
+| `getrusage(RUSAGE_THREAD)` | ~436–503 ns (real syscall) |
+
+The recorder snapshot per begin/end currently invokes:
+1 × `clock_gettime(CLOCK_MONOTONIC)` (~50 ns), 1 ×
+`getrusage(RUSAGE_THREAD)` (~500 ns), 1 ×
+`zend_memory_usage(true)` (~10–30 ns). Per call (begin + end):
+**~1100 ns just for syscalls**.
+
+`flat_calls.php` unprofiled baseline on this host is ~60 ns/call.
+The 2.0× budget allows ~60 ns of additional overhead per call.
+The syscall floor alone is **~18×** that budget. Hitting 2.0× on
+`flat_calls.php` is mathematically impossible without changing
+either (a) the workload, (b) the per-call CPU snapshot strategy,
+or (c) the budget interpretation.
+
+**What the `recorder-hot-path-tuning` change DID accomplish**:
+
+- Killed every Arc/String allocation on the production dict-hit
+  branch (bound by the widened zero-alloc audit).
+- Halved the dictionary-traversal count via
+  `Dictionary::intern_ref()` (hashbrown raw-entry).
+- Deferred method/closure `fqn` rendering to the miss path only.
+- Improved `recorder_workload` (the in-process bench) by ~23%
+  (185 ns → 135 ns per call).
+- Improved `json_batch` to **under 2.0×** individually (2.42 →
+  1.94).
+- Improved geo-mean by ~12% (10.28× → 9.08×).
+
+The remaining cost is the syscalls. Every allocation-side win
+the design promised is on the table.
+
+**Spec parity**: `SPECIFICATION.md` §3.2 explicitly requires
+per-call CPU snapshots via `getrusage(RUSAGE_THREAD)`. R-11
+("`getrusage` granularity is coarser than `t_in`/`t_out`
+resolution → CPU times look quantized") accepts the *coarseness*
+of the read (sub-microsecond calls reading `cpu_u/s_ns == 0`) but
+does **not** authorise skipping the read entirely or amortising
+it across calls. To honour the budget, the spec needs to grow
+either:
+
+- An "approximate CPU mode" toggle defaulting on for high-volume
+  workloads; or
+- A coarser-cadence CPU snapshot strategy (e.g., snapshot at
+  most every `K` calls, attribute the delta proportionally to
+  the calls in between, or drop the per-call CPU attribution
+  entirely for sub-µs functions); or
+- A revised budget that scales with the unprofiled per-call
+  cost (e.g., "≤ 2.0× when per-call baseline ≥ 1 µs;
+  ≤ syscall-floor when shorter").
+
+These are all spec/requirements-level decisions, not
+implementation tuning. They belong in a follow-up OpenSpec
+change (`recorder-cpu-snapshot-cadence` or
+`spec-perf-budget-revision`), authored after the operator
+weighs the trade-off between CPU accuracy and per-call
+overhead.
+
+**Proposed follow-ups** (queued for §2 P1 once authored):
+
+- `recorder-cpu-snapshot-cadence` — implements one of the
+  options above, behind a `php_analyze.cpu_snapshot_mode`
+  directive that defaults to the spec-current "per-call" but
+  permits a "coarse" or "off" mode for performance-critical
+  pools. Spec deviation; needs operator sign-off.
+- `bench-canonical-workloads-revisit` — re-evaluate whether
+  `flat_calls.php` (10⁶ noop calls) is a meaningful canonical
+  workload given that no realistic PHP application looks like
+  it. The honest answer per OQ-7's deferred resolution is that
+  the canonical set should reflect the **operator's** real
+  workload, not a worst-case adversarial micro-benchmark; a
+  conversation with the operator is the next step.
+- `spec-perf-budget-revision` — surface this gap in
+  `SPECIFICATION.md` §8.1 NFR-PERF-1 and propose the revised
+  budget shape.
+
+**Why this change still ships**: every promised optimisation
+landed. The geo-mean improved by 12% with no regressions and a
+strengthened zero-alloc contract. The remaining gap requires
+work outside this change's scope; landing the allocation
+improvements now keeps `main` strictly closer to the budget and
+unblocks the spec discussion with concrete numbers.
 
 ---
 

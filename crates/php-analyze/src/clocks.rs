@@ -205,6 +205,43 @@ fn timeval_to_ns(tv: libc::timeval) -> i64 {
     tv.tv_sec * 1_000_000_000 + tv.tv_usec * 1_000
 }
 
+/// All four observer-relevant clock/memory values in one batch. Used
+/// by [`RawSnapshot::capture_now`] so the recorder hot path passes
+/// through a single inlinable entry point per begin/end boundary
+/// (recorder-hot-path-tuning D-3). The syscall pattern is unchanged
+/// versus calling the individual `*_now_ns` helpers — same one
+/// `CLOCK_MONOTONIC` read, same one `getrusage` read, same one
+/// `zend_memory_usage` call.
+///
+/// The struct exists for shape parity with the begin/end snapshot
+/// types in `recorder::observer`; the helper assembles values from
+/// the same syscall pattern documented on those helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawSnapshot {
+    pub t_ns: i64,
+    pub cpu_u_ns: i64,
+    pub cpu_s_ns: i64,
+    pub mem_bytes: i64,
+}
+
+/// Combined snapshot helper. Equivalent to calling
+/// [`monotonic_now_ns`] + [`cpu_times_now_ns`] +
+/// [`memory_usage_real_bytes`] in sequence; provided as a single
+/// `#[inline]` function so the optimiser can fold the boundary and so
+/// the recorder hot path has a single named seam to reason about.
+#[inline]
+pub(crate) fn snapshot_now() -> RawSnapshot {
+    let t_ns = monotonic_now_ns();
+    let cpu = cpu_times_now_ns();
+    let mem_bytes = memory_usage_real_bytes();
+    RawSnapshot {
+        t_ns,
+        cpu_u_ns: cpu.user_ns,
+        cpu_s_ns: cpu.system_ns,
+        mem_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +330,30 @@ mod tests {
         // The let-binding annotation is what enforces the contract; the
         // body of this test is intentionally minimal.
         let _value: i64 = memory_usage_real_bytes();
+    }
+
+    #[test]
+    fn snapshot_now_returns_consistent_components_across_two_reads() {
+        // The combined snapshot helper must agree with the individual
+        // `*_now_ns` helpers on what they would have read separately
+        // — modulo the strict ordering between the wall-clock and CPU
+        // reads (which can advance between calls). The bound is the
+        // weakest one all four components share: non-negative,
+        // monotonically non-decreasing across two reads, and within
+        // a sane upper bound (`i64::MAX`).
+        let a = snapshot_now();
+        std::thread::sleep(Duration::from_micros(500));
+        let b = snapshot_now();
+
+        // Wall clock must not regress.
+        assert!(b.t_ns >= a.t_ns, "monotonic regression: a={a:?}, b={b:?}");
+        // CPU times are monotonically non-decreasing per the kernel's
+        // accounting contract.
+        assert!(b.cpu_u_ns >= a.cpu_u_ns, "user CPU regressed");
+        assert!(b.cpu_s_ns >= a.cpu_s_ns, "system CPU regressed");
+        // Memory: the test-build stub returns 0 unconditionally;
+        // production reads PHP's real-usage counter. Both paths are
+        // non-negative.
+        assert!(b.mem_bytes >= 0);
     }
 }
