@@ -33,6 +33,17 @@
 //! `(binary, fixture)` cross-product mediated by per-fixture helpers
 //! (mirrors the recorder integration test's shape).
 //!
+//! Tasks 7.5 (auth-header byte-equal) and 7.6 (User-Agent
+//! equality) are bound in `try_round_trip` itself: after the
+//! noop round-trip asserts on the stored batch, the test fetches
+//! `/debug/last_request_headers` from the stub (the endpoint
+//! added by `stub-ingest-header-capture`) and asserts the
+//! `Authorization` value equals `Bearer rt-token-1` byte-for-byte
+//! and the `User-Agent` value equals `format!("php-analyze/{}",
+//! env!("CARGO_PKG_VERSION"))`. The `assert_eq!` against the
+//! exact `env!` value is tighter than the spec's
+//! `^php-analyze/[0-9]+\.[0-9]+\.[0-9]+$` regex.
+//!
 //! Task 7.7 (1000 sends / 1 connection) is bound in this file by
 //! `try_round_trip_connection_reuse` against the
 //! `connection_reuse.php` fixture, using the
@@ -61,13 +72,10 @@
 //! a regression in either the per-attempt timeout or the
 //! per-iteration cell re-read pushes it to 3s+.
 //!
-//! Tasks 7.5 (auth-header byte-equal) and 7.6 (User-Agent string)
-//! are unblocked by the prior `stub-ingest-header-capture` change
-//! but bound in a separate follow-up. With 7.10 closed by this
-//! change, no deferred items in this file remain that require
-//! new `stub-ingest` endpoints or shipper-side fixes — only the
-//! lightweight consumer of `/debug/last_request_headers` for
-//! 7.5 / 7.6 is left.
+//! All Phase-4 slice-3 deferred-test items (7.5, 7.6, 7.7, 7.8,
+//! 7.9, 7.10) are now closed by this file's four round-trip
+//! helpers consuming the four stub-ingest debug endpoints +
+//! the in-crate `SlowRecordingOnBatch` Rust-level test.
 
 use std::env;
 use std::io::{BufRead, BufReader};
@@ -162,6 +170,31 @@ enum RoundTripOutcome {
     SkippedModuleApi,
 }
 
+/// Wire shape returned by `stub-ingest`'s
+/// `GET /debug/last_request_headers` (added in
+/// `stub-ingest-header-capture`). One entry per header in the
+/// order the client sent them; names are case-insensitive on
+/// lookup per RFC 9110, so the test uses
+/// [`find_header_value`] which `eq_ignore_ascii_case`-matches
+/// names while preserving the as-sent value verbatim.
+#[derive(serde::Deserialize, Debug)]
+struct HeaderPair {
+    name: String,
+    value: String,
+}
+
+/// Case-insensitive header-name lookup; case-sensitive value
+/// return. Mirrors the `find_header_value` helper in the
+/// stub-side `crates/stub-ingest/tests/round_trip.rs` (the
+/// duplication is intentional — both are small enough that a
+/// shared test-support crate would be over-engineering).
+fn find_header_value<'a>(headers: &'a [HeaderPair], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
+}
+
 fn try_round_trip(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
     let token = "rt-token-1";
     let path = "/v1/ingest";
@@ -254,6 +287,34 @@ fn try_round_trip(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
         "{php_binary} noop.php: noop appears in dict exactly once, got {} ({:?})",
         noop_dict.len(),
         batch.dict.iter().map(|d| &d.fqn).collect::<Vec<_>>(),
+    );
+
+    // Tasks 7.5 / 7.6 binding: fetch the headers the production
+    // shipper sent (via the `/debug/last_request_headers`
+    // endpoint added in `stub-ingest-header-capture`) and assert
+    // on the byte-exact `Authorization` and `User-Agent` values.
+    // The `assert_eq!` on `User-Agent` uses the same `env!` the
+    // production code reads (`crates/php-analyze/src/shipper/http.rs`
+    // line ~193: `format!("php-analyze/{}", env!("CARGO_PKG_VERSION"))`).
+    // The test crate is part of the same package as the production
+    // crate, so both `env!` reads resolve to the same value at
+    // compile time — this is stricter than the spec's
+    // `^php-analyze/[0-9]+\.[0-9]+\.[0-9]+$` regex and catches
+    // version-source drift the regex would permit.
+    let captured = stub.fetch_last_request_headers();
+    assert_eq!(
+        find_header_value(&captured, "Authorization"),
+        Some("Bearer rt-token-1"),
+        "{php_binary} noop.php: Authorization header must equal `Bearer <configured-token>` \
+         byte-for-byte (task 7.5); got {captured:?}",
+    );
+    let expected_user_agent = format!("php-analyze/{}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        find_header_value(&captured, "User-Agent"),
+        Some(expected_user_agent.as_str()),
+        "{php_binary} noop.php: User-Agent header must equal \
+         `php-analyze/<crate-version>` where <crate-version> is \
+         `env!(\"CARGO_PKG_VERSION\")` (task 7.6); got {captured:?}",
     );
 
     // `drop(stub)` kills the stub process so the next iteration
@@ -719,6 +780,38 @@ impl StubProcess {
             )
         });
         decoded.count
+    }
+
+    /// GET `/debug/last_request_headers` and return the decoded
+    /// JSON array. Panics on non-200 (including the 404
+    /// "no ingest yet" case — the test calls this *after*
+    /// `fetch_batches` has already proven the ingest landed,
+    /// so 404 here would be a test bug). Used by `try_round_trip`
+    /// to bind tasks 7.5 (Authorization byte-equal) and 7.6
+    /// (User-Agent equality) against the production
+    /// `RmpEncodeAndHttpPost` headers via the endpoint added in
+    /// `stub-ingest-header-capture`.
+    fn fetch_last_request_headers(&self) -> Vec<HeaderPair> {
+        let url = format!("http://127.0.0.1:{}/debug/last_request_headers", self.port);
+        let response = ureq::get(&url)
+            .call()
+            .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+        let status = response.status().as_u16();
+        assert_eq!(
+            status, 200,
+            "GET /debug/last_request_headers expected 200 (the test calls this after \
+             fetch_batches proves the ingest landed, so 404 would be a test bug); got {status}",
+        );
+        let mut body = response.into_body();
+        let bytes = body
+            .read_to_vec()
+            .unwrap_or_else(|e| panic!("read /debug/last_request_headers body: {e}"));
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "decode /debug/last_request_headers JSON: {e}; body: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     }
 }
 
