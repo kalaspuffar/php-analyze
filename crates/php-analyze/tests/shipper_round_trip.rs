@@ -33,15 +33,19 @@
 //! `(binary, fixture)` cross-product mediated by per-fixture helpers
 //! (mirrors the recorder integration test's shape).
 //!
-//! Tasks 7.5 (auth-header byte-equal), 7.6 (User-Agent string), 7.7
-//! (1000 sends / 1 connection), 7.8 (retry-exhaust drop counter
-//! visible on the next batch), 7.9 (token never leaked to error
-//! log), and 7.10 (MSHUTDOWN drain within grace) are **deferred to a
-//! follow-up OpenSpec change**. They require either new
-//! `stub-ingest` debug endpoints (header capture, connection
-//! counter, simulated-slow mode) or PHP error-log capture
-//! infrastructure that does not yet exist. This file covers tasks
-//! 7.1–7.4 only — the end-to-end happy-path verification.
+//! Task 7.7 (1000 sends / 1 connection) is bound in this file by
+//! `try_round_trip_connection_reuse` against the
+//! `connection_reuse.php` fixture, using the
+//! `/debug/connection_count` endpoint added in the
+//! `stub-ingest-connection-counter` change. Tasks 7.5 (auth-header
+//! byte-equal) and 7.6 (User-Agent string) are unblocked by the
+//! prior `stub-ingest-header-capture` change but bound in a separate
+//! follow-up. Tasks 7.8 (retry-exhaust drop counter visible on the
+//! next batch), 7.9 (token never leaked to error log), and 7.10
+//! (MSHUTDOWN drain within grace) remain **deferred** — they need
+//! the `stub-ingest-configurable-failure` and `stub-ingest-slow-mode`
+//! endpoints (queued in `COMMENTS.md` §2 P0) or PHP error-log
+//! capture infrastructure.
 
 use std::env;
 use std::io::{BufRead, BufReader};
@@ -88,9 +92,18 @@ fn shipper_round_trip_lands_one_batch_on_stub() {
     let mut exercised: Vec<&str> = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();
     for binary in &available {
-        match try_round_trip(binary, &cdylib) {
-            RoundTripOutcome::Passed => exercised.push(binary),
-            RoundTripOutcome::SkippedModuleApi => skipped.push(binary),
+        // Each fixture gets its own freshly-spawned stub: a single
+        // PHP process opens one TCP connection to the stub's
+        // ureq::Agent, but the second PHP process would inevitably
+        // open a second. Spawning two stubs (one per fixture) keeps
+        // each fixture's per-process invariants independent.
+        let primary = try_round_trip(binary, &cdylib);
+        let reuse = try_round_trip_connection_reuse(binary, &cdylib);
+        match (primary, reuse) {
+            (RoundTripOutcome::Passed, RoundTripOutcome::Passed) => exercised.push(binary),
+            (RoundTripOutcome::SkippedModuleApi, _) | (_, RoundTripOutcome::SkippedModuleApi) => {
+                skipped.push(binary)
+            }
         }
     }
 
@@ -217,6 +230,89 @@ fn try_round_trip(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
     RoundTripOutcome::Passed
 }
 
+/// AC-SH-6 binding round-trip: drive the `connection_reuse.php`
+/// fixture (1000 `noop()` calls under `flush_records = 1`) through
+/// one PHP process so the shipper's single `ureq::Agent` POSTs
+/// ≈1000 times sequentially, then assert the stub's
+/// `/debug/connection_count` reports exactly `1`. Closes task 7.7
+/// of `shipper_round_trip.rs`'s deferred-test backlog.
+fn try_round_trip_connection_reuse(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
+    let token = "rt-token-cr";
+    let path = "/v1/ingest";
+
+    let stub = StubProcess::spawn(token, path);
+    let server_url = format!("http://127.0.0.1:{}{}", stub.port, path);
+
+    // `flush_records = 1` forces a flush on every emitted exit
+    // record, so each `noop()` call in the fixture produces a
+    // flushable `PendingBatch` → one POST. The shipper's
+    // `RmpEncodeAndHttpPost` reuses one `ureq::Agent` for all of
+    // them; AC-SH-6 says that maps to exactly one TCP connection.
+    // `shutdown_grace` is bumped relative to the noop fixture
+    // because the drain may need to push out a tail of in-flight
+    // batches before exit.
+    let tmpdir = tempfile::tempdir().expect("tempdir for php.ini");
+    let ini_path = tmpdir.path().join("shipper_reuse.ini");
+    let ini_body = format!(
+        concat!(
+            "extension={cdylib}\n",
+            "php_analyze.enabled        = 1\n",
+            "php_analyze.server_url     = \"{url}\"\n",
+            "php_analyze.auth_token     = \"{token}\"\n",
+            "php_analyze.spike_observer = 0\n",
+            "php_analyze.flush_records  = 1\n",
+            "php_analyze.shutdown_grace = 5000\n",
+        ),
+        cdylib = cdylib.display(),
+        url = server_url,
+        token = token,
+    );
+    std::fs::write(&ini_path, ini_body).expect("write shipper_reuse.ini");
+
+    let fixture = locate_fixture("connection_reuse.php");
+    let output = Command::new(php_binary)
+        .arg("-n")
+        .arg("-c")
+        .arg(&ini_path)
+        .arg(&fixture)
+        .output()
+        .unwrap_or_else(|e| panic!("invoke {php_binary} {fixture:?}: {e}"));
+
+    if mentions_module_api_mismatch(&output.stdout) || mentions_module_api_mismatch(&output.stderr)
+    {
+        return RoundTripOutcome::SkippedModuleApi;
+    }
+
+    assert!(
+        output.status.success(),
+        "{php_binary} exited non-zero on connection_reuse.php (status {:?}); stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // AC-SH-6: 1 TCP connection across ≈1000 POSTs from one agent.
+    let count = stub.fetch_connection_count();
+    assert_eq!(
+        count, 1,
+        "{php_binary} connection_reuse.php: expected exactly 1 distinct TCP \
+         connection over loopback keep-alive (AC-SH-6), got {count}",
+    );
+
+    // Sanity: at least one batch landed on the stub. The exact
+    // count is `1000 ± a few` because the script body's exit
+    // record adds one and RSHUTDOWN's final flush can split a
+    // tail; the connection-count contract is `1`, not the batch
+    // count.
+    let batches = stub.fetch_batches();
+    assert!(
+        !batches.is_empty(),
+        "{php_binary} connection_reuse.php: expected at least one batch on the stub, got 0",
+    );
+
+    drop(stub);
+    RoundTripOutcome::Passed
+}
+
 /// Spawned `stub-ingest` process. Holds the child handle and the
 /// bound port. The child is killed on `Drop` so a panicking test
 /// leaves no orphan process behind.
@@ -282,6 +378,32 @@ impl StubProcess {
                 String::from_utf8_lossy(&bytes)
             )
         })
+    }
+
+    /// GET `/debug/connection_count` and return the decoded
+    /// `{"count": N}` value. Used by the AC-SH-6 binding test
+    /// below: a single PHP process driving ≈1000 sends via the
+    /// shipper's one `ureq::Agent` must result in `count == 1`.
+    fn fetch_connection_count(&self) -> usize {
+        let url = format!("http://127.0.0.1:{}/debug/connection_count", self.port);
+        let response = ureq::get(&url)
+            .call()
+            .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+        let mut body = response.into_body();
+        let bytes = body
+            .read_to_vec()
+            .unwrap_or_else(|e| panic!("read /debug/connection_count body: {e}"));
+        #[derive(serde::Deserialize)]
+        struct CountBody {
+            count: usize,
+        }
+        let decoded: CountBody = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "decode /debug/connection_count JSON: {e}; body: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        decoded.count
     }
 }
 
