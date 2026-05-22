@@ -89,6 +89,13 @@ rmpv = "1"
 # `serde_json` to produce that JSON; we depend on it here to consume
 # it. Not in the production closure — production uses MessagePack.
 serde_json = "1"
+# `criterion` is the bench harness under the `[[bench]]` blocks below
+# (Phase 5 / `SPECIFICATION.md` §9.4). Default features only — no
+# `html_reports` for the initial scaffold. Off the cdylib because
+# it's a dev-dep; further gated by the `bench-seam` feature so the
+# bench-only public surface in `lib.rs::bench_seam` doesn't even
+# compile in production builds.
+criterion = "0.5"
 
 [features]
 # Diagnostic-only: enables a `recorder::dump` module that writes the
@@ -98,6 +105,23 @@ serde_json = "1"
 # features) ship no dump code in the cdylib. The feature disappears in
 # Phase 4 when the shipper replaces the discard with a `try_send`.
 recorder-dump = []
+# Bench-only seam: when activated, the crate root grows a
+# `pub mod bench_seam` that re-exports the recorder's `pub(crate)`
+# hot-path entry points (`begin_with_snapshots`, `end_with_snapshots`,
+# `categorise`, the snapshot/categorise value types) so `cargo bench
+# --features bench-seam` can reach them without going through PHP.
+# Off by default; default cdylib builds carry no extra public surface.
+# No transitive feature unlock. See `bench-criterion-skeleton`'s
+# `design.md` D-1.
+bench-seam = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "recorder_hot_path"
+harness = false
+
+[[bench]]
+name = "recorder_workload"
+harness = false

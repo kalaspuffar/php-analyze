@@ -50,6 +50,44 @@ pub mod wire;
 pub use config::initialise_from_ini;
 pub use config::{Config, ConfigError, ConfigWarning, DisableReason, RawIni, TokenSource};
 
+/// Bench-only test seam. Activates via the off-by-default `bench-seam`
+/// feature. Production cdylib builds (default features) carry no
+/// `bench_seam` re-export; this module's contents are visible only
+/// to `cargo bench --features bench-seam` and to anyone explicitly
+/// opting into the feature for their own diagnostic builds.
+///
+/// Why this exists: the recorder's hot-path entry points
+/// ([`recorder::observer::begin_with_snapshots`],
+/// [`recorder::observer::end_with_snapshots`], [`recorder::observer::categorise`])
+/// and the value types they consume ([`recorder::observer::Categorised`],
+/// `EntrySnapshots`, `ExitSnapshots`, `RawCallSite`) are internal
+/// by convention but `pub` in the source — Rust's visibility rules
+/// reject `pub use` of `pub(crate)` items (compile errors
+/// E0364/E0365), so the items had to be promoted to `pub` for the
+/// re-export below to compile. The `bench-seam` feature still
+/// gates the *re-export module*, so the discoverable bench-only
+/// surface is hidden from anyone who doesn't opt in. Each
+/// promoted item carries a `// pub for the bench-seam re-export`
+/// doc-line in `observer.rs` so future readers know why it isn't
+/// `pub(crate)`.
+///
+/// Future bench-related slices (`bench-canonical-workloads`,
+/// `recorder-zero-alloc-audit`) consume the same surface. Adding
+/// items here is additive; nothing leaves once it's in.
+///
+/// See `openspec/changes/archive/<date>-bench-criterion-skeleton/design.md`
+/// D-1 for the visibility-rules trade-off and the rejected
+/// alternatives (separate bench crate; wrapper newtypes).
+#[cfg(feature = "bench-seam")]
+pub mod bench_seam {
+    pub use crate::recorder::observer::{
+        begin_with_snapshots, categorise, end_with_snapshots, Categorised, EntrySnapshots,
+        ExitSnapshots, RawCallSite,
+    };
+    pub use crate::recorder::types::{FunctionKey, FunctionKind, Trace, TraceLimits};
+    pub use crate::recorder::RequestIdentity;
+}
+
 use ext_php_rs::prelude::*;
 
 /// User-side `MINIT` shim invoked by the `#[php_module]` macro before its
