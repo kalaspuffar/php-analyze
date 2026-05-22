@@ -146,6 +146,16 @@ const DIRECTIVES: &[Directive] = &[
         default: "8",
         redact_display: false,
     },
+    // Per-call CPU snapshot policy (recorder-cpu-snapshot-cadence). The
+    // default `per-call` preserves the spec-current behaviour (every
+    // begin/end snapshot calls getrusage). Operators can set `off` for
+    // high-volume pools where the per-call getrusage syscall is a
+    // measurable share of recorder overhead; see COMMENTS.md C-19.
+    Directive {
+        name: "php_analyze.cpu_snapshot_mode",
+        default: "per-call",
+        redact_display: false,
+    },
     // Spike-mode directives (Phase-0 `spike-zend-observer` change). Both
     // default to off so a production `php.ini` that does not mention them
     // exhibits no spike-mode behaviour. Removed in the same change that
@@ -708,6 +718,7 @@ fn raw_ini_from_ini_map(ini: &HashMap<String, Option<String>>) -> RawIni {
         http_timeout_ms: lookup_int("php_analyze.http_timeout_ms"),
         shutdown_grace_ms: lookup_int("php_analyze.shutdown_grace_ms"),
         shipper_queue_depth: lookup_int("php_analyze.shipper_queue_depth"),
+        cpu_snapshot_mode: lookup_str("php_analyze.cpu_snapshot_mode"),
         spike_observer: lookup_bool("php_analyze.spike_observer"),
         spike_log_path: lookup_str("php_analyze.spike_log_path"),
     }
@@ -833,6 +844,13 @@ impl PhpInfoRenderer {
         rows.push((
             "php_analyze.shipper_queue_depth".to_owned(),
             c.shipper_queue_depth.to_string(),
+        ));
+        // Per-call CPU snapshot mode (recorder-cpu-snapshot-cadence).
+        // Plain string row — no secret content; renders as `per-call`
+        // or `off` matching the operator-facing directive vocabulary.
+        rows.push((
+            "php_analyze.cpu_snapshot_mode".to_owned(),
+            c.cpu_snapshot_mode.as_ini_str().to_owned(),
         ));
     }
 
@@ -1300,6 +1318,44 @@ mod tests {
             ..RawIni::default()
         };
         Config::from_ini_values(&raw).0
+    }
+
+    #[test]
+    fn rows_render_cpu_snapshot_mode_as_plain_string_per_call_default() {
+        // The mode directive is purely operator-facing — no secret
+        // content, no banner. The phpinfo row mirrors the operator's
+        // own `php.ini` value vocabulary so they can confirm the
+        // resolved mode by name.
+        let config = enabled_config_with_spike(false, None);
+        let rows = PhpInfoRenderer::rows(Some(&config));
+        let row = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.cpu_snapshot_mode")
+            .expect("cpu_snapshot_mode row");
+        assert_eq!(row.1, "per-call");
+        // The token redaction marker MUST NOT appear in this row.
+        assert!(
+            !row.1.contains("***"),
+            "cpu_snapshot_mode row must be plain string, not redacted: {row:?}"
+        );
+    }
+
+    #[test]
+    fn rows_render_cpu_snapshot_mode_off_when_directive_resolves_to_off() {
+        let raw = RawIni {
+            enabled: Some(true),
+            server_url: Some("https://ingest.example.com/v1/ingest".to_owned()),
+            auth_token: Some("token".to_owned()),
+            cpu_snapshot_mode: Some("off".to_owned()),
+            ..RawIni::default()
+        };
+        let config = Config::from_ini_values(&raw).0;
+        let rows = PhpInfoRenderer::rows(Some(&config));
+        let row = rows
+            .iter()
+            .find(|(l, _)| l == "php_analyze.cpu_snapshot_mode")
+            .expect("cpu_snapshot_mode row");
+        assert_eq!(row.1, "off");
     }
 
     #[test]
@@ -1791,6 +1847,7 @@ mod tests {
             http_timeout: Duration::from_millis(2_000),
             shutdown_grace: Duration::from_millis(5_000),
             shipper_queue_depth: 8,
+            cpu_snapshot_mode: crate::config::CpuSnapshotMode::PerCall,
             spike_observer: false,
             spike_log_path: None,
         }

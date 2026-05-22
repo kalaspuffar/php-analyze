@@ -214,12 +214,13 @@ impl EntrySnapshots {
     /// Take snapshots from the production clock primitives. Routes
     /// through [`clocks::snapshot_now`] so the recorder hot path has
     /// one inlinable boundary per begin/end (recorder-hot-path-tuning
-    /// D-3). The syscall pattern is unchanged: same
-    /// `CLOCK_MONOTONIC` read, same `getrusage(RUSAGE_THREAD)`,
-    /// same `zend_memory_usage(true)`.
+    /// D-3). The CPU read is conditional on the
+    /// `cpu_snapshot_mode` directive (recorder-cpu-snapshot-cadence):
+    /// `PerCall` (default) invokes `getrusage(RUSAGE_THREAD)`; `Off`
+    /// skips the syscall and returns zero CPU fields.
     #[inline]
     fn capture_now() -> Self {
-        let raw = clocks::snapshot_now();
+        let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_in_ns: raw.t_ns,
             cpu_u_in_ns: raw.cpu_u_ns,
@@ -242,10 +243,10 @@ pub struct ExitSnapshots {
 
 impl ExitSnapshots {
     /// Take snapshots from the production clock primitives. Mirror of
-    /// [`EntrySnapshots::capture_now`]; same one-syscall-pattern.
+    /// [`EntrySnapshots::capture_now`]; same conditional CPU read.
     #[inline]
     fn capture_now() -> Self {
-        let raw = clocks::snapshot_now();
+        let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_out_ns: raw.t_ns,
             cpu_u_now_ns: raw.cpu_u_ns,
@@ -253,6 +254,25 @@ impl ExitSnapshots {
             mem_out_bytes: raw.mem_bytes,
         }
     }
+}
+
+/// Resolve the active `cpu_snapshot_mode` for the current process.
+///
+/// Reads `Config::global().cpu_snapshot_mode` (the frozen-at-MINIT
+/// value) and returns its `Copy` mode. Before `MINIT` runs — or in
+/// the `cargo test` build where production paths are exercised in
+/// isolation — the global is uninitialised; this helper falls back
+/// to [`CpuSnapshotMode::PerCall`] so unit tests preserve the
+/// spec-current behaviour without depending on global state.
+///
+/// The branch on `Config::global()`'s `Option` is single-load against
+/// a `OnceLock`; the steady-state cost (post-MINIT) is one memory
+/// load. The mode itself is `Copy`, so the return is a value-copy.
+#[inline]
+fn current_cpu_snapshot_mode() -> crate::config::CpuSnapshotMode {
+    crate::config::Config::global()
+        .map(|c| c.cpu_snapshot_mode)
+        .unwrap_or(crate::config::CpuSnapshotMode::PerCall)
 }
 
 // --- Call-site extraction --------------------------------------------------

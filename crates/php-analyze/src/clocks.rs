@@ -210,8 +210,8 @@ fn timeval_to_ns(tv: libc::timeval) -> i64 {
 /// through a single inlinable entry point per begin/end boundary
 /// (recorder-hot-path-tuning D-3). The syscall pattern is unchanged
 /// versus calling the individual `*_now_ns` helpers — same one
-/// `CLOCK_MONOTONIC` read, same one `getrusage` read, same one
-/// `zend_memory_usage` call.
+/// `CLOCK_MONOTONIC` read, same one (or zero) `getrusage` read, same
+/// one `zend_memory_usage` call.
 ///
 /// The struct exists for shape parity with the begin/end snapshot
 /// types in `recorder::observer`; the helper assembles values from
@@ -225,19 +225,36 @@ pub struct RawSnapshot {
 }
 
 /// Combined snapshot helper. Equivalent to calling
-/// [`monotonic_now_ns`] + [`cpu_times_now_ns`] +
-/// [`memory_usage_real_bytes`] in sequence; provided as a single
-/// `#[inline]` function so the optimiser can fold the boundary and so
-/// the recorder hot path has a single named seam to reason about.
+/// [`monotonic_now_ns`] + (conditionally) [`cpu_times_now_ns`] +
+/// [`memory_usage_real_bytes`] in sequence.
+///
+/// The `mode` parameter controls whether `cpu_times_now_ns()` is
+/// invoked. Under [`CpuSnapshotMode::PerCall`] (the spec-current
+/// default) the call happens, populating `cpu_u_ns` / `cpu_s_ns`
+/// with the actual thread-CPU values. Under
+/// [`CpuSnapshotMode::Off`] the `getrusage(RUSAGE_THREAD)` syscall
+/// is skipped entirely and both CPU fields are forced to `0` —
+/// saving ~500 ns per call on hosts without vDSO for that syscall.
+///
+/// See `recorder-cpu-snapshot-cadence` design D-3 for the
+/// single-decision-point rationale: one named seam, predictable
+/// branch (the mode is set once at `MINIT` and never changes), and
+/// no scattered `if mode == Off` checks elsewhere on the hot path.
 #[inline]
-pub(crate) fn snapshot_now() -> RawSnapshot {
+pub(crate) fn snapshot_now(mode: crate::config::CpuSnapshotMode) -> RawSnapshot {
     let t_ns = monotonic_now_ns();
-    let cpu = cpu_times_now_ns();
+    let (cpu_u_ns, cpu_s_ns) = match mode {
+        crate::config::CpuSnapshotMode::PerCall => {
+            let cpu = cpu_times_now_ns();
+            (cpu.user_ns, cpu.system_ns)
+        }
+        crate::config::CpuSnapshotMode::Off => (0, 0),
+    };
     let mem_bytes = memory_usage_real_bytes();
     RawSnapshot {
         t_ns,
-        cpu_u_ns: cpu.user_ns,
-        cpu_s_ns: cpu.system_ns,
+        cpu_u_ns,
+        cpu_s_ns,
         mem_bytes,
     }
 }
@@ -333,17 +350,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_now_returns_consistent_components_across_two_reads() {
+    fn snapshot_now_per_call_returns_consistent_components_across_two_reads() {
+        use crate::config::CpuSnapshotMode;
         // The combined snapshot helper must agree with the individual
         // `*_now_ns` helpers on what they would have read separately
         // — modulo the strict ordering between the wall-clock and CPU
-        // reads (which can advance between calls). The bound is the
-        // weakest one all four components share: non-negative,
-        // monotonically non-decreasing across two reads, and within
-        // a sane upper bound (`i64::MAX`).
-        let a = snapshot_now();
+        // reads (which can advance between calls). Under PerCall, the
+        // bound is the weakest one all four components share:
+        // non-negative, monotonically non-decreasing across two reads,
+        // and within a sane upper bound (`i64::MAX`).
+        let a = snapshot_now(CpuSnapshotMode::PerCall);
         std::thread::sleep(Duration::from_micros(500));
-        let b = snapshot_now();
+        let b = snapshot_now(CpuSnapshotMode::PerCall);
 
         // Wall clock must not regress.
         assert!(b.t_ns >= a.t_ns, "monotonic regression: a={a:?}, b={b:?}");
@@ -355,5 +373,56 @@ mod tests {
         // production reads PHP's real-usage counter. Both paths are
         // non-negative.
         assert!(b.mem_bytes >= 0);
+    }
+
+    #[test]
+    fn snapshot_now_with_off_returns_zero_cpu_and_populated_wall_and_mem() {
+        use crate::config::CpuSnapshotMode;
+        // Under Off, `cpu_u_ns` and `cpu_s_ns` MUST be exactly 0
+        // regardless of actual thread-CPU consumption. Wall clock and
+        // memory paths are unconditional and continue to populate.
+        // Burn some CPU first so a PerCall snapshot at the same point
+        // would observe non-zero — this proves the zeroing is
+        // mode-driven, not coincidence.
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+
+        let raw = snapshot_now(CpuSnapshotMode::Off);
+        assert_eq!(
+            raw.cpu_u_ns, 0,
+            "Off mode must force cpu_u_ns = 0; got {raw:?}"
+        );
+        assert_eq!(
+            raw.cpu_s_ns, 0,
+            "Off mode must force cpu_s_ns = 0; got {raw:?}"
+        );
+        // Wall clock + memory still populate; the test-build memory
+        // stub returns 0 unconditionally, so the assertion is `>= 0`
+        // on both paths.
+        assert!(raw.t_ns >= 0);
+        assert!(raw.mem_bytes >= 0);
+    }
+
+    #[test]
+    fn snapshot_now_with_per_call_returns_non_negative_cpu_after_busy_loop() {
+        use crate::config::CpuSnapshotMode;
+        // Mirror of `cpu_times_now_ns_returns_non_negative_components_after_a_busy_loop`,
+        // routed through the combined helper. Burn some CPU then
+        // assert the returned fields are non-negative i64s.
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+
+        let raw = snapshot_now(CpuSnapshotMode::PerCall);
+        assert!(raw.cpu_u_ns >= 0, "user CPU must be non-negative: {raw:?}");
+        assert!(
+            raw.cpu_s_ns >= 0,
+            "system CPU must be non-negative: {raw:?}"
+        );
     }
 }

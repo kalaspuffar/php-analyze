@@ -48,7 +48,9 @@ pub mod spike;
 pub mod wire;
 
 pub use config::initialise_from_ini;
-pub use config::{Config, ConfigError, ConfigWarning, DisableReason, RawIni, TokenSource};
+pub use config::{
+    Config, ConfigError, ConfigWarning, CpuSnapshotMode, DisableReason, RawIni, TokenSource,
+};
 
 /// Bench-only test seam. Activates via the off-by-default `bench-seam`
 /// feature. Production cdylib builds (default features) carry no
