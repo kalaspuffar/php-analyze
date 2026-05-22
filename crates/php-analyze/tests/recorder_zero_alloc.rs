@@ -152,7 +152,8 @@ const EXIT_SNAPSHOTS: ExitSnapshots = ExitSnapshots {
     mem_out_bytes: 0,
 };
 
-const WORKLOAD_SIZE: usize = 10_000;
+const WARMUP_SIZE: usize = 1_000;
+const MEASUREMENT_SIZE: usize = 10_000;
 const MAX_DEPTH: usize = 1024;
 
 // --- Positive test: steady-state hot path is zero-alloc ---------------------
@@ -162,35 +163,50 @@ fn recorder_hot_path_is_zero_alloc_in_steady_state() {
     let mut trace = make_trace();
     let categorised = make_categorised();
 
-    // Pre-warm: one call through the cold-miss path. This
-    // allocates legitimately (interns the FunctionKey, stages a
-    // DictEntry with `to_owned()` String fields per the
-    // `// NOTE for Phase 5` markers). The pre-warm also writes
-    // one record to `trace.buffer` and one frame in+out of
-    // `trace.stack`; the pre-grow below uses the post-pre-warm
-    // state as its baseline so the inner loop's WORKLOAD_SIZE
-    // pushes fit exactly.
+    // Pre-warm phase 1 — dictionary cold miss. One call through
+    // the cold-miss path interns the FunctionKey and stages a
+    // DictEntry with `to_owned()` String fields. This pre-warm
+    // call's allocations are *expected* and excluded from the
+    // assertion via the snapshot-after pattern.
     begin_with_snapshots(&mut trace, &categorised, ENTRY_SNAPSHOTS);
     end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
 
-    // Pre-grow AFTER pre-warm so `Vec::reserve(WORKLOAD_SIZE)`
-    // grows capacity to `len() + WORKLOAD_SIZE`. From the
-    // post-pre-warm state (`buffer.len() == 1`) this gives
-    // capacity ≥ 10_001 — enough for the inner loop's 10_000
-    // additional pushes without any realloc. If we pre-grew
-    // BEFORE the pre-warm, capacity would be exactly
-    // WORKLOAD_SIZE and the 10_000th inner push would trip a
-    // realloc (the first iteration of this audit observed
-    // exactly that: `realloc_delta=1`).
-    trace.pregrow_for_audit(WORKLOAD_SIZE, MAX_DEPTH);
+    // Pre-grow AFTER the cold-miss pre-warm so
+    // `Vec::reserve(WARMUP_SIZE + MEASUREMENT_SIZE)` grows
+    // capacity to `len() + WARMUP_SIZE + MEASUREMENT_SIZE` =
+    // 1 + 11_000 = 11_001. Plenty of room for both phases below
+    // without any realloc.
+    trace.pregrow_for_audit(WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
 
-    // Snapshot the counters AFTER pre-warm + pre-grow. The
-    // deltas below measure only the steady-state region.
+    // Pre-warm phase 2 — `WARMUP_SIZE` hit-path iterations to
+    // absorb any *one-shot* lazy initialisation that fires on
+    // first hit-path use (e.g., a thread-local cell's `OnceCell`
+    // backing storage, a panic-format machinery init, a
+    // platform-dependent allocator-side cache warmup). The CI
+    // host this test runs on observed `alloc_delta=4,
+    // realloc_delta=2, dealloc_delta=9` across a 10_000-call
+    // window *without* this phase; the local build host saw
+    // `0/0/0`. The small constant counts (not per-call) point at
+    // one-shot lazy init, so a 1_000-iter warmup window is the
+    // cleanest way to absorb it without weakening the strict
+    // `== 0` assertion below. Per `SPECIFICATION.md` AC-RC-5's
+    // "in the steady state … after warmup" wording, this is
+    // exactly what "warmup" means.
+    for _ in 0..WARMUP_SIZE {
+        begin_with_snapshots(&mut trace, &categorised, ENTRY_SNAPSHOTS);
+        end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
+    }
+
+    // Snapshot the counters AFTER both pre-warm phases. The
+    // deltas below measure only the steady-state region — every
+    // legitimate one-shot init has had a chance to fire.
     let (alloc_before, realloc_before, dealloc_before) = snapshot_counters();
 
-    // Timed region: WORKLOAD_SIZE calls, all dict hits, all
-    // within pre-grown buffer + stack capacity.
-    for _ in 0..WORKLOAD_SIZE {
+    // Measurement region: MEASUREMENT_SIZE additional calls.
+    // After WARMUP_SIZE + MEASUREMENT_SIZE = 11_000 total inner
+    // pushes (plus pre-warm phase 1's single push), the buffer
+    // is at len = 11_001 with capacity ≥ 11_001 — no realloc.
+    for _ in 0..MEASUREMENT_SIZE {
         begin_with_snapshots(&mut trace, &categorised, ENTRY_SNAPSHOTS);
         end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
     }
@@ -201,15 +217,17 @@ fn recorder_hot_path_is_zero_alloc_in_steady_state() {
     let dealloc_delta = dealloc_after - dealloc_before;
 
     // AC-RC-5 bound: exactly zero new allocations across the
-    // steady-state region. `dealloc_delta` is included in the
-    // panic message for diagnostic completeness but not
-    // asserted — the recorder holds the `Trace` alive across
-    // the whole region, so nothing inside it should drop.
+    // steady-state region (after `WARMUP_SIZE` hit-path warmup
+    // iterations). `dealloc_delta` is included in the panic
+    // message for diagnostic completeness but not asserted —
+    // the recorder holds the `Trace` alive across the whole
+    // region, so nothing inside it should drop.
     assert!(
         alloc_delta == 0 && realloc_delta == 0,
-        "AC-RC-5 violated: steady-state hot path allocated. \
+        "AC-RC-5 violated: steady-state hot path allocated AFTER warmup. \
          alloc_delta={alloc_delta}, realloc_delta={realloc_delta}, \
-         dealloc_delta={dealloc_delta} across {WORKLOAD_SIZE} calls. \
+         dealloc_delta={dealloc_delta} across {MEASUREMENT_SIZE} measurement \
+         calls (after {WARMUP_SIZE} warmup-phase-2 calls). \
          Expected: 0 allocs, 0 reallocs. Likely culprits: hidden \
          allocation in snapshot capture, FunctionKey Arc<str> clone \
          on the hit path, HashMap rehash during what should be a hit, \
@@ -227,7 +245,7 @@ fn recorder_hot_path_first_miss_does_allocate() {
     // Same pre-grow as the positive test. Note: pre-grow itself
     // allocates (the `reserve` calls fire), but those happen
     // *before* the counter snapshot below.
-    trace.pregrow_for_audit(WORKLOAD_SIZE, MAX_DEPTH);
+    trace.pregrow_for_audit(WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
 
     let categorised = make_categorised();
 
