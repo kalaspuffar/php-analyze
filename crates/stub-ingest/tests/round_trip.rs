@@ -19,7 +19,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use php_analyze::wire;
 
@@ -84,6 +84,16 @@ fn spawn_stub_at(token: &str, bind: &str) -> (ChildGuard, SocketAddr) {
 fn spawn_stub_with_respond_with(token: &str, respond_with: u16) -> (ChildGuard, SocketAddr) {
     let status = respond_with.to_string();
     spawn_stub_with_args(token, "127.0.0.1:0", &["--respond-with", &status])
+}
+
+/// Spawn the stub with a configured `--simulate-slow <ms>` delay
+/// on the success path. Used by AC-SH-3 / AC-BS-4 / AC-PB-2 tests
+/// to drive the shipper's per-attempt timeout + MSHUTDOWN deadline
+/// without standing up a separate slow server. Other args
+/// (`--auth-token`, `--bind`) match `spawn_stub`'s defaults.
+fn spawn_stub_with_simulate_slow(token: &str, simulate_slow_ms: u64) -> (ChildGuard, SocketAddr) {
+    let ms = simulate_slow_ms.to_string();
+    spawn_stub_with_args(token, "127.0.0.1:0", &["--simulate-slow", &ms])
 }
 
 /// Shared spawn body: builds the `Command`, waits for the bind
@@ -720,13 +730,12 @@ fn debug_reset_clears_the_captured_headers_slot() {
 }
 
 #[test]
-fn readme_documents_the_five_routes_the_bind_protocol_and_respond_with() {
+fn readme_documents_the_five_routes_the_bind_protocol_respond_with_and_simulate_slow() {
     // `include_str!` is resolved at compile time relative to this
     // test source file, so the README's content is pinned into the
-    // test binary alongside the assertions. The eight substrings
+    // test binary alongside the assertions. The nine substrings
     // come straight from the `stub-ingest-server/spec.md` scenario
-    // (widened from seven → eight by
-    // `stub-ingest-configurable-failure`).
+    // (widened from eight → nine by `stub-ingest-slow-mode`).
     let readme = include_str!("../README.md");
     for needle in [
         "POST /v1/ingest",
@@ -736,6 +745,7 @@ fn readme_documents_the_five_routes_the_bind_protocol_and_respond_with() {
         "POST /debug/reset",
         "--bind",
         "--respond-with",
+        "--simulate-slow",
         "bound:",
     ] {
         assert!(
@@ -1035,5 +1045,143 @@ fn respond_with_does_not_affect_debug_routes() {
         200,
         "GET /debug/batches returns 200 even when --respond-with is 500; got {}",
         response.status().as_u16(),
+    );
+}
+
+#[test]
+fn simulate_slow_zero_is_the_default_behaviour_unchanged() {
+    // Regression guard: a stub spawned without `--simulate-slow`
+    // responds promptly on the success path. Loopback should
+    // deliver the full response well under 100ms.
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let start = Instant::now();
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer test-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "default --simulate-slow is 0; expected prompt 200 response",
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "loopback response with --simulate-slow=0 should be prompt; elapsed = {elapsed:?}",
+    );
+}
+
+#[test]
+fn simulate_slow_300_delays_the_success_response_by_at_least_250ms() {
+    // Binds the `--simulate-slow` semantic: the stub does sleep
+    // on the success path, and the client observes that delay
+    // as response-wait time. The lower bound is widened from
+    // 300ms to 250ms to absorb `Duration` rounding and the
+    // request/response round-trip itself.
+    let (_guard, addr) = spawn_stub_with_simulate_slow("test-token", 300);
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let start = Instant::now();
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer test-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "--simulate-slow 300 still returns 200 on the success path; got {}",
+        response.status().as_u16(),
+    );
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "expected the stub to sleep ~300ms before responding; elapsed = {elapsed:?}",
+    );
+    assert_eq!(
+        fetch_batches(&agent, addr).len(),
+        1,
+        "the batch lands in the store before the sleep begins (design D-1)",
+    );
+}
+
+#[test]
+fn simulate_slow_does_not_delay_debug_routes() {
+    // `--simulate-slow` governs the ingest path only. A
+    // `/debug/*` request issued before any ingest should
+    // respond promptly even when the flag is set to a large
+    // value, because the debug-route handlers never sleep.
+    let (_guard, addr) = spawn_stub_with_simulate_slow("test-token", 5000);
+    let agent = ureq_agent_no_status_err();
+
+    let start = Instant::now();
+    let response = agent
+        .get(url(addr, "/debug/batches"))
+        .call()
+        .expect("GET /debug/batches");
+    let elapsed = start.elapsed();
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "GET /debug/batches returns 200 promptly even when --simulate-slow=5000",
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "GET /debug/batches must respond promptly; elapsed = {elapsed:?}",
+    );
+}
+
+#[test]
+fn client_with_short_timeout_against_slow_stub_times_out_at_the_client_budget() {
+    // AC-SH-3 binding: a `ureq::Agent` configured with
+    // `timeout_global = 200ms` (the same shape the production
+    // shipper uses) against a `--simulate-slow 5000` stub
+    // must time out at approximately the client's budget,
+    // not at the stub's sleep duration.
+    //
+    // The bounds are widened from the spec's literal `± 100ms`
+    // to absorb CI scheduling noise: a real regression (the
+    // client honouring the stub's 5s response time instead of
+    // its own 200ms budget) would push elapsed to ≥5000ms,
+    // easily caught by the 1000ms upper bound.
+    let (_guard, addr) = spawn_stub_with_simulate_slow("test-token", 5000);
+    let agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_millis(200)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let start = Instant::now();
+    let result = agent
+        .post(url(addr, "/v1/ingest"))
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", wire::MEDIA_TYPE)
+        .send(&body[..]);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "expected a timeout error, got Ok response: {:?}",
+        result.as_ref().map(|r| r.status().as_u16()).ok(),
+    );
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "the client cannot time out before its 200ms budget (lower bound 100ms = ureq's own \
+         ± 100ms slack); elapsed = {elapsed:?}",
+    );
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the client must time out near its 200ms budget, not at the stub's 5000ms sleep; \
+         elapsed = {elapsed:?}",
     );
 }
