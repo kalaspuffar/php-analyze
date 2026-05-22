@@ -48,18 +48,33 @@
 //! appears in any log output") via a sentinel-token grep over the
 //! captured PHP error log.
 //!
+//! Task 7.10 (MSHUTDOWN drain within grace, AC-BS-4 / AC-PB-2,
+//! plus AC-SH-3 per-attempt timeout) is bound in this file by
+//! `try_round_trip_mshutdown_drain` against the
+//! `mshutdown_drain.php` fixture, using the `--simulate-slow`
+//! flag added in the `stub-ingest-slow-mode` change and the
+//! per-iteration deadline re-read inside `run_with_retry`
+//! landed by `shipper-deadline-mid-retry` (which closes C-18 in
+//! `COMMENTS.md`). The production `RmpEncodeAndHttpPost` is
+//! exercised end-to-end against a real TCP server with a tight
+//! `shutdown_grace`; PHP wall-clock is bounded by `2000ms` and
+//! a regression in either the per-attempt timeout or the
+//! per-iteration cell re-read pushes it to 3s+.
+//!
 //! Tasks 7.5 (auth-header byte-equal) and 7.6 (User-Agent string)
 //! are unblocked by the prior `stub-ingest-header-capture` change
-//! but bound in a separate follow-up. Task 7.10 (MSHUTDOWN drain
-//! within grace) remains **deferred** — it needs the
-//! `stub-ingest-slow-mode` endpoint (queued in `COMMENTS.md` §2 P0).
+//! but bound in a separate follow-up. With 7.10 closed by this
+//! change, no deferred items in this file remain that require
+//! new `stub-ingest` endpoints or shipper-side fixes — only the
+//! lightweight consumer of `/debug/last_request_headers` for
+//! 7.5 / 7.6 is left.
 
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use php_analyze::wire;
 
@@ -102,19 +117,25 @@ fn shipper_round_trip_lands_one_batch_on_stub() {
         // Each fixture gets its own freshly-spawned stub: a single
         // PHP process opens one TCP connection to the stub's
         // ureq::Agent, but the second PHP process would inevitably
-        // open a second. Spawning three stubs (one per fixture)
+        // open a second. Spawning four stubs (one per fixture)
         // keeps each fixture's per-process invariants independent
-        // (connection counts, headers slot, batch store).
+        // (connection counts, headers slot, batch store,
+        // wall-clock budgets).
         let primary = try_round_trip(binary, &cdylib);
         let reuse = try_round_trip_connection_reuse(binary, &cdylib);
         let retry = try_round_trip_retry_exhaust(binary, &cdylib);
-        match (primary, reuse, retry) {
-            (RoundTripOutcome::Passed, RoundTripOutcome::Passed, RoundTripOutcome::Passed) => {
-                exercised.push(binary)
-            }
-            (RoundTripOutcome::SkippedModuleApi, _, _)
-            | (_, RoundTripOutcome::SkippedModuleApi, _)
-            | (_, _, RoundTripOutcome::SkippedModuleApi) => skipped.push(binary),
+        let mshutdown = try_round_trip_mshutdown_drain(binary, &cdylib);
+        match (primary, reuse, retry, mshutdown) {
+            (
+                RoundTripOutcome::Passed,
+                RoundTripOutcome::Passed,
+                RoundTripOutcome::Passed,
+                RoundTripOutcome::Passed,
+            ) => exercised.push(binary),
+            (RoundTripOutcome::SkippedModuleApi, _, _, _)
+            | (_, RoundTripOutcome::SkippedModuleApi, _, _)
+            | (_, _, RoundTripOutcome::SkippedModuleApi, _)
+            | (_, _, _, RoundTripOutcome::SkippedModuleApi) => skipped.push(binary),
         }
     }
 
@@ -478,6 +499,104 @@ fn try_round_trip_retry_exhaust(php_binary: &str, cdylib: &Path) -> RoundTripOut
     RoundTripOutcome::Passed
 }
 
+/// AC-BS-4 / AC-PB-2 binding round-trip: drive the
+/// `mshutdown_drain.php` fixture against a `crates/stub-ingest`
+/// spawned with `--simulate-slow 5000`. The shipper's first
+/// HTTP attempt times out at `http_timeout_ms = 200ms`; the
+/// MSHUTDOWN deadline cell trips at `shutdown_grace = 200ms`;
+/// the per-iteration deadline re-read inside `run_with_retry`
+/// (closed C-18) sees the now-`Some` deadline; the batch is
+/// dropped with `deadline_exceeded`; MSHUTDOWN returns.
+///
+/// The test asserts the total PHP wall-clock falls under
+/// `2000ms` — generous enough to absorb PHP startup and CI
+/// scheduling noise, tight enough to catch a regression that
+/// broke either the per-attempt timeout (which would push
+/// wall-clock to ≥5s) or the per-iteration cell re-read (which
+/// would push it to ~2.75s of retry budget — exactly what was
+/// observed when this test first surfaced C-18).
+///
+/// Closes task 7.10 of `shipper_round_trip.rs`'s deferred
+/// backlog. Drives the **production** `RmpEncodeAndHttpPost`
+/// against a real TCP server, complementing the in-crate
+/// `SlowRecordingOnBatch` Rust-level test that binds the
+/// deadline arithmetic via the `OnBatch` trait seam, and the
+/// `run_with_retry_honors_deadline_cell_published_mid_loop`
+/// unit test that pins the closure re-read directly.
+fn try_round_trip_mshutdown_drain(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
+    let token = "rt-token-msd";
+    let path = "/v1/ingest";
+
+    let stub = StubProcess::spawn_with_simulate_slow(token, path, 5000);
+    let server_url = format!("http://127.0.0.1:{}{}", stub.port, path);
+
+    let tmpdir = tempfile::tempdir().expect("tempdir for mshutdown-drain ini");
+    let ini_path = tmpdir.path().join("shipper_mshutdown_drain.ini");
+    // Tight `shutdown_grace = 200ms` is what makes this test
+    // sensitive to deadline-cell regressions. `retry_count = 5`
+    // ensures the regression timeline (without the per-iteration
+    // re-read) would be ≥6 × http_timeout + cumulative backoff ≈
+    // 2750ms, well past the 2000ms test budget below.
+    let ini_body = format!(
+        concat!(
+            "extension={cdylib}\n",
+            "php_analyze.enabled          = 1\n",
+            "php_analyze.server_url       = \"{url}\"\n",
+            "php_analyze.auth_token       = \"{token}\"\n",
+            "php_analyze.spike_observer    = 0\n",
+            "php_analyze.shutdown_grace_ms = 200\n",
+            "php_analyze.http_timeout_ms   = 200\n",
+            "php_analyze.retry_count       = 5\n",
+            "php_analyze.retry_backoff_ms  = 50\n",
+        ),
+        cdylib = cdylib.display(),
+        url = server_url,
+        token = token,
+    );
+    std::fs::write(&ini_path, ini_body).expect("write shipper_mshutdown_drain.ini");
+
+    let fixture = locate_fixture("mshutdown_drain.php");
+    let start = Instant::now();
+    let output = Command::new(php_binary)
+        .arg("-n")
+        .arg("-c")
+        .arg(&ini_path)
+        .arg(&fixture)
+        .output()
+        .unwrap_or_else(|e| panic!("invoke {php_binary} {fixture:?}: {e}"));
+    let elapsed = start.elapsed();
+
+    if mentions_module_api_mismatch(&output.stdout) || mentions_module_api_mismatch(&output.stderr)
+    {
+        return RoundTripOutcome::SkippedModuleApi;
+    }
+
+    assert!(
+        output.status.success(),
+        "{php_binary} exited non-zero on mshutdown_drain.php (status {:?}); stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // AC-BS-4 / AC-PB-2: PHP wall-clock is bounded by
+    // PHP startup + (shutdown_grace + 200ms MSHUTDOWN budget)
+    // + a generous CI buffer. A regression in either the
+    // per-attempt timeout (AC-SH-3, ureq honoring stub-side 5s
+    // delay) or the per-iteration deadline cell re-read
+    // (C-18 / AC-BS-4) pushes elapsed to ≥3000ms.
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "{php_binary} mshutdown_drain.php: PHP wall-clock exceeded the budget; \
+         elapsed = {elapsed:?}, expected < 2000ms. A regression that broke either \
+         the per-attempt timeout (AC-SH-3) or the per-iteration DRAIN_DEADLINE \
+         re-read inside `run_with_retry` (C-18 / AC-BS-4 / AC-PB-2) would push \
+         elapsed past this bound.",
+    );
+
+    drop(stub);
+    RoundTripOutcome::Passed
+}
+
 /// Spawned `stub-ingest` process. Holds the child handle and the
 /// bound port. The child is killed on `Drop` so a panicking test
 /// leaves no orphan process behind.
@@ -497,6 +616,14 @@ impl StubProcess {
     fn spawn_with_respond_with(token: &str, path: &str, respond_with: u16) -> Self {
         let status = respond_with.to_string();
         Self::spawn_with_args(token, path, &["--respond-with", &status])
+    }
+
+    /// Spawn the stub with a configured `--simulate-slow <ms>`
+    /// for the MSHUTDOWN-drain integration test. Other args
+    /// (`--auth-token`, `--bind`, `--path`) match `spawn`.
+    fn spawn_with_simulate_slow(token: &str, path: &str, simulate_slow_ms: u64) -> Self {
+        let ms = simulate_slow_ms.to_string();
+        Self::spawn_with_args(token, path, &["--simulate-slow", &ms])
     }
 
     /// Shared spawn body: builds the `Command`, applies the
