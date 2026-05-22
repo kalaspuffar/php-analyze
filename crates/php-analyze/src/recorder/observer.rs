@@ -300,6 +300,19 @@ static CPU_SNAPSHOT_MODE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
 #[cfg(test)]
 const CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET: u8 = 0xff;
 
+/// Serialises every test that touches the
+/// [`CPU_SNAPSHOT_MODE_TEST_OVERRIDE`] slot. Cargo test runs tests
+/// in parallel within a binary; without this lock, a test setting
+/// `Off` and another setting `PerCall` race against
+/// [`current_cpu_snapshot_mode`]'s read, producing flaky failures.
+/// CI observed `cpu_u_in_ns = 73000` in an `Off`-expected test
+/// because a parallel `PerCall` test cleared the override
+/// mid-call. The lock is held for the lifetime of any
+/// [`CpuSnapshotModeTestGuard`] or [`lock_cpu_snapshot_mode_for_test`]
+/// returned `MutexGuard`.
+#[cfg(test)]
+static CPU_SNAPSHOT_MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 fn cpu_snapshot_mode_test_override() -> Option<crate::config::CpuSnapshotMode> {
     use std::sync::atomic::Ordering;
@@ -316,6 +329,8 @@ fn cpu_snapshot_mode_test_override() -> Option<crate::config::CpuSnapshotMode> {
 /// Publish a test override for [`current_cpu_snapshot_mode`]. Must be
 /// paired with [`clear_cpu_snapshot_mode_for_test`] in the test's
 /// teardown so the slot does not leak into other tests' assertions.
+/// Callers MUST already hold the [`CPU_SNAPSHOT_MODE_TEST_LOCK`];
+/// the [`CpuSnapshotModeTestGuard`] RAII helper enforces this.
 #[cfg(test)]
 fn set_cpu_snapshot_mode_for_test(mode: crate::config::CpuSnapshotMode) {
     use std::sync::atomic::Ordering;
@@ -328,25 +343,53 @@ fn set_cpu_snapshot_mode_for_test(mode: crate::config::CpuSnapshotMode) {
 
 /// Clear the test override; subsequent reads of
 /// [`current_cpu_snapshot_mode`] fall back to the
-/// `Config::global()`-or-default path. Idempotent.
+/// `Config::global()`-or-default path. Idempotent. Callers MUST
+/// hold [`CPU_SNAPSHOT_MODE_TEST_LOCK`].
 #[cfg(test)]
 fn clear_cpu_snapshot_mode_for_test() {
     use std::sync::atomic::Ordering;
     CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET, Ordering::Relaxed);
 }
 
-/// RAII guard that publishes a mode override on construction and
-/// clears it on drop. Used by the integration tests that exercise
-/// `Recorder::begin_handler` / `end_handler` under each mode; the
-/// `Drop` impl guarantees teardown even if the test panics.
+/// Acquire [`CPU_SNAPSHOT_MODE_TEST_LOCK`] without publishing an
+/// override. Used by tests that need to observe the no-override
+/// state (i.e., that [`current_cpu_snapshot_mode`] falls back to
+/// `Config::global()` or the default) while still serialising
+/// against tests that DO publish an override.
 #[cfg(test)]
-struct CpuSnapshotModeTestGuard;
+fn lock_cpu_snapshot_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CPU_SNAPSHOT_MODE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard that publishes a mode override on construction and
+/// clears it on drop. **Holds [`CPU_SNAPSHOT_MODE_TEST_LOCK`] for
+/// its entire lifetime** so two tests using the override cannot
+/// interleave their `set` and `read` operations — the lock is the
+/// only thing that makes the override safe to use under cargo
+/// test's default parallel execution.
+///
+/// The held `MutexGuard<'static, ()>` is released by `Drop`, which
+/// also clears the override slot. Test panics still unwind through
+/// `Drop`, so the slot and the lock both end the test in a clean
+/// state even on failure.
+#[cfg(test)]
+struct CpuSnapshotModeTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl CpuSnapshotModeTestGuard {
     fn new(mode: crate::config::CpuSnapshotMode) -> Self {
+        // `unwrap_or_else(|e| e.into_inner())` recovers from a
+        // poisoned lock — a previous test panicked while holding it.
+        // The override slot might still hold the stale value; the
+        // `set_cpu_snapshot_mode_for_test` call below overwrites it
+        // unconditionally so the slot is consistent before any read.
+        let lock = lock_cpu_snapshot_mode_for_test();
         set_cpu_snapshot_mode_for_test(mode);
-        Self
+        Self { _lock: lock }
     }
 }
 
@@ -354,6 +397,7 @@ impl CpuSnapshotModeTestGuard {
 impl Drop for CpuSnapshotModeTestGuard {
     fn drop(&mut self) {
         clear_cpu_snapshot_mode_for_test();
+        // `_lock` drops here, releasing the mutex for the next test.
     }
 }
 
@@ -3533,6 +3577,12 @@ mod tests {
         // The helper falls back to PerCall when Config::global is
         // None (test builds where MINIT has not run). Confirms the
         // backward-compatible default.
+        //
+        // Serialises against tests that publish an override — without
+        // the lock, a parallel `CpuSnapshotModeTestGuard::new(Off)`
+        // could win the race between our `clear` and our `read`,
+        // returning `Off` and failing the assertion.
+        let _audit_lock = lock_cpu_snapshot_mode_for_test();
         clear_cpu_snapshot_mode_for_test();
         assert_eq!(
             current_cpu_snapshot_mode(),
@@ -3544,28 +3594,35 @@ mod tests {
     fn current_cpu_snapshot_mode_test_override_round_trips_both_variants() {
         // Sanity check on the test seam itself — PerCall and Off
         // round-trip through the override. Drop-side cleanup is
-        // exercised implicitly via the guard's Drop.
-        {
-            let _g = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::Off);
-            assert_eq!(
-                current_cpu_snapshot_mode(),
-                crate::config::CpuSnapshotMode::Off
-            );
-        }
-        // After drop the override is cleared; helper falls back to
-        // default (PerCall in tests).
+        // exercised by directly calling `set` / `clear` while
+        // holding the audit lock for the whole test — using nested
+        // `CpuSnapshotModeTestGuard` scopes would briefly release
+        // the lock between scopes and let a parallel test win the
+        // race, so we hold the lock once across all four state
+        // transitions.
+        let _audit_lock = lock_cpu_snapshot_mode_for_test();
+
+        set_cpu_snapshot_mode_for_test(crate::config::CpuSnapshotMode::Off);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::Off
+        );
+
+        clear_cpu_snapshot_mode_for_test();
+        // After clear the override is unset; helper falls back to
+        // default (PerCall in tests, since Config::global is None).
         assert_eq!(
             current_cpu_snapshot_mode(),
             crate::config::CpuSnapshotMode::PerCall
         );
 
-        {
-            let _g = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::PerCall);
-            assert_eq!(
-                current_cpu_snapshot_mode(),
-                crate::config::CpuSnapshotMode::PerCall
-            );
-        }
+        set_cpu_snapshot_mode_for_test(crate::config::CpuSnapshotMode::PerCall);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall
+        );
+
+        clear_cpu_snapshot_mode_for_test();
         assert_eq!(
             current_cpu_snapshot_mode(),
             crate::config::CpuSnapshotMode::PerCall
