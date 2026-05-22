@@ -27,13 +27,22 @@ secrecy = "0.10"
 thiserror = "2"
 # `url` parses and validates `server_url` (must be `http://` or `https://`).
 url = "2"
-# `rustc_hash::FxHashMap` is the hash builder for the recorder's
+# `rustc_hash::FxBuildHasher` is the hash builder for the recorder's
 # function dictionary (`recorder::dictionary::Dictionary`). Small
 # composite keys, trusted inputs — SipHash's DoS resistance is wasted
 # and its cost is measurable. We use `rustc-hash` (the rust-lang
 # maintained fork of the older `fxhash` crate) because it has zero
 # transitive dependencies; the older `fxhash` pulls `byteorder`.
 rustc-hash = "2"
+# `hashbrown::HashMap` is the underlying hashmap for the recorder's
+# function dictionary. The default `std::collections::HashMap` does
+# not expose `raw_entry_mut` on stable; we need it for the
+# `recorder-hot-path-tuning` borrow-keyed probe (a probe by
+# `FunctionKeyRef<'a>` that does not allocate the owning
+# `FunctionKey`'s `Arc<str>` fields). `hashbrown` is already a
+# transitive dep in the workspace; promoting it to a direct dep adds
+# no new crate to the lockfile.
+hashbrown = "0.15"
 # `libc` exposes `clock_gettime`, `getrusage`, `CLOCK_MONOTONIC`,
 # `CLOCK_REALTIME`, `RUSAGE_SELF`, and `timeval` — everything the
 # recorder's clock primitives need. `libc` is already a transitive dep
