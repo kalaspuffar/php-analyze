@@ -100,6 +100,7 @@ The extension reads its configuration from `php.ini` only. **No
 | `php_analyze.http_timeout_ms` | int | `2000` | `[100, 60000]` | Per-attempt HTTP timeout. |
 | `php_analyze.shutdown_grace_ms` | int | `5000` | `[0, 60000]` | Bounds shipper drain at `MSHUTDOWN`. |
 | `php_analyze.shipper_queue_depth` | int | `8` | `[1, 1024]` | Batch channel capacity; full → drop-newest. |
+| `php_analyze.cpu_snapshot_mode` | string | `per-call` | `{per-call, off}` | Per-call CPU snapshot policy. `per-call` (default) calls `getrusage(RUSAGE_THREAD)` per begin/end; `off` skips the syscall and emits `cpu_u_ns = cpu_s_ns = 0` in every record. See `Performance trade-offs` below. |
 
 Behaviour:
 
@@ -116,6 +117,19 @@ Behaviour:
   **not** fall back to the inline token.
 - **HTTP warning.** `http://` URLs are accepted but emit one `E_WARNING`
   noting the lack of TLS. Production deployments should use `https://`.
+- **CPU snapshot policy** (`cpu_snapshot_mode`). The default `per-call`
+  preserves the spec-current behaviour: every begin/end snapshot calls
+  `getrusage(RUSAGE_THREAD)` and per-call CPU is recorded with kernel
+  granularity (typically microseconds; sub-µs functions may read `0`).
+  The `off` mode skips the `getrusage` call entirely and emits
+  `cpu_u_ns = cpu_s_ns = 0` in **every** record. On the reference
+  development host this saves ~1000 ns/call (~500 ns × 2 syscalls per
+  PHP function) and roughly halves the recorder's overhead on
+  CPU-snapshot-dominated workloads. Use `off` in high-volume pools where
+  per-call CPU attribution is not needed; the wire format is unchanged
+  so the visualization layer continues to read the `cpu_u_ns` /
+  `cpu_s_ns` fields normally — they just always show `0`. Unrecognised
+  values emit one `E_WARNING` and fall back to `per-call`.
 
 ## Spike mode (developer-only)
 

@@ -208,7 +208,7 @@ Per REQ §4.2 and §7.10:
 
 **Clock sources**:
 - Wall time (`t_in`, `t_out`): `clock_gettime(CLOCK_MONOTONIC, …)`.
-- CPU time: `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, …)` split into user/sys via `getrusage(RUSAGE_THREAD)` deltas — **caveat**: `getrusage` granularity is coarse (typically microseconds). See §11 R-PERF for the trade-off; default implementation uses `getrusage` deltas and exposes the granularity in the README. `RUSAGE_THREAD` (Linux 2.6.26+) returns CPU time for the calling thread only — required because the Recorder runs on the PHP request thread and the Phase-4 shipper runs on a separate thread; a `RUSAGE_SELF` reading would conflate the two and inflate per-call CPU deltas under load.
+- CPU time: `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, …)` split into user/sys via `getrusage(RUSAGE_THREAD)` deltas — **caveat**: `getrusage` granularity is coarse (typically microseconds). See §11 R-PERF for the trade-off; default implementation uses `getrusage` deltas and exposes the granularity in the README. `RUSAGE_THREAD` (Linux 2.6.26+) returns CPU time for the calling thread only — required because the Recorder runs on the PHP request thread and the Phase-4 shipper runs on a separate thread; a `RUSAGE_SELF` reading would conflate the two and inflate per-call CPU deltas under load. **Operator opt-out** (`recorder-cpu-snapshot-cadence`): the `php_analyze.cpu_snapshot_mode` directive accepts `per-call` (default; this paragraph's behaviour) or `off`. Under `off` the `getrusage(RUSAGE_THREAD)` call is **skipped** at every begin/end snapshot and `CallRecord::cpu_u_ns` / `cpu_s_ns` are emitted as `0` regardless of function duration — saving ~1000 ns/call on hosts without vDSO for the syscall, at the cost of per-call CPU attribution. The wire format is unchanged in both modes; only the values of those two fields are affected. See `COMMENTS.md` C-19 for the syscall-cost gap analysis that motivated the directive.
 - Memory: PHP `zend_memory_usage(true)` (real usage, including allocator overhead).
 - `start_time` (per-trace metadata only): `clock_gettime(CLOCK_REALTIME, …)`.
 
@@ -311,6 +311,7 @@ Per REQ §4.2 and §7.10:
 | `php_analyze.http_timeout_ms` | int | `2000` | `[100, 60000]` | Per-attempt HTTP timeout. |
 | `php_analyze.shutdown_grace_ms` | int | `5000` | `[0, 60000]` | Bounds shipper drain at `MSHUTDOWN`. |
 | `php_analyze.shipper_queue_depth` | int | `8` | `[1, 1024]` | Batch channel capacity; full → drop-newest. |
+| `php_analyze.cpu_snapshot_mode` | string | `per-call` | `{per-call, off}` | Per-call CPU snapshot policy. `per-call` (spec-current) calls `getrusage(RUSAGE_THREAD)` per begin/end. `off` skips the syscall and emits `cpu_u_ns = cpu_s_ns = 0` in every record. See §3.2 for the trade-off. |
 
 **Acceptance criteria**:
 - AC-CF-1: Every directive has a default, range, and effect documented in README (§MAINT-1).
@@ -901,7 +902,7 @@ Pulls forward REQ §14 with architect-level updates:
 | R-8 | PECL packaging for Rust extension non-standard | M | L | Source dist is the MUST; PECL is best-effort in Phase 6. | Accepted |
 | R-9 | Server outage during long CLI causes silent loss | M | L | `dropped_records` exposes; v1 explicitly excludes spooling. | Accepted |
 | **R-10** (new) | **POSIX `fork()` + background thread surprise**: shipper thread spawned in master would not exist in FPM worker | L | H | Lazy spawn at first `RINIT` per process, guarded by `AtomicBool` (AD-4). Integration test `fpm_repeated.php` verifies each worker has its own thread. | Mitigated by design |
-| **R-11** (new) | **`getrusage` granularity** is coarser than `t_in`/`t_out` resolution → CPU times look quantized | L | L | Documented in README; for sub-microsecond functions, `cpu_u`/`cpu_s` may be `0`. Acceptable for staging-level analysis. | Accepted |
+| **R-11** (new) | **`getrusage` granularity** is coarser than `t_in`/`t_out` resolution → CPU times look quantized | L | L | Documented in README; for sub-microsecond functions, `cpu_u`/`cpu_s` may be `0`. Under `php_analyze.cpu_snapshot_mode = off` (`recorder-cpu-snapshot-cadence`) the `getrusage` call is skipped entirely and `cpu_u_ns / cpu_s_ns` are forced to `0` regardless of function duration. Acceptable for staging-level analysis. | Accepted |
 | **R-12** (new) | **`MSHUTDOWN` hang** if shipper is mid-HTTP and server unresponsive | L | M | `shutdown_grace_ms` deadline; shipper self-aborts pending HTTP at deadline; remaining batches counted as dropped. AC-BS-4 verifies. | Mitigated by design |
 | **R-13** (new) | **Channel-full** under burst load → recorder drops at the channel boundary rather than the buffer boundary, hiding why | L | L | Both drop paths increment the same `drop_counter`; the `E_NOTICE` distinguishes "buffer cap" vs "channel full" in its message. | Mitigated by design |
 
@@ -969,6 +970,8 @@ php_analyze.retry_backoff_ms     = 100
 php_analyze.http_timeout_ms      = 2000
 php_analyze.shutdown_grace_ms    = 5000
 php_analyze.shipper_queue_depth  = 8
+
+;php_analyze.cpu_snapshot_mode   = per-call           ; or "off" — see §3.2 / C-19
 ```
 
 ### 12.4 References

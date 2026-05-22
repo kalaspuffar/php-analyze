@@ -56,6 +56,12 @@ pub struct Config {
     pub http_timeout: Duration,
     pub shutdown_grace: Duration,
     pub shipper_queue_depth: usize,
+    /// Per-call CPU snapshot policy. Default [`CpuSnapshotMode::PerCall`]
+    /// (spec-current). Operators can opt into [`CpuSnapshotMode::Off`]
+    /// for high-volume pools where the per-call `getrusage` syscall is
+    /// a measurable share of recorder overhead — see
+    /// `COMMENTS.md` C-19.
+    pub cpu_snapshot_mode: CpuSnapshotMode,
     /// Phase-0 spike: when `true` AND `enabled` is `true`, the spike
     /// module registers an `FcallObserver` that writes one log line per
     /// `begin`/`end` event. Default `false`; removed when Phase 2's
@@ -75,6 +81,63 @@ pub enum TokenSource {
     None,
     Inline,
     File(PathBuf),
+}
+
+/// Per-call CPU snapshot policy for the recorder hot path.
+///
+/// `SPECIFICATION.md` §3.2 mandates `getrusage(RUSAGE_THREAD)` per
+/// begin/end snapshot to populate `CallRecord::cpu_u_ns` /
+/// `cpu_s_ns`. On hosts without vDSO acceleration for `getrusage`
+/// each call costs ~500 ns of real syscall time — ~1000 ns per
+/// PHP call across begin+end. The `Off` variant lets operators
+/// opt that cost away in exchange for losing per-call CPU
+/// attribution (all `cpu_u_ns` / `cpu_s_ns` values then read `0`).
+///
+/// `R-11` already permits `cpu_*_ns == 0` for sub-microsecond
+/// functions; `Off` extends that permission to every function
+/// regardless of duration. See `COMMENTS.md` C-19 for the gap
+/// analysis that motivated this directive and
+/// `openspec/changes/recorder-cpu-snapshot-cadence/` for the
+/// design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpuSnapshotMode {
+    /// Spec-current behaviour: every begin/end snapshot calls
+    /// `getrusage(RUSAGE_THREAD)` and records the actual CPU
+    /// times. **Default** when the directive is absent.
+    #[default]
+    PerCall,
+    /// Skip the `getrusage` call entirely; emit
+    /// `cpu_u_ns = cpu_s_ns = 0` in every `CallRecord`. Saves
+    /// ~1000 ns/call (host-dependent) at the cost of per-call
+    /// CPU attribution.
+    Off,
+}
+
+impl CpuSnapshotMode {
+    /// Operator-facing string form: matches the
+    /// `php_analyze.cpu_snapshot_mode` directive values that
+    /// resolve to each variant. Used by the `phpinfo()` renderer
+    /// and the parser's diagnostic output.
+    pub fn as_ini_str(self) -> &'static str {
+        match self {
+            Self::PerCall => "per-call",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse the directive's raw string. Case-insensitive and
+    /// whitespace-trimmed. `None` on an unrecognised value (the
+    /// caller emits the warning and falls back to the default).
+    pub fn parse(raw: &str) -> Option<Self> {
+        let normalised = raw.trim();
+        if normalised.eq_ignore_ascii_case("per-call") {
+            Some(Self::PerCall)
+        } else if normalised.eq_ignore_ascii_case("off") {
+            Some(Self::Off)
+        } else {
+            None
+        }
+    }
 }
 
 /// Why `Config::enabled` is `false`. Rendered verbatim into `MINFO` as
@@ -128,6 +191,11 @@ pub struct RawIni {
     pub http_timeout_ms: Option<i64>,
     pub shutdown_grace_ms: Option<i64>,
     pub shipper_queue_depth: Option<i64>,
+    /// Raw `php_analyze.cpu_snapshot_mode` value. `None` means
+    /// the directive was absent; otherwise the string is fed
+    /// through [`CpuSnapshotMode::parse`] in
+    /// [`Config::from_ini_values`].
+    pub cpu_snapshot_mode: Option<String>,
     pub spike_observer: Option<bool>,
     pub spike_log_path: Option<String>,
 }
@@ -173,6 +241,14 @@ pub enum ConfigWarning {
         directive: &'static str,
         value: i64,
         clamped_to: i64,
+    },
+
+    #[error(
+        "php_analyze.cpu_snapshot_mode: unrecognised value '{raw_value}', falling back to '{fallback}'"
+    )]
+    UnknownCpuSnapshotMode {
+        raw_value: String,
+        fallback: &'static str,
     },
 }
 
@@ -234,6 +310,11 @@ impl Config {
             http_timeout: Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS as u64),
             shutdown_grace: Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS as u64),
             shipper_queue_depth: DEFAULT_SHIPPER_QUEUE_DEPTH as usize,
+            // CPU snapshot mode keeps its documented default in the
+            // disabled state — the directive's value is irrelevant
+            // while the extension is off but rendering `phpinfo()`
+            // still needs a defined value.
+            cpu_snapshot_mode: CpuSnapshotMode::PerCall,
             // Spike directives default to off regardless of why the
             // extension is disabled; nothing about a disabled pool
             // makes the spike useful. Phase 2's Recorder change deletes
@@ -381,6 +462,26 @@ impl Config {
 
         let enabled = disable_reason.is_none();
 
+        // `cpu_snapshot_mode`: parse the raw string. Absent → default
+        // (PerCall). Present and recognised → matched variant.
+        // Present but unrecognised → push one warning and fall back to
+        // the default. Matches the §3.5 directive-table posture:
+        // clamp/fallback with one E_WARNING; never disable on bad
+        // input.
+        let cpu_snapshot_mode = match raw.cpu_snapshot_mode.as_deref() {
+            None => CpuSnapshotMode::PerCall,
+            Some(raw_value) => match CpuSnapshotMode::parse(raw_value) {
+                Some(mode) => mode,
+                None => {
+                    warnings.push(ConfigWarning::UnknownCpuSnapshotMode {
+                        raw_value: raw_value.to_owned(),
+                        fallback: CpuSnapshotMode::PerCall.as_ini_str(),
+                    });
+                    CpuSnapshotMode::PerCall
+                }
+            },
+        };
+
         // Spike directives: bool defaults to false; path defaults to None.
         // No range validation — the bool is a bool, and the path is
         // validated at file-open time inside the spike module (not here).
@@ -410,6 +511,7 @@ impl Config {
             http_timeout: Duration::from_millis(http_timeout_ms as u64),
             shutdown_grace: Duration::from_millis(shutdown_grace_ms as u64),
             shipper_queue_depth: shipper_queue_depth as usize,
+            cpu_snapshot_mode,
             spike_observer,
             spike_log_path,
         };
@@ -982,6 +1084,163 @@ mod tests {
         assert!(
             config.spike_log_path.is_none(),
             "whitespace-only path must resolve to None (= stderr)"
+        );
+    }
+
+    // --- cpu_snapshot_mode (recorder-cpu-snapshot-cadence) ----------------
+
+    #[test]
+    fn cpu_snapshot_mode_absent_directive_defaults_to_per_call() {
+        // The minimal raw INI does not set cpu_snapshot_mode; the parser
+        // must default to PerCall without emitting any warning.
+        let (config, warnings) = Config::from_ini_values(&minimal_valid_raw());
+        assert_eq!(config.cpu_snapshot_mode, CpuSnapshotMode::PerCall);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnknownCpuSnapshotMode { .. })),
+            "no UnknownCpuSnapshotMode warning expected when directive is absent: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_explicit_off_parses_to_off_variant() {
+        let raw = RawIni {
+            cpu_snapshot_mode: Some("off".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert_eq!(config.cpu_snapshot_mode, CpuSnapshotMode::Off);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnknownCpuSnapshotMode { .. })),
+            "no UnknownCpuSnapshotMode warning expected for recognised value: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_explicit_per_call_round_trips_to_default_variant() {
+        let raw = RawIni {
+            cpu_snapshot_mode: Some("per-call".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert_eq!(config.cpu_snapshot_mode, CpuSnapshotMode::PerCall);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnknownCpuSnapshotMode { .. })),
+            "no UnknownCpuSnapshotMode warning expected for recognised value: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_case_and_whitespace_normalised_before_match() {
+        // Mixed case + leading/trailing whitespace must resolve to the
+        // canonical variant without warning. Mirrors the
+        // case-insensitive + trimmed posture documented on
+        // `CpuSnapshotMode::parse`.
+        let cases = [
+            ("  OFF  ", CpuSnapshotMode::Off),
+            ("Off", CpuSnapshotMode::Off),
+            ("PER-CALL", CpuSnapshotMode::PerCall),
+            ("\tper-call\n", CpuSnapshotMode::PerCall),
+        ];
+        for (raw_value, expected) in cases {
+            let raw = RawIni {
+                cpu_snapshot_mode: Some(raw_value.to_owned()),
+                ..minimal_valid_raw()
+            };
+            let (config, warnings) = Config::from_ini_values(&raw);
+            assert_eq!(
+                config.cpu_snapshot_mode, expected,
+                "raw value {raw_value:?} should parse to {expected:?}"
+            );
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| matches!(w, ConfigWarning::UnknownCpuSnapshotMode { .. })),
+                "no warning expected for {raw_value:?}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_unknown_value_warns_once_and_falls_back_to_per_call() {
+        let raw = RawIni {
+            cpu_snapshot_mode: Some("sampled".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        // The unrecognised value falls back to the safe default.
+        assert_eq!(config.cpu_snapshot_mode, CpuSnapshotMode::PerCall);
+        // Exactly one UnknownCpuSnapshotMode warning is pushed, naming
+        // the raw value and the fallback.
+        let unknown: Vec<_> = warnings
+            .iter()
+            .filter_map(|w| match w {
+                ConfigWarning::UnknownCpuSnapshotMode {
+                    raw_value,
+                    fallback,
+                } => Some((raw_value.as_str(), *fallback)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unknown.len(),
+            1,
+            "expected one UnknownCpuSnapshotMode warning: {warnings:?}"
+        );
+        assert_eq!(unknown[0], ("sampled", "per-call"));
+        // The extension stays enabled — this is a clamp-and-continue
+        // directive, not a disable trigger.
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_display_for_unknown_warning_names_value_and_fallback() {
+        // Drift guard: the `Display` impl is what the bootstrap layer
+        // sends to `php_error(E_WARNING, ...)`. The rendered text must
+        // include the raw value and the fallback so the operator can
+        // diagnose the typo from the log alone.
+        let warning = ConfigWarning::UnknownCpuSnapshotMode {
+            raw_value: "verbose".to_owned(),
+            fallback: "per-call",
+        };
+        let rendered = warning.to_string();
+        assert!(
+            rendered.contains("verbose"),
+            "expected raw value in display: {rendered}"
+        );
+        assert!(
+            rendered.contains("per-call"),
+            "expected fallback in display: {rendered}"
+        );
+        assert!(
+            rendered.contains("cpu_snapshot_mode"),
+            "expected directive name in display: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cpu_snapshot_mode_under_master_switch_off_holds_default() {
+        // The master-switch-off short-circuit returns `Config::disabled`;
+        // the mode field carries the documented default (`PerCall`)
+        // regardless of what the operator wrote in the disabled-pool's
+        // php.ini.
+        let raw = RawIni {
+            enabled: Some(false),
+            cpu_snapshot_mode: Some("off".to_owned()),
+            ..RawIni::default()
+        };
+        let (config, warnings) = Config::from_ini_values(&raw);
+        assert!(!config.enabled);
+        assert_eq!(config.cpu_snapshot_mode, CpuSnapshotMode::PerCall);
+        // No warnings — master-switch-off path skips all validation.
+        assert!(
+            warnings.is_empty(),
+            "no warnings expected under master-switch-off: {warnings:?}"
         );
     }
 

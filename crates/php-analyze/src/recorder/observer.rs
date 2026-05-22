@@ -214,12 +214,13 @@ impl EntrySnapshots {
     /// Take snapshots from the production clock primitives. Routes
     /// through [`clocks::snapshot_now`] so the recorder hot path has
     /// one inlinable boundary per begin/end (recorder-hot-path-tuning
-    /// D-3). The syscall pattern is unchanged: same
-    /// `CLOCK_MONOTONIC` read, same `getrusage(RUSAGE_THREAD)`,
-    /// same `zend_memory_usage(true)`.
+    /// D-3). The CPU read is conditional on the
+    /// `cpu_snapshot_mode` directive (recorder-cpu-snapshot-cadence):
+    /// `PerCall` (default) invokes `getrusage(RUSAGE_THREAD)`; `Off`
+    /// skips the syscall and returns zero CPU fields.
     #[inline]
     fn capture_now() -> Self {
-        let raw = clocks::snapshot_now();
+        let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_in_ns: raw.t_ns,
             cpu_u_in_ns: raw.cpu_u_ns,
@@ -242,16 +243,161 @@ pub struct ExitSnapshots {
 
 impl ExitSnapshots {
     /// Take snapshots from the production clock primitives. Mirror of
-    /// [`EntrySnapshots::capture_now`]; same one-syscall-pattern.
+    /// [`EntrySnapshots::capture_now`]; same conditional CPU read.
     #[inline]
     fn capture_now() -> Self {
-        let raw = clocks::snapshot_now();
+        let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_out_ns: raw.t_ns,
             cpu_u_now_ns: raw.cpu_u_ns,
             cpu_s_now_ns: raw.cpu_s_ns,
             mem_out_bytes: raw.mem_bytes,
         }
+    }
+}
+
+/// Resolve the active `cpu_snapshot_mode` for the current process.
+///
+/// Reads `Config::global().cpu_snapshot_mode` (the frozen-at-MINIT
+/// value) and returns its `Copy` mode. Before `MINIT` runs — or in
+/// the `cargo test` build where production paths are exercised in
+/// isolation — the global is uninitialised; this helper falls back
+/// to [`CpuSnapshotMode::PerCall`] so unit tests preserve the
+/// spec-current behaviour without depending on global state.
+///
+/// The branch on `Config::global()`'s `Option` is single-load against
+/// a `OnceLock`; the steady-state cost (post-MINIT) is one memory
+/// load. The mode itself is `Copy`, so the return is a value-copy.
+///
+/// **Test seam**: under `cfg(test)`, [`set_cpu_snapshot_mode_for_test`]
+/// can publish a mode that this helper observes before consulting
+/// `Config::global()`. The override is process-wide; tests that use
+/// it MUST [`clear_cpu_snapshot_mode_for_test`] on teardown.
+#[inline]
+fn current_cpu_snapshot_mode() -> crate::config::CpuSnapshotMode {
+    #[cfg(test)]
+    if let Some(mode) = cpu_snapshot_mode_test_override() {
+        return mode;
+    }
+    crate::config::Config::global()
+        .map(|c| c.cpu_snapshot_mode)
+        .unwrap_or(crate::config::CpuSnapshotMode::PerCall)
+}
+
+/// Test-only override slot for [`current_cpu_snapshot_mode`]. Encoded
+/// as an `AtomicU8` because `AtomicEnum` is not in stdlib:
+/// - `0xff` = no override (default; helper consults `Config::global`).
+/// - `0` = `CpuSnapshotMode::PerCall`.
+/// - `1` = `CpuSnapshotMode::Off`.
+///
+/// The encoding mirrors the natural source order of the variants;
+/// tests reset the slot to `0xff` on teardown so cross-test
+/// contamination is impossible.
+#[cfg(test)]
+static CPU_SNAPSHOT_MODE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0xff);
+
+#[cfg(test)]
+const CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET: u8 = 0xff;
+
+/// Serialises every test that touches the
+/// [`CPU_SNAPSHOT_MODE_TEST_OVERRIDE`] slot. Cargo test runs tests
+/// in parallel within a binary; without this lock, a test setting
+/// `Off` and another setting `PerCall` race against
+/// [`current_cpu_snapshot_mode`]'s read, producing flaky failures.
+/// CI observed `cpu_u_in_ns = 73000` in an `Off`-expected test
+/// because a parallel `PerCall` test cleared the override
+/// mid-call. The lock is held for the lifetime of any
+/// [`CpuSnapshotModeTestGuard`] or [`lock_cpu_snapshot_mode_for_test`]
+/// returned `MutexGuard`.
+#[cfg(test)]
+static CPU_SNAPSHOT_MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn cpu_snapshot_mode_test_override() -> Option<crate::config::CpuSnapshotMode> {
+    use std::sync::atomic::Ordering;
+    match CPU_SNAPSHOT_MODE_TEST_OVERRIDE.load(Ordering::Relaxed) {
+        CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET => None,
+        0 => Some(crate::config::CpuSnapshotMode::PerCall),
+        1 => Some(crate::config::CpuSnapshotMode::Off),
+        // Any other value is a test-side bug — the encoding above is
+        // total.
+        other => panic!("CPU_SNAPSHOT_MODE_TEST_OVERRIDE has bogus value {other}"),
+    }
+}
+
+/// Publish a test override for [`current_cpu_snapshot_mode`]. Must be
+/// paired with [`clear_cpu_snapshot_mode_for_test`] in the test's
+/// teardown so the slot does not leak into other tests' assertions.
+/// Callers MUST already hold the [`CPU_SNAPSHOT_MODE_TEST_LOCK`];
+/// the [`CpuSnapshotModeTestGuard`] RAII helper enforces this.
+#[cfg(test)]
+fn set_cpu_snapshot_mode_for_test(mode: crate::config::CpuSnapshotMode) {
+    use std::sync::atomic::Ordering;
+    let encoded = match mode {
+        crate::config::CpuSnapshotMode::PerCall => 0,
+        crate::config::CpuSnapshotMode::Off => 1,
+    };
+    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(encoded, Ordering::Relaxed);
+}
+
+/// Clear the test override; subsequent reads of
+/// [`current_cpu_snapshot_mode`] fall back to the
+/// `Config::global()`-or-default path. Idempotent. Callers MUST
+/// hold [`CPU_SNAPSHOT_MODE_TEST_LOCK`].
+#[cfg(test)]
+fn clear_cpu_snapshot_mode_for_test() {
+    use std::sync::atomic::Ordering;
+    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET, Ordering::Relaxed);
+}
+
+/// Acquire [`CPU_SNAPSHOT_MODE_TEST_LOCK`] without publishing an
+/// override. Used by tests that need to observe the no-override
+/// state (i.e., that [`current_cpu_snapshot_mode`] falls back to
+/// `Config::global()` or the default) while still serialising
+/// against tests that DO publish an override.
+#[cfg(test)]
+fn lock_cpu_snapshot_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CPU_SNAPSHOT_MODE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard that publishes a mode override on construction and
+/// clears it on drop. **Holds [`CPU_SNAPSHOT_MODE_TEST_LOCK`] for
+/// its entire lifetime** so two tests using the override cannot
+/// interleave their `set` and `read` operations — the lock is the
+/// only thing that makes the override safe to use under cargo
+/// test's default parallel execution.
+///
+/// The held `MutexGuard<'static, ()>` is released by `Drop`, which
+/// also clears the override slot. Test panics still unwind through
+/// `Drop`, so the slot and the lock both end the test in a clean
+/// state even on failure.
+#[cfg(test)]
+struct CpuSnapshotModeTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CpuSnapshotModeTestGuard {
+    fn new(mode: crate::config::CpuSnapshotMode) -> Self {
+        // `unwrap_or_else(|e| e.into_inner())` recovers from a
+        // poisoned lock — a previous test panicked while holding it.
+        // The override slot might still hold the stale value; the
+        // `set_cpu_snapshot_mode_for_test` call below overwrites it
+        // unconditionally so the slot is consistent before any read.
+        let lock = lock_cpu_snapshot_mode_for_test();
+        set_cpu_snapshot_mode_for_test(mode);
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CpuSnapshotModeTestGuard {
+    fn drop(&mut self) {
+        clear_cpu_snapshot_mode_for_test();
+        // `_lock` drops here, releasing the mutex for the next test.
     }
 }
 
@@ -3290,5 +3436,196 @@ mod tests {
         let staged_a = trace_a.dictionary.take_new_entries();
         let staged_b = trace_b.dictionary.take_new_entries();
         assert_eq!(staged_a, staged_b);
+    }
+
+    // --- cpu_snapshot_mode integration (recorder-cpu-snapshot-cadence) ----
+    //
+    // These tests exercise `EntrySnapshots::capture_now()` /
+    // `ExitSnapshots::capture_now()` against each mode via the test
+    // override seam (`CpuSnapshotModeTestGuard`). They prove the
+    // mode is honoured uniformly across begin and end, not just at
+    // the lower-level `clocks::snapshot_now` boundary.
+
+    #[test]
+    fn entry_snapshots_capture_now_under_off_mode_returns_zero_cpu_fields() {
+        let _guard = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::Off);
+
+        // Burn some CPU first so a `PerCall` snapshot at the same
+        // point would observe non-zero — proves the zeroing is
+        // mode-driven, not coincidence.
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+
+        let snap = EntrySnapshots::capture_now();
+        assert_eq!(snap.cpu_u_in_ns, 0, "Off mode must force cpu_u_in_ns = 0");
+        assert_eq!(snap.cpu_s_in_ns, 0, "Off mode must force cpu_s_in_ns = 0");
+        // Wall clock and memory still populate.
+        assert!(snap.t_in_ns >= 0);
+        assert!(snap.mem_in_bytes >= 0);
+    }
+
+    #[test]
+    fn exit_snapshots_capture_now_under_off_mode_returns_zero_cpu_fields() {
+        let _guard = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::Off);
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+
+        let snap = ExitSnapshots::capture_now();
+        assert_eq!(snap.cpu_u_now_ns, 0);
+        assert_eq!(snap.cpu_s_now_ns, 0);
+        assert!(snap.t_out_ns >= 0);
+        assert!(snap.mem_out_bytes >= 0);
+    }
+
+    #[test]
+    fn entry_snapshots_capture_now_under_per_call_returns_non_negative_cpu_fields() {
+        let _guard = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::PerCall);
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+
+        let snap = EntrySnapshots::capture_now();
+        // PerCall returns non-negative values; the actual reading can
+        // legitimately be 0 for very short busy loops (R-11 microsecond
+        // granularity), but never negative.
+        assert!(snap.cpu_u_in_ns >= 0, "PerCall: {snap:?}");
+        assert!(snap.cpu_s_in_ns >= 0, "PerCall: {snap:?}");
+    }
+
+    #[test]
+    fn recorder_begin_end_pair_under_off_mode_emits_zero_cpu_call_record() {
+        // End-to-end: drive a begin/end pair through the lazy production
+        // path against a real Trace and assert the emitted CallRecord
+        // has cpu_u_ns / cpu_s_ns == 0. Mirrors the production observer
+        // chain (Recorder::begin_handler → categorise_lazy →
+        // begin_with_snapshots_lazy → end_with_snapshots) without
+        // standing up a PHP runtime.
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let _mode_guard = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::Off);
+
+        let mut trace = Trace::new(stub_identity(), permissive_limits());
+        let info = stub_site(Some("noop"), None, Some("/x.php"), 1, false);
+        let lazy = categorise_lazy(&info);
+
+        // Burn CPU between begin and end so a PerCall trace would
+        // record non-zero CPU; under Off mode we expect zero.
+        let entry = EntrySnapshots::capture_now();
+        begin_with_snapshots_lazy(&mut trace, &lazy, entry);
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+        let exit = ExitSnapshots::capture_now();
+        end_with_snapshots(&mut trace, exit, false);
+
+        // The CallRecord should land in the buffer.
+        assert_eq!(trace.buffer.len(), 1);
+        let record = &trace.buffer[0];
+        assert_eq!(
+            record.cpu_u_ns, 0,
+            "Off mode: CallRecord must carry cpu_u_ns = 0; got {record:?}"
+        );
+        assert_eq!(
+            record.cpu_s_ns, 0,
+            "Off mode: CallRecord must carry cpu_s_ns = 0; got {record:?}"
+        );
+        // Wall and memory fields still populate normally.
+        assert!(record.t_in_ns >= 0);
+        assert!(record.t_out_ns >= record.t_in_ns);
+    }
+
+    #[test]
+    fn recorder_begin_end_pair_under_per_call_mode_emits_non_negative_cpu_call_record() {
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let _mode_guard = CpuSnapshotModeTestGuard::new(crate::config::CpuSnapshotMode::PerCall);
+
+        let mut trace = Trace::new(stub_identity(), permissive_limits());
+        let info = stub_site(Some("noop"), None, Some("/x.php"), 1, false);
+        let lazy = categorise_lazy(&info);
+
+        let entry = EntrySnapshots::capture_now();
+        begin_with_snapshots_lazy(&mut trace, &lazy, entry);
+        let mut sum: u64 = 0;
+        for i in 0..50_000_u64 {
+            sum = sum.wrapping_add(i.wrapping_mul(31));
+        }
+        std::hint::black_box(sum);
+        let exit = ExitSnapshots::capture_now();
+        end_with_snapshots(&mut trace, exit, false);
+
+        assert_eq!(trace.buffer.len(), 1);
+        let record = &trace.buffer[0];
+        // PerCall returns non-negative; the actual value depends on
+        // kernel scheduling and getrusage granularity.
+        assert!(record.cpu_u_ns >= 0, "PerCall: {record:?}");
+        assert!(record.cpu_s_ns >= 0, "PerCall: {record:?}");
+    }
+
+    #[test]
+    fn current_cpu_snapshot_mode_defaults_to_per_call_when_config_global_is_unset() {
+        // The helper falls back to PerCall when Config::global is
+        // None (test builds where MINIT has not run). Confirms the
+        // backward-compatible default.
+        //
+        // Serialises against tests that publish an override — without
+        // the lock, a parallel `CpuSnapshotModeTestGuard::new(Off)`
+        // could win the race between our `clear` and our `read`,
+        // returning `Off` and failing the assertion.
+        let _audit_lock = lock_cpu_snapshot_mode_for_test();
+        clear_cpu_snapshot_mode_for_test();
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall
+        );
+    }
+
+    #[test]
+    fn current_cpu_snapshot_mode_test_override_round_trips_both_variants() {
+        // Sanity check on the test seam itself — PerCall and Off
+        // round-trip through the override. Drop-side cleanup is
+        // exercised by directly calling `set` / `clear` while
+        // holding the audit lock for the whole test — using nested
+        // `CpuSnapshotModeTestGuard` scopes would briefly release
+        // the lock between scopes and let a parallel test win the
+        // race, so we hold the lock once across all four state
+        // transitions.
+        let _audit_lock = lock_cpu_snapshot_mode_for_test();
+
+        set_cpu_snapshot_mode_for_test(crate::config::CpuSnapshotMode::Off);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::Off
+        );
+
+        clear_cpu_snapshot_mode_for_test();
+        // After clear the override is unset; helper falls back to
+        // default (PerCall in tests, since Config::global is None).
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall
+        );
+
+        set_cpu_snapshot_mode_for_test(crate::config::CpuSnapshotMode::PerCall);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall
+        );
+
+        clear_cpu_snapshot_mode_for_test();
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall
+        );
     }
 }
