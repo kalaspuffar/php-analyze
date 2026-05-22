@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use php_analyze::wire;
+use serde::Serialize;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 /// In-memory batch store shared between the request handlers and the
@@ -39,6 +40,23 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 /// (currently nonexistent) future case where the stub serves
 /// concurrent connections.
 type Store = Arc<Mutex<Vec<wire::Batch>>>;
+
+/// Captured headers from the most-recent request the stub routed to
+/// `handle_ingest`. `None` until the first ingest request arrives;
+/// also reset to `None` by `POST /debug/reset`. Populated *before*
+/// any validation so a 401/415/400-rejected request is still
+/// observable through `/debug/last_request_headers`.
+type LastHeaders = Arc<Mutex<Option<Vec<(String, String)>>>>;
+
+/// JSON shape returned by `GET /debug/last_request_headers`. One
+/// object per header in the order the client sent them. Header names
+/// are preserved with the as-sent spelling; tests SHOULD compare with
+/// `eq_ignore_ascii_case` (the HTTP semantic).
+#[derive(Serialize)]
+struct HeaderPair<'a> {
+    name: &'a str,
+    value: &'a str,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -88,11 +106,12 @@ fn run(args: Args) -> Result<(), String> {
     drop(stdout);
 
     let store: Store = Arc::new(Mutex::new(Vec::new()));
-    serve(server, args, store);
+    let last_headers: LastHeaders = Arc::new(Mutex::new(None));
+    serve(server, args, store, last_headers);
     Ok(())
 }
 
-fn serve(server: Server, args: Args, store: Store) {
+fn serve(server: Server, args: Args, store: Store, last_headers: LastHeaders) {
     loop {
         let request = match server.recv() {
             Ok(req) => req,
@@ -101,11 +120,11 @@ fn serve(server: Server, args: Args, store: Store) {
                 continue;
             }
         };
-        dispatch(request, &args, &store);
+        dispatch(request, &args, &store, &last_headers);
     }
 }
 
-fn dispatch(request: Request, args: &Args, store: &Store) {
+fn dispatch(request: Request, args: &Args, store: &Store, last_headers: &LastHeaders) {
     // Strip query string if any — `/debug/batches?…` should still
     // hit the debug-batches handler. None of our routes care about
     // query params today; documenting the slice the dispatch makes
@@ -116,15 +135,34 @@ fn dispatch(request: Request, args: &Args, store: &Store) {
 
     let method_name = request_method_name(&request);
     match (&method, path.as_str()) {
-        (Method::Post, p) if p == args.path => handle_ingest(request, args, store),
+        (Method::Post, p) if p == args.path => handle_ingest(request, args, store, last_headers),
         (Method::Get, "/debug/batches") => handle_debug_batches(request, store),
-        (Method::Post, "/debug/reset") => handle_debug_reset(request, store),
+        (Method::Get, "/debug/last_request_headers") => {
+            handle_debug_last_request_headers(request, last_headers)
+        }
+        (Method::Post, "/debug/reset") => handle_debug_reset(request, store, last_headers),
         (_, p) if p == args.path => respond_status(request, 405, &format!("{method_name} {p}")),
         _ => respond_status(request, 404, &format!("{method_name} {path}")),
     }
 }
 
-fn handle_ingest(mut request: Request, args: &Args, store: &Store) {
+fn handle_ingest(mut request: Request, args: &Args, store: &Store, last_headers: &LastHeaders) {
+    // Capture the request's headers BEFORE any validation so a
+    // 401/415/400-rejected request is still observable through
+    // `/debug/last_request_headers`. The token's `Authorization`
+    // value is intentionally surfaced — `/debug/last_request_headers`
+    // is the test seam for AC-SH-4-adjacent assertions; see
+    // `stub-ingest-header-capture`'s `design.md` D-1 / D-6.
+    let captured = capture_headers(request.headers());
+    match last_headers.lock() {
+        Ok(mut guard) => *guard = Some(captured),
+        Err(err) => {
+            eprintln!("stub-ingest: last_headers mutex poisoned: {err}");
+            respond_status(request, 500, "last_headers mutex poisoned");
+            return;
+        }
+    }
+
     if !validate_bearer(request.headers(), &args.auth_token) {
         respond_status(request, 401, "missing or invalid bearer token");
         return;
@@ -187,7 +225,12 @@ fn handle_debug_batches(request: Request, store: &Store) {
     }
 }
 
-fn handle_debug_reset(request: Request, store: &Store) {
+fn handle_debug_reset(request: Request, store: &Store, last_headers: &LastHeaders) {
+    // The two locks are acquired and released sequentially, never
+    // held together (design D-4): each clear is independent and
+    // there is no atomicity story to tell across them — a
+    // concurrent ingest landing between the two clears is still
+    // visible after reset via whichever slot it populated.
     match store.lock() {
         Ok(mut guard) => guard.clear(),
         Err(err) => {
@@ -196,7 +239,66 @@ fn handle_debug_reset(request: Request, store: &Store) {
             return;
         }
     }
+    match last_headers.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(err) => {
+            eprintln!("stub-ingest: last_headers mutex poisoned: {err}");
+            respond_status(request, 500, "last_headers mutex poisoned");
+            return;
+        }
+    }
     respond_empty(request, 200);
+}
+
+fn handle_debug_last_request_headers(request: Request, last_headers: &LastHeaders) {
+    let snapshot = match last_headers.lock() {
+        Ok(guard) => guard.clone(),
+        Err(err) => {
+            eprintln!("stub-ingest: last_headers mutex poisoned: {err}");
+            respond_status(request, 500, "last_headers mutex poisoned");
+            return;
+        }
+    };
+    let Some(pairs) = snapshot else {
+        // The empty state goes through `respond_empty` rather than
+        // `respond_status` so the legitimate "no ingest yet" branch
+        // does not produce a noisy `stub-ingest: 404 ...` line on
+        // stderr for every test that gates on it. See design D-3.
+        respond_empty(request, 404);
+        return;
+    };
+    let body = match serde_json::to_vec(
+        &pairs
+            .iter()
+            .map(|(name, value)| HeaderPair { name, value })
+            .collect::<Vec<_>>(),
+    ) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("stub-ingest: json encode error: {err}");
+            respond_status(request, 500, "json encode failure");
+            return;
+        }
+    };
+    let response = Response::from_data(body).with_header(json_header());
+    if let Err(err) = request.respond(response) {
+        eprintln!("stub-ingest: respond error: {err}");
+    }
+}
+
+/// Convert the request's headers into an owned, JSON-friendly
+/// vector preserving order and as-sent spelling. The allocations
+/// are negligible for a test fixture; see design D-2.
+fn capture_headers(headers: &[Header]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|h| {
+            (
+                h.field.as_str().as_str().to_owned(),
+                h.value.as_str().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Design D-7: byte-equal compare, **not** constant-time. The stub is
