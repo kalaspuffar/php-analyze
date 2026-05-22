@@ -259,6 +259,13 @@ fn startup_body_inner(module_number: i32) {
         php_error(&ErrorType::Warning, &warning.to_string());
     }
 
+    // After the misconfig `E_WARNING` loop and before any shipper
+    // side-effect, surface the deliberate `enabled = 0` case as one
+    // `E_NOTICE` per process. Misconfig paths are already logged by
+    // the warning loop above; this branch only fires for the
+    // `MasterSwitchOff` `DisableReason`.
+    emit_master_switch_notice_if_off(Config::global());
+
     // Install the Phase-4 shipper channel for enabled extensions only.
     // The disabled path stays silent — no channel, no thread, no
     // `MSHUTDOWN` work at process exit (the `shipper::*` slots remain
@@ -360,7 +367,8 @@ fn emit_queued_drop_notices() {
 /// at `ErrorType::Notice`. The `cargo test` binary links without a
 /// live PHP runtime, so `php_error_docref` (called transitively by
 /// `php_error`) is unresolvable — the unit-test build replaces this
-/// with a no-op. Integration coverage of the wired-up
+/// with a recorder (see the `#[cfg(test)]` body below) that captures
+/// each message for assertion. Integration coverage of the wired-up
 /// `php_error(E_NOTICE, ...)` call lives on
 /// `tests/shipper_round_trip.rs`'s future retry-exhaust scenario
 /// (deferred to the `stub-ingest-configurable-failure` follow-up,
@@ -371,9 +379,43 @@ fn emit_php_notice(message: &str) {
     php_error(&ErrorType::Notice, message);
 }
 
+/// Test seam: append each notice message to a process-global
+/// recorder so unit tests can assert on the emitted text. The
+/// production path (`#[cfg(not(test))]` above) dispatches into
+/// `php_error(E_NOTICE, ...)`, which is unresolvable at test-link
+/// time. The recorder is drained via `drain_recorded_notices_for_test`
+/// and reset via `reset_recorded_notices_for_test`. Tests that do
+/// not inspect the recorder (e.g. the shipper drop-notice tests)
+/// are unaffected: the recorder is a write-only sink from their
+/// perspective.
 #[cfg(test)]
-fn emit_php_notice(_message: &str) {
-    // Intentionally empty: see the production-path doc comment above.
+fn emit_php_notice(message: &str) {
+    tests::recorded_notices()
+        .lock()
+        .expect("notice recorder mutex poisoned (no other thread should panic while holding it)")
+        .push(message.to_owned());
+}
+
+/// Surface the deliberate `php_analyze.enabled = 0` state as one
+/// `E_NOTICE` per process. Only the `MasterSwitchOff` `DisableReason`
+/// qualifies: every other `DisableReason` (missing `server_url`,
+/// missing token, unreadable token file, …) already produces one
+/// `E_WARNING` from the `ConfigWarning` loop in
+/// `startup_body_inner`, so adding a notice would double-log those
+/// cases. The enabled path stays silent.
+///
+/// The message is a fixed string — token-free by construction, and
+/// deliberately decoupled from `DisableReason::human()` so a future
+/// copy-edit of the `MINFO` rendering does not silently change the
+/// error-log surface. See `notice-on-master-switch-off`'s `design.md`
+/// D-2.
+fn emit_master_switch_notice_if_off(config: Option<&Config>) {
+    let Some(config) = config else {
+        return;
+    };
+    if matches!(config.disable_reason, Some(DisableReason::MasterSwitchOff)) {
+        emit_php_notice("php_analyze: disabled by php_analyze.enabled = 0");
+    }
 }
 
 /// `RINIT` — request startup. Allocates the per-request `Trace` in the
@@ -830,7 +872,65 @@ mod tests {
     //! `openspec/changes/scaffold-workspace-and-config/tasks.md` §9.
 
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
+
+    // --- emit_php_notice recorder ------------------------------------------
+    //
+    // The `#[cfg(test)]` `emit_php_notice` shim feeds every notice
+    // through this recorder so the bootstrap tests below — and the
+    // master-switch notice tests in particular — can assert on the
+    // emitted text. The recorder lives behind a `Mutex` so concurrent
+    // `cargo test` workers do not race when one of them logs a notice
+    // while another is asserting. Tests that care about the contents
+    // call `reset_recorded_notices_for_test` at entry; tests that
+    // don't (e.g. the shipper drop-notice unit tests) are unaffected
+    // by leftover messages because they never read the recorder.
+
+    /// Process-global notice recorder used by the `#[cfg(test)]`
+    /// `emit_php_notice` shim. Lazily initialised on first use.
+    pub(super) fn recorded_notices() -> &'static Mutex<Vec<String>> {
+        static RECORDER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        RECORDER.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Drain the notice recorder and return everything it has
+    /// captured since the last drain or reset. Only used by the
+    /// bootstrap unit tests in this module.
+    fn drain_recorded_notices_for_test() -> Vec<String> {
+        std::mem::take(
+            &mut *recorded_notices()
+                .lock()
+                .expect("notice recorder mutex poisoned"),
+        )
+    }
+
+    /// Clear the notice recorder. Call this at the start of any
+    /// test that intends to assert on the captured notices, so a
+    /// notice left over from another `cargo test` worker does not
+    /// pollute the assertion.
+    fn reset_recorded_notices_for_test() {
+        recorded_notices()
+            .lock()
+            .expect("notice recorder mutex poisoned")
+            .clear();
+    }
+
+    /// Serialise the `emit_master_switch_notice_if_off` tests so they
+    /// do not race on the shared `recorded_notices` recorder. Held
+    /// across the reset/emit/drain triple in each test, which makes
+    /// the captured count deterministic under `cargo test`'s default
+    /// multi-threaded runner. Other notice-producing test paths in
+    /// the bootstrap suite do not fire `emit_php_notice` in practice
+    /// (the shipper drop-notice path is exercised against an empty
+    /// channel), so this lock is the only synchronisation point
+    /// needed for the notice surface.
+    fn acquire_notice_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     // --- parse_bool ---------------------------------------------------------
 
@@ -1658,5 +1758,148 @@ mod tests {
         );
 
         crate::shipper::reset_for_test();
+    }
+
+    // --- master-switch E_NOTICE --------------------------------------------
+    //
+    // These four tests pin the `notice-on-master-switch-off` contract:
+    // exactly one `E_NOTICE` per process when
+    // `disable_reason == MasterSwitchOff`, silence for every other
+    // arm and for the enabled / unset cases. They share a recorder
+    // (see `recorded_notices`) and serialise via
+    // `acquire_notice_test_lock` so the captured count is
+    // deterministic under `cargo test`'s default parallel runner.
+
+    fn config_with_disable_reason(reason: DisableReason) -> Config {
+        // Hand-build a `Config` with an arbitrary `disable_reason` —
+        // `Config::from_ini_values` only produces `MasterSwitchOff`
+        // and the misconfig reasons that match the ini state, so the
+        // "every other DisableReason" test below needs a direct
+        // constructor.
+        Config {
+            enabled: false,
+            disable_reason: Some(reason),
+            server_url: None,
+            auth_token: secrecy::SecretString::default(),
+            auth_token_source: TokenSource::None,
+            flush_records: 10_000,
+            flush_bytes: 1_048_576,
+            buffer_cap_bytes: 67_108_864,
+            max_depth: 1024,
+            retry_count: 3,
+            retry_backoff: Duration::from_millis(100),
+            http_timeout: Duration::from_millis(2_000),
+            shutdown_grace: Duration::from_millis(5_000),
+            shipper_queue_depth: 8,
+            spike_observer: false,
+            spike_log_path: None,
+        }
+    }
+
+    #[test]
+    fn emit_master_switch_notice_if_off_emits_exactly_one_notice_when_master_switch_is_off() {
+        let _guard = acquire_notice_test_lock();
+        reset_recorded_notices_for_test();
+
+        let disabled = disabled_config_for_lifecycle_tests();
+        assert_eq!(
+            disabled.disable_reason,
+            Some(DisableReason::MasterSwitchOff),
+            "fixture sanity: helper builds a MasterSwitchOff config",
+        );
+
+        emit_master_switch_notice_if_off(Some(&disabled));
+
+        let captured = drain_recorded_notices_for_test();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly one notice, got {captured:?}",
+        );
+        let line = &captured[0];
+        assert!(
+            line.contains("php_analyze.enabled = 0"),
+            "notice must reference the directive that triggered it; got {line:?}",
+        );
+    }
+
+    #[test]
+    fn emit_master_switch_notice_if_off_is_silent_for_every_other_disable_reason() {
+        let _guard = acquire_notice_test_lock();
+
+        // Every `DisableReason` variant other than `MasterSwitchOff`.
+        // If a new variant is added without updating this list, the
+        // exhaustiveness of the match below will surface it at
+        // compile time (see the explicit pattern match).
+        let other_reasons = [
+            DisableReason::ServerUrlNotConfigured,
+            DisableReason::ServerUrlInvalid,
+            DisableReason::ServerUrlSchemeUnsupported,
+            DisableReason::TokenNotConfigured,
+            DisableReason::TokenFileUnreadable,
+            DisableReason::TokenFileEmpty,
+        ];
+        // Exhaustiveness guard: if a new `DisableReason` is added,
+        // this match forces a compile-time decision about whether the
+        // new variant should also be silent here.
+        for reason in &other_reasons {
+            match reason {
+                DisableReason::MasterSwitchOff => {
+                    unreachable!("MasterSwitchOff must not appear in the other-reasons list",)
+                }
+                DisableReason::ServerUrlNotConfigured
+                | DisableReason::ServerUrlInvalid
+                | DisableReason::ServerUrlSchemeUnsupported
+                | DisableReason::TokenNotConfigured
+                | DisableReason::TokenFileUnreadable
+                | DisableReason::TokenFileEmpty => {}
+            }
+        }
+
+        for reason in other_reasons {
+            reset_recorded_notices_for_test();
+            let config = config_with_disable_reason(reason.clone());
+            emit_master_switch_notice_if_off(Some(&config));
+            let captured = drain_recorded_notices_for_test();
+            assert!(
+                captured.is_empty(),
+                "DisableReason::{reason:?} must not emit a master-switch notice; got {captured:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn emit_master_switch_notice_if_off_is_silent_when_extension_is_enabled() {
+        let _guard = acquire_notice_test_lock();
+        reset_recorded_notices_for_test();
+
+        let enabled = enabled_config_for_lifecycle_tests();
+        assert!(enabled.enabled, "fixture sanity: enabled config is enabled");
+        assert_eq!(
+            enabled.disable_reason, None,
+            "fixture sanity: enabled config has no disable_reason",
+        );
+
+        emit_master_switch_notice_if_off(Some(&enabled));
+
+        let captured = drain_recorded_notices_for_test();
+        assert!(
+            captured.is_empty(),
+            "enabled config must not emit a master-switch notice; got {captured:?}",
+        );
+    }
+
+    #[test]
+    fn emit_master_switch_notice_if_off_is_silent_when_config_is_unset() {
+        let _guard = acquire_notice_test_lock();
+        reset_recorded_notices_for_test();
+
+        emit_master_switch_notice_if_off(None);
+
+        let captured = drain_recorded_notices_for_test();
+        assert!(
+            captured.is_empty(),
+            "missing config must not emit a master-switch notice; got {captured:?}",
+        );
     }
 }
