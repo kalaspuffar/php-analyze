@@ -39,7 +39,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use php_analyze::recorder::observer::{
     begin_with_snapshots, begin_with_snapshots_lazy, categorise_lazy, end_with_snapshots,
@@ -47,6 +47,27 @@ use php_analyze::recorder::observer::{
 };
 use php_analyze::recorder::types::{FunctionKey, FunctionKind, Trace, TraceLimits};
 use php_analyze::recorder::RequestIdentity;
+
+/// Serialises the two steady-state allocator-counting tests. Both
+/// read the same global `CountingAllocator` counters and assert
+/// strict `== 0` deltas across their measurement windows. Running
+/// them in parallel (cargo test's default within a binary) lets one
+/// test's *teardown* — dropping the test-local `Trace` and
+/// `Categorised`, which deallocates the buffer Vec, stack Vec,
+/// hashmap, dict entries, and a handful of `Arc<str>`s — land in
+/// the other test's measurement window. The first observed CI
+/// failure was the production-path test seeing `dealloc_delta=21`
+/// while only 5 alloc events ran in its own body — the classic
+/// shape of cross-test teardown contamination.
+///
+/// The `*_first_miss_does_allocate` siblings don't need this lock:
+/// they only assert `>= 1`, so any contamination only helps them.
+///
+/// `PoisonError` recovery on `.unwrap()` is acceptable here — a
+/// panicking test inside the lock pollutes the counters; the next
+/// test will likely fail too, which is correct behaviour
+/// (the failure points at the real problem rather than masking it).
+static AUDIT_LOCK: Mutex<()> = Mutex::new(());
 
 // --- Counting global allocator ----------------------------------------------
 
@@ -154,19 +175,6 @@ const EXIT_SNAPSHOTS: ExitSnapshots = ExitSnapshots {
 };
 
 const WARMUP_SIZE: usize = 1_000;
-/// Wider warmup window for the production-path audit
-/// (`recorder_production_hot_path_is_zero_alloc_in_steady_state`).
-/// The production chain exercises more first-use code paths than the
-/// bench-seam chain (`categorise_lazy`, `FqnSpec::render_len`, the
-/// `hashbrown::raw_entry` machinery, etc.), so its lazy-init tail
-/// runs longer. The bench-seam test's WARMUP_SIZE = 1_000 was tuned
-/// against the CI host's observed `4/2/9` residue and got it to
-/// `0/0/0`; the production-path test's first CI run observed
-/// `3/2/21` after the same 1_000 warmup, hence the wider window.
-/// 10× the bench-seam warmup remains negligible runtime
-/// (~10_000 × ~135 ns ≈ 1.4 ms) and is the cleanest absorbtion
-/// strategy without weakening the strict `== 0` assertion.
-const PRODUCTION_WARMUP_SIZE: usize = 10_000;
 const MEASUREMENT_SIZE: usize = 10_000;
 const MAX_DEPTH: usize = 1024;
 
@@ -174,6 +182,9 @@ const MAX_DEPTH: usize = 1024;
 
 #[test]
 fn recorder_hot_path_is_zero_alloc_in_steady_state() {
+    // Serialise against `recorder_production_hot_path_is_zero_alloc_in_steady_state` —
+    // both read the global allocator counters. See AUDIT_LOCK doc.
+    let _audit_guard = AUDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut trace = make_trace();
     let categorised = make_categorised();
 
@@ -325,6 +336,9 @@ fn make_raw_call_site() -> RawCallSite<'static> {
 
 #[test]
 fn recorder_production_hot_path_is_zero_alloc_in_steady_state() {
+    // Serialise against `recorder_hot_path_is_zero_alloc_in_steady_state` —
+    // both read the global allocator counters. See AUDIT_LOCK doc.
+    let _audit_guard = AUDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut trace = make_trace();
     let raw = make_raw_call_site();
 
@@ -340,21 +354,18 @@ fn recorder_production_hot_path_is_zero_alloc_in_steady_state() {
 
     // Pre-grow AFTER the cold-miss pre-warm so the Vecs have room
     // for both the warmup window and the measurement region with
-    // no reallocation. Uses the wider `PRODUCTION_WARMUP_SIZE` so
-    // the buffer's reserved capacity covers the larger warmup
-    // window without realloc.
-    trace.pregrow_for_audit(PRODUCTION_WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
+    // no reallocation.
+    trace.pregrow_for_audit(WARMUP_SIZE + MEASUREMENT_SIZE, MAX_DEPTH);
 
-    // Pre-warm phase 2 — `PRODUCTION_WARMUP_SIZE` hit-path
-    // iterations through the full `categorise_lazy → begin → end`
-    // chain. Wider than the bench-seam test's `WARMUP_SIZE`
-    // because the production path exercises more first-use code
-    // paths (categorise_lazy's precedence ladder, FqnSpec's
-    // render_len arms, hashbrown's raw_entry machinery) that the
-    // bench-seam path skips. See the comment on
-    // `PRODUCTION_WARMUP_SIZE` for the CI residue numbers that
-    // motivated the widening.
-    for _ in 0..PRODUCTION_WARMUP_SIZE {
+    // Pre-warm phase 2 — `WARMUP_SIZE` hit-path iterations through
+    // the full `categorise_lazy → begin → end` chain. Mirrors the
+    // bench-seam test's warmup-window pattern to absorb any
+    // one-shot lazy initialisation that fires on first hit-path
+    // use. (Earlier attempts widened this window thinking CI
+    // failures were lazy-init residue; the real cause turned out
+    // to be cross-test counter contamination from parallel
+    // execution — see AUDIT_LOCK.)
+    for _ in 0..WARMUP_SIZE {
         let lazy = categorise_lazy(&raw);
         begin_with_snapshots_lazy(&mut trace, &lazy, ENTRY_SNAPSHOTS);
         end_with_snapshots(&mut trace, EXIT_SNAPSHOTS, false);
@@ -386,22 +397,21 @@ fn recorder_production_hot_path_is_zero_alloc_in_steady_state() {
         "AC-RC-5 (widened) violated: steady-state PRODUCTION hot path \
          allocated AFTER warmup. alloc_delta={alloc_delta}, \
          realloc_delta={realloc_delta}, dealloc_delta={dealloc_delta} \
-         across {MEASUREMENT_SIZE} measurement calls (after \
-         {PRODUCTION_WARMUP_SIZE} warmup-phase-2 calls). Expected: 0 \
-         allocs, 0 reallocs. The widened audit covers `categorise_lazy → \
-         begin_with_snapshots_lazy → end_with_snapshots` — the same chain \
-         `Recorder::begin_handler` drives in production. \
-         \n\nIf this fails with a *small constant* (≤ ~5 allocs across 10⁴ \
-         calls), the likely cause is residual one-shot lazy init that the \
-         warmup window didn't fully absorb — widen \
-         `PRODUCTION_WARMUP_SIZE` further (it has already been tuned from \
-         1_000 → 10_000 against CI residue). If alloc_delta grows \
-         linearly with iteration count, the cause is a true per-call \
-         allocation site: a fresh `Arc::from(&str)` on the dict-hit branch \
-         of `categorise_lazy`, an `FqnSpec::render()` that fires even on a \
-         hit, an owning `FunctionKey` materialised outside the intern_ref \
-         build closure, or a new `Vec::new()` / `Box::new()` on the \
-         per-call path.",
+         across {MEASUREMENT_SIZE} measurement calls (after {WARMUP_SIZE} \
+         warmup-phase-2 calls). Expected: 0 allocs, 0 reallocs. The \
+         widened audit covers `categorise_lazy → begin_with_snapshots_lazy \
+         → end_with_snapshots` — the same chain `Recorder::begin_handler` \
+         drives in production. \
+         \n\nIf `dealloc_delta` is >> (`alloc_delta` + `realloc_delta`), the \
+         most likely cause is cross-test counter contamination — the \
+         AUDIT_LOCK on this test is missing or broken. If the deltas are \
+         balanced (matching alloc/dealloc counts) and growing linearly \
+         with iteration count, the cause is a true per-call allocation \
+         site: a fresh `Arc::from(&str)` on the dict-hit branch of \
+         `categorise_lazy`, an `FqnSpec::render()` that fires even on a \
+         hit, an owning `FunctionKey` materialised outside the \
+         intern_ref build closure, or a new `Vec::new()` / `Box::new()` \
+         on the per-call path.",
     );
 }
 
