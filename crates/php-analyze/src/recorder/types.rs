@@ -726,6 +726,40 @@ impl Trace {
         })
     }
 
+    /// Borrow-keyed sibling of [`push_dict_entry_via_intern`]: probes
+    /// the dictionary by a borrowed [`FunctionKeyRef`] (zero
+    /// `Arc<str>` allocations on the hit path) and only invokes
+    /// `build` on a miss. On a miss the build closure materialises
+    /// both the owning `FunctionKey` (the dictionary's key) and the
+    /// staged `DictEntry` in one place — the same Arc<str> family
+    /// can back both if the caller chooses.
+    ///
+    /// Returns the `fn_id` only; the hit/miss split is collapsed
+    /// because the §3.2 cap-gate has already projected the miss cost
+    /// via [`crate::recorder::Dictionary::contains_key_ref`] before
+    /// calling this method.
+    ///
+    /// **Zero-alloc on hit**: the recorder hot path's binding test is
+    /// `recorder-zero-alloc-audit` (recorder-hot-path-tuning §6).
+    pub fn push_dict_entry_via_intern_ref<F>(
+        &mut self,
+        key_ref: &crate::recorder::types::FunctionKeyRef<'_>,
+        build: F,
+    ) -> u32
+    where
+        F: FnOnce(u32) -> (FunctionKey, DictEntry),
+    {
+        let estimate = &mut self.buffer_estimated_bytes;
+        let (fn_id, _outcome) = self.dictionary.intern_ref(key_ref, |fn_id| {
+            let (owning_key, entry) = build(fn_id);
+            let contribution = DICT_ENTRY_FIXED_BYTES + entry.fqn.len() + entry.file.len();
+            *estimate += contribution;
+            accounting::add(contribution);
+            (owning_key, entry)
+        });
+        fn_id
+    }
+
     /// Pre-grow `self.buffer` and `self.stack` to the requested
     /// capacities so subsequent `push_record` / observer-driven
     /// stack pushes within those bounds are pointer-bump only
