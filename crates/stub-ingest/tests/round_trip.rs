@@ -698,17 +698,18 @@ fn debug_reset_clears_the_captured_headers_slot() {
 }
 
 #[test]
-fn readme_documents_the_four_routes_and_bind_protocol() {
+fn readme_documents_the_five_routes_and_bind_protocol() {
     // `include_str!` is resolved at compile time relative to this
     // test source file, so the README's content is pinned into the
-    // test binary alongside the assertions. The six substrings come
-    // straight from the `stub-ingest-server/spec.md` scenario
-    // (widened from five → six by `stub-ingest-header-capture`).
+    // test binary alongside the assertions. The seven substrings
+    // come straight from the `stub-ingest-server/spec.md` scenario
+    // (widened from six → seven by `stub-ingest-connection-counter`).
     let readme = include_str!("../README.md");
     for needle in [
         "POST /v1/ingest",
         "GET /debug/batches",
         "GET /debug/last_request_headers",
+        "GET /debug/connection_count",
         "POST /debug/reset",
         "--bind",
         "bound:",
@@ -718,6 +719,178 @@ fn readme_documents_the_four_routes_and_bind_protocol() {
             "stub-ingest/README.md must mention {needle:?} per the spec scenario",
         );
     }
+}
+
+/// Mirror of the stub's `CountBody` serialisation shape.
+#[derive(serde::Deserialize, Debug)]
+struct CountBody {
+    count: usize,
+}
+
+/// GET `/debug/connection_count` and return the decoded count.
+fn fetch_connection_count(agent: &ureq::Agent, addr: SocketAddr) -> usize {
+    let mut response = agent
+        .get(url(addr, "/debug/connection_count"))
+        .call()
+        .expect("GET /debug/connection_count");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "GET /debug/connection_count is always 200 (zero is meaningful; no 404 here)",
+    );
+    let body: Vec<u8> = response
+        .body_mut()
+        .read_to_vec()
+        .expect("read /debug/connection_count body");
+    let decoded: CountBody = serde_json::from_slice(&body).unwrap_or_else(|e| {
+        panic!(
+            "decode /debug/connection_count JSON: {e}; body: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    decoded.count
+}
+
+#[test]
+fn connection_count_returns_zero_on_a_fresh_stub() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 0,
+        "a freshly-spawned stub has not seen any ingest-path connection; expected count=0, got {count}",
+    );
+}
+
+#[test]
+fn connection_count_returns_one_after_a_single_ingest() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    post_valid_batch(&agent, addr, "test-token", &sample_batch());
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 1,
+        "one ingest from one agent yields one distinct connection; got {count}",
+    );
+}
+
+#[test]
+fn connection_count_stays_at_one_for_one_thousand_posts_through_one_agent() {
+    // Stub-side direct binding of AC-SH-6: one ureq::Agent over
+    // loopback keep-alive must result in exactly one distinct
+    // remote_addr in the connection-set, regardless of how many
+    // sequential POSTs the agent sends.
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    for _ in 0..1000 {
+        let response = post_batch_with_headers(
+            &agent,
+            addr,
+            Some("Bearer test-token"),
+            wire::MEDIA_TYPE,
+            body.clone(),
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "every POST in the 1000-iteration loop must succeed",
+        );
+    }
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 1,
+        "1000 sequential POSTs through one ureq::Agent over keep-alive \
+         must use exactly one TCP connection (AC-SH-6 stub-side); got {count}",
+    );
+}
+
+#[test]
+fn connection_count_increments_when_a_new_agent_posts() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent_a = ureq_agent_no_status_err();
+    let agent_b = ureq_agent_no_status_err();
+
+    post_valid_batch(&agent_a, addr, "test-token", &sample_batch());
+    post_valid_batch(&agent_b, addr, "test-token", &sample_batch());
+
+    let count = fetch_connection_count(&agent_a, addr);
+    assert!(
+        count >= 2,
+        "two distinct ureq::Agent instances must yield count >= 2; got {count}",
+    );
+}
+
+#[test]
+fn connection_count_counts_401_rejected_requests() {
+    let (_guard, addr) = spawn_stub("real-token");
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch()).expect("encode");
+    let response = post_batch_with_headers(
+        &agent,
+        addr,
+        Some("Bearer wrong-token"),
+        wire::MEDIA_TYPE,
+        body,
+    );
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "fixture sanity: the wrong bearer is rejected",
+    );
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 1,
+        "a 401-rejected request still consumed a TCP connection and must count; got {count}",
+    );
+}
+
+#[test]
+fn connection_count_does_not_count_debug_batches_request() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    // Drive a non-ingest request that does NOT target the ingest
+    // path. The connection used by this GET must NOT be counted.
+    let batches = fetch_batches(&agent, addr);
+    assert!(
+        batches.is_empty(),
+        "fixture sanity: fresh store starts empty"
+    );
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 0,
+        "/debug/batches must NOT populate /debug/connection_count; got {count}",
+    );
+}
+
+#[test]
+fn debug_reset_clears_the_connection_set() {
+    let (_guard, addr) = spawn_stub("test-token");
+    let agent = ureq_agent_no_status_err();
+
+    post_valid_batch(&agent, addr, "test-token", &sample_batch());
+    assert_eq!(
+        fetch_connection_count(&agent, addr),
+        1,
+        "fixture sanity: one ingest yields count=1",
+    );
+
+    reset_store(&agent, addr);
+
+    let count = fetch_connection_count(&agent, addr);
+    assert_eq!(
+        count, 0,
+        "POST /debug/reset must clear the connection-set; got {count}",
+    );
 }
 
 /// `ureq` v3 by default turns 4xx/5xx responses into `Err`s. We want

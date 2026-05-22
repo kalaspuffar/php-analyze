@@ -26,7 +26,9 @@
 //! writes only to stderr; stdout stays silent for the lifetime of
 //! the process.
 
+use std::collections::BTreeSet;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -48,6 +50,16 @@ type Store = Arc<Mutex<Vec<wire::Batch>>>;
 /// observable through `/debug/last_request_headers`.
 type LastHeaders = Arc<Mutex<Option<Vec<(String, String)>>>>;
 
+/// Distinct `remote_addr` values observed on the ingest path. Each
+/// unique value represents one accepted TCP connection (HTTP/1.1
+/// keep-alive on a single `ureq::Agent` reuses the same ephemeral
+/// port, so the set's `.len()` is the number of distinct TCP
+/// connections that reached `handle_ingest`). Cleared by
+/// `POST /debug/reset`; surfaced via `GET /debug/connection_count`.
+/// `BTreeSet` rather than `HashSet` for deterministic iteration if
+/// the address list is ever exposed for diagnostics.
+type Connections = Arc<Mutex<BTreeSet<SocketAddr>>>;
+
 /// JSON shape returned by `GET /debug/last_request_headers`. One
 /// object per header in the order the client sent them. Header names
 /// are preserved with the as-sent spelling; tests SHOULD compare with
@@ -56,6 +68,15 @@ type LastHeaders = Arc<Mutex<Option<Vec<(String, String)>>>>;
 struct HeaderPair<'a> {
     name: &'a str,
     value: &'a str,
+}
+
+/// JSON shape returned by `GET /debug/connection_count`. Wrapping the
+/// count in an object (instead of returning a bare integer body) lets
+/// us add fields later (e.g. `addrs: [...]`) without breaking
+/// existing consumers.
+#[derive(Serialize)]
+struct CountBody {
+    count: usize,
 }
 
 #[derive(Debug, Parser)]
@@ -107,11 +128,18 @@ fn run(args: Args) -> Result<(), String> {
 
     let store: Store = Arc::new(Mutex::new(Vec::new()));
     let last_headers: LastHeaders = Arc::new(Mutex::new(None));
-    serve(server, args, store, last_headers);
+    let connections: Connections = Arc::new(Mutex::new(BTreeSet::new()));
+    serve(server, args, store, last_headers, connections);
     Ok(())
 }
 
-fn serve(server: Server, args: Args, store: Store, last_headers: LastHeaders) {
+fn serve(
+    server: Server,
+    args: Args,
+    store: Store,
+    last_headers: LastHeaders,
+    connections: Connections,
+) {
     loop {
         let request = match server.recv() {
             Ok(req) => req,
@@ -120,11 +148,17 @@ fn serve(server: Server, args: Args, store: Store, last_headers: LastHeaders) {
                 continue;
             }
         };
-        dispatch(request, &args, &store, &last_headers);
+        dispatch(request, &args, &store, &last_headers, &connections);
     }
 }
 
-fn dispatch(request: Request, args: &Args, store: &Store, last_headers: &LastHeaders) {
+fn dispatch(
+    request: Request,
+    args: &Args,
+    store: &Store,
+    last_headers: &LastHeaders,
+    connections: &Connections,
+) {
     // Strip query string if any — `/debug/batches?…` should still
     // hit the debug-batches handler. None of our routes care about
     // query params today; documenting the slice the dispatch makes
@@ -135,18 +169,31 @@ fn dispatch(request: Request, args: &Args, store: &Store, last_headers: &LastHea
 
     let method_name = request_method_name(&request);
     match (&method, path.as_str()) {
-        (Method::Post, p) if p == args.path => handle_ingest(request, args, store, last_headers),
+        (Method::Post, p) if p == args.path => {
+            handle_ingest(request, args, store, last_headers, connections)
+        }
         (Method::Get, "/debug/batches") => handle_debug_batches(request, store),
         (Method::Get, "/debug/last_request_headers") => {
             handle_debug_last_request_headers(request, last_headers)
         }
-        (Method::Post, "/debug/reset") => handle_debug_reset(request, store, last_headers),
+        (Method::Get, "/debug/connection_count") => {
+            handle_debug_connection_count(request, connections)
+        }
+        (Method::Post, "/debug/reset") => {
+            handle_debug_reset(request, store, last_headers, connections)
+        }
         (_, p) if p == args.path => respond_status(request, 405, &format!("{method_name} {p}")),
         _ => respond_status(request, 404, &format!("{method_name} {path}")),
     }
 }
 
-fn handle_ingest(mut request: Request, args: &Args, store: &Store, last_headers: &LastHeaders) {
+fn handle_ingest(
+    mut request: Request,
+    args: &Args,
+    store: &Store,
+    last_headers: &LastHeaders,
+    connections: &Connections,
+) {
     // Capture the request's headers BEFORE any validation so a
     // 401/415/400-rejected request is still observable through
     // `/debug/last_request_headers`. The token's `Authorization`
@@ -159,6 +206,19 @@ fn handle_ingest(mut request: Request, args: &Args, store: &Store, last_headers:
         Err(err) => {
             eprintln!("stub-ingest: last_headers mutex poisoned: {err}");
             respond_status(request, 500, "last_headers mutex poisoned");
+            return;
+        }
+    }
+
+    // Record the TCP connection's ephemeral source address BEFORE
+    // bearer/content-type validation, for the same reason headers
+    // are captured early: a 401-rejected request still consumed a
+    // TCP connection, which the AC-SH-6 contract counts.
+    match record_connection(request.remote_addr(), connections) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("stub-ingest: connections mutex poisoned: {err}");
+            respond_status(request, 500, "connections mutex poisoned");
             return;
         }
     }
@@ -225,11 +285,16 @@ fn handle_debug_batches(request: Request, store: &Store) {
     }
 }
 
-fn handle_debug_reset(request: Request, store: &Store, last_headers: &LastHeaders) {
-    // The two locks are acquired and released sequentially, never
+fn handle_debug_reset(
+    request: Request,
+    store: &Store,
+    last_headers: &LastHeaders,
+    connections: &Connections,
+) {
+    // The three locks are acquired and released sequentially, never
     // held together (design D-4): each clear is independent and
     // there is no atomicity story to tell across them — a
-    // concurrent ingest landing between the two clears is still
+    // concurrent ingest landing between the clears is still
     // visible after reset via whichever slot it populated.
     match store.lock() {
         Ok(mut guard) => guard.clear(),
@@ -244,6 +309,14 @@ fn handle_debug_reset(request: Request, store: &Store, last_headers: &LastHeader
         Err(err) => {
             eprintln!("stub-ingest: last_headers mutex poisoned: {err}");
             respond_status(request, 500, "last_headers mutex poisoned");
+            return;
+        }
+    }
+    match connections.lock() {
+        Ok(mut guard) => guard.clear(),
+        Err(err) => {
+            eprintln!("stub-ingest: connections mutex poisoned: {err}");
+            respond_status(request, 500, "connections mutex poisoned");
             return;
         }
     }
@@ -299,6 +372,57 @@ fn capture_headers(headers: &[Header]) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// Insert the request's `remote_addr` into the connection-set so
+/// `/debug/connection_count` reports the number of distinct TCP
+/// connections that reached `handle_ingest`. Returns `Err` only on
+/// mutex poison — the caller decides how to respond to that. A
+/// `None` `remote_addr` (theoretically possible on non-IP transports
+/// `tiny_http` does not currently support) is tolerated: we log one
+/// stderr line and skip the insert, so the count undercounts rather
+/// than panics. On Linux loopback the value is always `Some(_)`.
+fn record_connection(
+    remote_addr: Option<&SocketAddr>,
+    connections: &Connections,
+) -> Result<(), String> {
+    let Some(addr) = remote_addr.copied() else {
+        eprintln!(
+            "stub-ingest: remote_addr missing on ingest request; \
+             /debug/connection_count may undercount",
+        );
+        return Ok(());
+    };
+    let mut guard = connections.lock().map_err(|e| e.to_string())?;
+    guard.insert(addr);
+    Ok(())
+}
+
+/// `GET /debug/connection_count` — return the number of distinct
+/// ingest-path TCP connections as JSON `{"count": N}`. `0` on a
+/// freshly-spawned stub (zero is a meaningful count; see design
+/// D-3, no 404 here). The slot is cleared by `POST /debug/reset`.
+fn handle_debug_connection_count(request: Request, connections: &Connections) {
+    let count = match connections.lock() {
+        Ok(guard) => guard.len(),
+        Err(err) => {
+            eprintln!("stub-ingest: connections mutex poisoned: {err}");
+            respond_status(request, 500, "connections mutex poisoned");
+            return;
+        }
+    };
+    let body = match serde_json::to_vec(&CountBody { count }) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("stub-ingest: json encode error: {err}");
+            respond_status(request, 500, "json encode failure");
+            return;
+        }
+    };
+    let response = Response::from_data(body).with_header(json_header());
+    if let Err(err) = request.respond(response) {
+        eprintln!("stub-ingest: respond error: {err}");
+    }
 }
 
 /// Design D-7: byte-equal compare, **not** constant-time. The stub is
