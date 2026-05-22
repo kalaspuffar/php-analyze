@@ -196,8 +196,14 @@ pub(crate) fn with_current_trace<R>(f: impl FnOnce(&mut Trace) -> R) -> Option<R
 /// The four clock/memory values captured at call entry by the begin
 /// handler. Passed through to `begin_with_snapshots` so unit tests can
 /// inject deterministic values without invoking the real syscalls.
+/// `pub` (not `pub(crate)`) so `lib.rs::bench_seam` can re-export
+/// it for the criterion benches under `crates/php-analyze/benches/`.
+/// External Rust consumers have no reason to construct or consume
+/// this — it exists as a `pub` item only to satisfy Rust's
+/// visibility rules for the bench-seam `pub use`. See
+/// `bench-criterion-skeleton`'s `design.md` D-1 (revised).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct EntrySnapshots {
+pub struct EntrySnapshots {
     pub t_in_ns: i64,
     pub cpu_u_in_ns: i64,
     pub cpu_s_in_ns: i64,
@@ -219,8 +225,9 @@ impl EntrySnapshots {
 
 /// The four clock/memory values captured at call exit by the end
 /// handler. Same role as [`EntrySnapshots`] for `end_with_snapshots`.
+/// `pub` for the same bench-seam reason as [`EntrySnapshots`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExitSnapshots {
+pub struct ExitSnapshots {
     pub t_out_ns: i64,
     pub cpu_u_now_ns: i64,
     pub cpu_s_now_ns: i64,
@@ -253,8 +260,9 @@ impl ExitSnapshots {
 /// payload becomes an owned `String` with U+FFFD substituted for the
 /// invalid bytes. The recorder's hot path is unchanged in the common
 /// (UTF-8) case.
+/// `pub` for the same bench-seam reason as [`EntrySnapshots`].
 #[derive(Clone, Debug)]
-pub(crate) struct RawCallSite<'a> {
+pub struct RawCallSite<'a> {
     pub function_name: Option<std::borrow::Cow<'a, str>>,
     pub class_name: Option<std::borrow::Cow<'a, str>>,
     pub filename: Option<std::borrow::Cow<'a, str>>,
@@ -391,8 +399,9 @@ unsafe fn zend_string_to_cow<'a>(zs: *mut ffi::zend_string) -> Option<std::borro
 /// owned `String`s. They are turned into owned `String`s lazily
 /// inside the dictionary's `intern` build closure (only on a
 /// dictionary miss).
+/// `pub` for the same bench-seam reason as [`EntrySnapshots`].
 #[derive(Debug)]
-pub(crate) struct Categorised<'a> {
+pub struct Categorised<'a> {
     pub key: FunctionKey,
     pub kind: FunctionKind,
     pub fqn: std::borrow::Cow<'a, str>,
@@ -429,7 +438,9 @@ pub(crate) struct Categorised<'a> {
 /// `execute_data` slot within one request is a known collision, but
 /// it's bounded and recognisable; the previous "everything is one"
 /// behaviour was not.
-pub(crate) fn categorise<'a>(info: &'a RawCallSite<'a>) -> Categorised<'a> {
+// `pub` (not `pub(crate)`) for the bench-seam re-export. See the
+// note on `EntrySnapshots` for the rationale.
+pub fn categorise<'a>(info: &'a RawCallSite<'a>) -> Categorised<'a> {
     use std::borrow::Cow;
     use std::sync::Arc;
 
@@ -640,7 +651,9 @@ impl FcallObserver for Recorder {
 ///    push the `CallFrame`. The record's own `CALL_RECORD_FIXED_BYTES`
 ///    contribution is billed at end time inside
 ///    [`Trace::push_record`] (design D-3).
-pub(crate) fn begin_with_snapshots(
+// `pub` (not `pub(crate)`) for the bench-seam re-export. See the
+// note on `EntrySnapshots` for the rationale.
+pub fn begin_with_snapshots(
     trace: &mut Trace,
     categorised: &Categorised<'_>,
     snapshots: EntrySnapshots,
@@ -746,7 +759,9 @@ fn dict_miss_cost(trace: &Trace, categorised: &Categorised<'_>) -> usize {
 ///   return without popping or emitting.
 /// - Otherwise, pop the frame and dispatch to [`finish_call_record`]
 ///   for the slice-2 accept path.
-pub(crate) fn end_with_snapshots(trace: &mut Trace, snapshots: ExitSnapshots, abnormal: bool) {
+// `pub` (not `pub(crate)`) for the bench-seam re-export. See the
+// note on `EntrySnapshots` for the rationale.
+pub fn end_with_snapshots(trace: &mut Trace, snapshots: ExitSnapshots, abnormal: bool) {
     // Decrement first so the depth is consistent for any caller that
     // observes `virtual_depth` mid-pop. `saturating_sub` defends an
     // adversarial-end-before-begin sequence (test 10.3); in well-formed
