@@ -52,6 +52,25 @@ pub(super) enum AttemptOutcome {
     Failed(DropReason),
 }
 
+/// Compose two optional deadlines into the *sooner* one. Returns
+/// `Some(min(a, b))` when both are `Some`; returns whichever is
+/// `Some` when only one is; returns `None` when both are `None`.
+///
+/// Used inside [`RmpEncodeAndHttpPost::handle`] to fold the
+/// caller-supplied per-call deadline (from `OnBatch::handle`'s
+/// signature) together with a fresh `drain_deadline_snapshot()`
+/// read on every `run_with_retry` iteration. The result is
+/// monotonically tighter than either input alone, so the
+/// post-drain code path's existing deadline contract is preserved
+/// (the cell only ever tightens an already-tight deadline; in
+/// practice they're equal by construction).
+pub(super) fn sooner(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(x.min(y)),
+    }
+}
+
 /// `SPECIFICATION.md` §5.2: open-loop exponential backoff. Sleep
 /// `retry_backoff_ms × 2^attempt` between attempt `attempt` and
 /// attempt `attempt + 1`. `attempt = 0` is the sleep after the first
@@ -76,21 +95,39 @@ pub(super) fn backoff_duration(retry_backoff_ms: u32, attempt: u32) -> Duration 
 ///   - Otherwise sleep `backoff_duration(retry_backoff_ms, attempt)`
 ///     (via `sleep_fn` — passed in so tests can replace it with a
 ///     no-op) and continue.
-/// - If `deadline` is `Some(d)` and the loop is about to sleep past
-///   `d`, OR is about to start an attempt at `t >= d`, return
-///   `OnBatchOutcome::Dropped { reason: DeadlineExceeded, attempts }`.
+/// - If `deadline_fn()` returns `Some(d)` and the loop is about to
+///   sleep past `d`, OR is about to start an attempt at `t >= d`,
+///   return `OnBatchOutcome::Dropped { reason: DeadlineExceeded,
+///   attempts }`.
+///
+/// The deadline is supplied as a *closure* (rather than a static
+/// `Option<Instant>`) so it can be re-read on every iteration.
+/// This closes the C-18 gap from `COMMENTS.md` §3: a
+/// `DRAIN_DEADLINE` cell published by `MSHUTDOWN` *after* the
+/// shipper dequeued a batch in the pre-drain code path was
+/// previously masked by a static `None` parameter; the per-iteration
+/// re-read now picks up such a deadline on the next attempt
+/// boundary. The closure is called once per iteration; the returned
+/// `Option<Instant>` is then used for both the head-of-iteration
+/// `now() >= d` check and the between-attempts `now() + sleep >= d`
+/// check (one stable snapshot per iteration).
 ///
 /// Pure with respect to the network: the only impure inputs are
-/// `attempt` and `sleep_fn`. Tests pass deterministic closures.
+/// `attempt`, `sleep_fn`, `now`, and `deadline_fn`. Tests pass
+/// deterministic closures.
 pub(super) fn run_with_retry(
     retry_count: u32,
     retry_backoff_ms: u32,
-    deadline: Option<Instant>,
+    deadline_fn: impl Fn() -> Option<Instant>,
     now: impl Fn() -> Instant,
     mut attempt: impl FnMut(u32) -> AttemptOutcome,
     mut sleep_fn: impl FnMut(Duration),
 ) -> OnBatchOutcome {
     for attempt_idx in 0..=retry_count {
+        // Re-read the deadline on every iteration so a cell published
+        // mid-batch is honored on the next attempt boundary (C-18).
+        // The snapshot is stable for the rest of this iteration.
+        let deadline = deadline_fn();
         // Deadline check before launching an attempt. The slice-1
         // deadline-pass arm already drains the residual queue;
         // here we surface a per-batch DeadlineExceeded so the
@@ -231,10 +268,24 @@ impl OnBatch for RmpEncodeAndHttpPost {
             }
         };
 
+        // Compose the caller-supplied `deadline` parameter (carried
+        // through `OnBatch::handle`) with a fresh
+        // `drain_deadline_snapshot()` per iteration. The composition
+        // takes the *sooner* of the two `Some` values; whichever is
+        // `Some` if only one is. The cell read is the safety net for
+        // the C-18 case where MSHUTDOWN publishes the deadline
+        // *after* the shipper dequeued this batch in the pre-drain
+        // code path — the `deadline` parameter is `None` there, and
+        // the closure picks up the live cell. In the post-drain
+        // code path, both values agree by construction (the cell
+        // and the `Drain { deadline }` message carry the same
+        // `Instant`), so `sooner` is a no-op redundancy.
+        let effective_deadline = || sooner(deadline, crate::shipper::drain_deadline_snapshot());
+
         run_with_retry(
             self.retry_count,
             self.retry_backoff_ms,
-            deadline,
+            effective_deadline,
             Instant::now,
             attempt,
             thread::sleep,
@@ -385,7 +436,7 @@ mod tests {
         let outcome = run_with_retry(
             3,
             200,
-            None,
+            || None,
             Instant::now,
             |i| script.next(i),
             |_| sleeps.set(sleeps.get() + 1),
@@ -409,7 +460,7 @@ mod tests {
         let outcome = run_with_retry(
             3,
             50,
-            None,
+            || None,
             Instant::now,
             |i| script.next(i),
             |_| sleeps.set(sleeps.get() + 1),
@@ -425,7 +476,7 @@ mod tests {
         let outcome = run_with_retry(
             3,
             10,
-            None,
+            || None,
             Instant::now,
             |i| script.next(i),
             |_| {}, // no-sleep fake
@@ -448,7 +499,7 @@ mod tests {
             AttemptOutcome::Failed(DropReason::HttpStatus(503)),
             AttemptOutcome::Failed(DropReason::Timeout),
         ]);
-        let outcome = run_with_retry(1, 10, None, Instant::now, |i| script.next(i), |_| {});
+        let outcome = run_with_retry(1, 10, || None, Instant::now, |i| script.next(i), |_| {});
         assert_eq!(
             outcome,
             OnBatchOutcome::Dropped {
@@ -468,7 +519,7 @@ mod tests {
         let outcome = run_with_retry(
             3,
             200,
-            Some(deadline),
+            move || Some(deadline),
             move || now,
             |i| script.next(i),
             |_| {},
@@ -500,7 +551,7 @@ mod tests {
         let outcome = run_with_retry(
             3,
             200, // first sleep is 200ms >> 10ms deadline window
-            Some(deadline),
+            move || Some(deadline),
             move || now_clone.get(),
             |i| {
                 let o = script.next(i);
@@ -517,6 +568,75 @@ mod tests {
                 reason: DropReason::DeadlineExceeded,
                 attempts: 1,
             },
+        );
+    }
+
+    #[test]
+    fn run_with_retry_honors_deadline_cell_published_mid_loop() {
+        // C-18 binding: the deadline closure returns `None` on the
+        // first iteration (no deadline known yet — simulates the
+        // pre-drain code path picking up a batch before MSHUTDOWN
+        // fires), then flips to `Some(d)` after the first attempt
+        // runs. The next iteration's deadline check sees `Some(d)`
+        // with `d <= now`, so the loop returns DeadlineExceeded
+        // *without* exhausting the full retry budget.
+        //
+        // Without the per-iteration closure re-read (the C-18 bug),
+        // the loop would consume `retry_count + 1 = 4` attempts and
+        // return `OnBatchOutcome::Dropped { reason: HttpStatus(500),
+        // attempts: 4 }` instead.
+        // All closures borrow the `Cell`s rather than capture them
+        // by move. `Cell::clone` creates an independent cell — a
+        // clone seeded by the original's value but tracking its own
+        // state thereafter — so the move-and-clone pattern used by
+        // the test above doesn't share mutations across closures.
+        // For this test we *need* the now/deadline mutations done
+        // in the attempt closure to be visible to the deadline/clock
+        // closures on the next iteration, so shared borrows are the
+        // simpler approach.
+        let now = Cell::new(Instant::now());
+        let deadline_published = Cell::new(false);
+        let script = Script::new(vec![
+            AttemptOutcome::Failed(DropReason::HttpStatus(500)),
+            AttemptOutcome::Sent, // never reached if the C-18 fix works
+            AttemptOutcome::Sent,
+            AttemptOutcome::Sent,
+        ]);
+        let publish_at = now.get() + Duration::from_millis(20);
+        // Already-past deadline so the head-of-iteration check
+        // `now() >= d` trips on iteration 1.
+        let published_deadline = publish_at - Duration::from_millis(5);
+
+        let outcome = run_with_retry(
+            3,
+            10,
+            || {
+                if deadline_published.get() {
+                    Some(published_deadline)
+                } else {
+                    None
+                }
+            },
+            || now.get(),
+            |i| {
+                let o = script.next(i);
+                // Simulate MSHUTDOWN publishing the cell during the
+                // window between attempt 0 returning and the next
+                // iteration's deadline_fn() call.
+                now.set(publish_at);
+                deadline_published.set(true);
+                o
+            },
+            |_| {}, // no-sleep fake
+        );
+        assert_eq!(
+            outcome,
+            OnBatchOutcome::Dropped {
+                reason: DropReason::DeadlineExceeded,
+                attempts: 1,
+            },
+            "C-18: a deadline that flips from None to Some mid-loop \
+             must be honored on the next iteration",
         );
     }
 
