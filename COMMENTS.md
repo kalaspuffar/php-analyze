@@ -843,8 +843,8 @@ this framing as follows:
 | #1 builds for 8.3 + 8.4 | yes | ✓ done |
 | #2 CLI + FPM SAPIs | yes | ✗ FPM unverified — see §6.3 |
 | #3a emits §4 batches | yes (the format) | ✓ done |
-| #3b ≥99.5% coverage vs Xdebug | yes (data quality) | ✗ unbound — see §6.3 |
-| #3c ±5% timing vs Xdebug | yes (data quality) | ✗ unbound — see §6.3 |
+| #3b ≥99.5% coverage vs Xdebug | yes (data quality) | spot-checked (`xdebug-spot-check`) |
+| #3c ±5% timing vs Xdebug | yes (data quality) | spot-checked (`xdebug-spot-check`) |
 | #3d geo-mean ≤ 2.0× | no (downstream perf concern) | not for MVP |
 | #4 network failure | yes (the HTTP contract) | ✓ done |
 | #5 exception unwind | yes (data quality) | ✓ done |

@@ -1,0 +1,7 @@
+# Per-run working directory written by `run.sh`. Contains the
+# Xdebug `.xt` trace, the captured stub-ingest JSON, and the
+# per-test `php.ini` files. Useful for re-running `compare.py`
+# without re-invoking PHP, but never part of git history — the
+# `.xt` file alone can be tens of MiB on a real workload, and
+# the JSON is regenerated on every `run.sh` invocation.
+last-run/
