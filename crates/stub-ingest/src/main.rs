@@ -29,6 +29,8 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -138,7 +140,39 @@ struct Args {
     /// `handle_ingest` sleeps.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
     simulate_slow: u64,
+
+    /// Write each successfully-validated POST body to
+    /// `<path>/batch-NNNN.msgpack` (4-digit zero-padded
+    /// monotonic counter, starting at `0001`). When set, the
+    /// directory MUST already exist and MUST be writable —
+    /// the stub validates at startup and exits non-zero if
+    /// not. The captured bytes are byte-identical to what the
+    /// client POSTed (NO `rmp_serde` round-trip).
+    ///
+    /// The flag composes with `--respond-with <N>` and
+    /// `--simulate-slow <ms>`: capture happens BEFORE both
+    /// (so even configured-failure responses still capture
+    /// their accepted bodies). A per-POST write failure
+    /// surfaces as a `500` response and a stderr `eprintln!`;
+    /// the in-memory store is NOT updated on capture failure
+    /// (the "successful capture = successful store"
+    /// invariant).
+    ///
+    /// Used by `tools/capture-fixtures.sh` to populate
+    /// `tools/captured-batches/<workload>/` with real
+    /// wire-format reference bytes for downstream parser
+    /// tests (e.g. `../php-tree-visualizer`). See
+    /// `capture-reference-batches`' `design.md` D-1 / D-2.
+    #[arg(long)]
+    capture_dir: Option<PathBuf>,
 }
+
+/// Monotonic counter for `--capture-dir` filename generation.
+/// Process-global so concurrent POSTs (impossible today, since
+/// the stub serialises on its mutex, but defensive against
+/// future relaxation) cannot produce duplicate filenames. The
+/// counter resets only on a fresh `stub-ingest` process.
+static CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     if let Err(err) = run(Args::parse()) {
@@ -148,6 +182,14 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    // Validate `--capture-dir` BEFORE binding the listen socket
+    // so a misconfigured path fails fast: the test harness
+    // hasn't yet read the `bound:` line, so a non-zero exit
+    // here doesn't leak an orphaned port-bound process.
+    if let Some(dir) = args.capture_dir.as_deref() {
+        validate_capture_dir(dir)?;
+    }
+
     let server = Server::http(&args.bind).map_err(|e| format!("bind {}: {e}", args.bind))?;
     let bound = server
         .server_addr()
@@ -286,6 +328,27 @@ fn handle_ingest(
         }
     };
 
+    // `--capture-dir`: write the body bytes verbatim BEFORE
+    // updating the in-memory store. Write-failure ⇒ 500 + no
+    // store update ⇒ the "successful capture = successful
+    // store" invariant holds (design D-1 + capability spec's
+    // mid-run-write-failure scenario). The body bytes are the
+    // unmodified POST body (we never re-encode `batch` for the
+    // capture; the captured file is byte-identical to the
+    // wire).
+    if let Some(dir) = args.capture_dir.as_deref() {
+        if let Err(err) = write_captured_batch(dir, &body) {
+            respond_status(request, 500, "capture write failed");
+            // Do NOT push to the store on a failed capture.
+            // The caller (`tools/capture-fixtures.sh`) wants
+            // every committed file to correspond to a stored
+            // batch; surfacing the failure on both sides keeps
+            // the invariant simple.
+            let _ = err;
+            return;
+        }
+    }
+
     match store.lock() {
         Ok(mut guard) => guard.push(batch),
         Err(err) => {
@@ -418,6 +481,54 @@ fn handle_debug_last_request_headers(request: Request, last_headers: &LastHeader
     if let Err(err) = request.respond(response) {
         eprintln!("stub-ingest: respond error: {err}");
     }
+}
+
+/// Validate that `--capture-dir <dir>` names a usable directory.
+/// Run BEFORE binding the listen socket so a misconfigured path
+/// surfaces as a clean exit-2 with a single stderr line, with
+/// no orphaned port-bound process for the test harness to
+/// clean up. Two checks: (a) the path exists and is a directory,
+/// (b) probe-writability via `tempfile_in` — checking `metadata`
+/// permission bits doesn't reflect mount-options / ACLs / strict
+/// SELinux labels accurately, and a probe write does. The probe
+/// file is cleaned up immediately after the write succeeds.
+fn validate_capture_dir(dir: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(dir)
+        .map_err(|e| format!("--capture-dir: cannot read {}: {e}", dir.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "--capture-dir: {} exists but is not a directory",
+            dir.display()
+        ));
+    }
+    let probe = dir.join(".stub-ingest-capture-probe");
+    std::fs::write(&probe, b"probe")
+        .map_err(|e| format!("--capture-dir: {} is not writable: {e}", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Write one captured POST body to `<dir>/batch-NNNN.msgpack`
+/// where `NNNN` is the next monotonic value of the
+/// process-global [`CAPTURE_COUNTER`]. Returns the filename
+/// path that was written on success; returns `Err` (with the
+/// path it tried) on filesystem failure, leaving the counter
+/// already incremented — counter monotonicity matters more
+/// than "no gaps on failure", and a failed write doesn't roll
+/// back the increment because a concurrent successful write
+/// might have already used the next number.
+fn write_captured_batch(dir: &Path, body: &[u8]) -> Result<PathBuf, String> {
+    let n = CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let filename = format!("batch-{n:04}.msgpack");
+    let path = dir.join(&filename);
+    std::fs::write(&path, body).map_err(|e| {
+        eprintln!(
+            "stub-ingest: capture write to {} failed: {e}",
+            path.display()
+        );
+        format!("write {}: {e}", path.display())
+    })?;
+    Ok(path)
 }
 
 /// Convert the request's headers into an owned, JSON-friendly

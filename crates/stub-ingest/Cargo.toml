@@ -48,6 +48,10 @@ clap = { version = "4", features = ["derive"] }
 # pinning it as a dev-dep here adds zero new crates to the resolve
 # graph.
 ureq = "3"
+# `tempfile::TempDir` provides the per-test scratch directory the
+# `--capture-dir` tests write to. Already a dev-dep of `php-analyze`,
+# so the resolve graph doesn't grow.
+tempfile = "3"
 
 [lints]
 workspace = true

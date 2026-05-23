@@ -733,9 +733,11 @@ fn debug_reset_clears_the_captured_headers_slot() {
 fn readme_documents_the_five_routes_the_bind_protocol_respond_with_and_simulate_slow() {
     // `include_str!` is resolved at compile time relative to this
     // test source file, so the README's content is pinned into the
-    // test binary alongside the assertions. The nine substrings
-    // come straight from the `stub-ingest-server/spec.md` scenario
-    // (widened from eight → nine by `stub-ingest-slow-mode`).
+    // test binary alongside the assertions. The substrings come
+    // straight from the `stub-ingest-server/spec.md` scenarios
+    // (widened from eight → nine by `stub-ingest-slow-mode`, then
+    // nine → ten by `capture-reference-batches` to cover the new
+    // `--capture-dir` flag).
     let readme = include_str!("../README.md");
     for needle in [
         "POST /v1/ingest",
@@ -746,6 +748,7 @@ fn readme_documents_the_five_routes_the_bind_protocol_respond_with_and_simulate_
         "--bind",
         "--respond-with",
         "--simulate-slow",
+        "--capture-dir",
         "bound:",
     ] {
         assert!(
@@ -1183,5 +1186,167 @@ fn client_with_short_timeout_against_slow_stub_times_out_at_the_client_budget() 
         elapsed < Duration::from_millis(1000),
         "the client must time out near its 200ms budget, not at the stub's 5000ms sleep; \
          elapsed = {elapsed:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--capture-dir` tests (`capture-reference-batches` change).
+// ---------------------------------------------------------------------------
+
+/// Spawn the stub with a configured `--capture-dir <path>` plus
+/// the default `--auth-token` / `--bind 127.0.0.1:0`. Used by
+/// the capture-reference-batches tests below.
+fn spawn_stub_with_capture_dir(
+    token: &str,
+    capture_dir: &std::path::Path,
+) -> (ChildGuard, SocketAddr) {
+    let dir_str = capture_dir.to_str().expect("capture-dir is UTF-8");
+    spawn_stub_with_args(token, "127.0.0.1:0", &["--capture-dir", dir_str])
+}
+
+/// Spawn the stub with both `--capture-dir` and `--respond-with`.
+/// Asserts the two flags compose: capture happens before the
+/// configured failure status is returned.
+fn spawn_stub_with_capture_and_respond_with(
+    token: &str,
+    capture_dir: &std::path::Path,
+    respond_with: u16,
+) -> (ChildGuard, SocketAddr) {
+    let dir_str = capture_dir.to_str().expect("capture-dir is UTF-8");
+    let status = respond_with.to_string();
+    spawn_stub_with_args(
+        token,
+        "127.0.0.1:0",
+        &["--capture-dir", dir_str, "--respond-with", &status],
+    )
+}
+
+#[test]
+fn capture_dir_writes_one_msgpack_per_accepted_post() {
+    let token = "capture-token-happy";
+    let tmpdir = tempfile::TempDir::new().expect("tempdir");
+    let (_guard, addr) = spawn_stub_with_capture_dir(token, tmpdir.path());
+    let agent = ureq_agent_no_status_err();
+
+    // POST three pre-encoded batches with distinct pids so the
+    // bytes differ between captures and we can assert each
+    // file's content equals the matching source.
+    let bodies: Vec<Vec<u8>> = (101..=103)
+        .map(|pid| rmp_serde::to_vec_named(&sample_batch_with_pid(pid)).expect("encode"))
+        .collect();
+    for body in &bodies {
+        let resp = post_batch_with_headers(
+            &agent,
+            addr,
+            Some(&format!("Bearer {token}")),
+            wire::MEDIA_TYPE,
+            body.clone(),
+        );
+        assert_eq!(resp.status().as_u16(), 200, "happy-path POST returns 200");
+    }
+
+    // Expect three files named `batch-0001.msgpack`,
+    // `batch-0002.msgpack`, `batch-0003.msgpack`, in arrival
+    // order, with body bytes byte-equal to what we POSTed.
+    for (i, body) in bodies.iter().enumerate() {
+        let expected_name = format!("batch-{:04}.msgpack", i + 1);
+        let path = tmpdir.path().join(&expected_name);
+        let captured = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("read {}: {e}", path.display());
+        });
+        assert_eq!(
+            captured, *body,
+            "capture file {expected_name} should equal posted body byte-for-byte"
+        );
+    }
+
+    // The in-memory store also grew to 3 (same as today's
+    // behaviour — capture is additive, not a replacement).
+    let snapshot = fetch_batches(&agent, addr);
+    assert_eq!(
+        snapshot.len(),
+        3,
+        "store grew to 3 entries alongside the captures"
+    );
+}
+
+#[test]
+fn capture_dir_on_missing_path_exits_non_zero_before_binding() {
+    // A path guaranteed not to exist. The test never reaches a
+    // ChildGuard for cleanup — the child should exit before
+    // emitting its `bound:` line, so the test waits on the
+    // process directly.
+    let bogus = format!(
+        "/tmp/stub-ingest-capture-no-such-dir-{}",
+        std::process::id()
+    );
+    let bin = env!("CARGO_BIN_EXE_stub-ingest");
+    let output = Command::new(bin)
+        .args([
+            "--auth-token",
+            "x",
+            "--bind",
+            "127.0.0.1:0",
+            "--capture-dir",
+            &bogus,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn stub-ingest");
+
+    assert!(
+        !output.status.success(),
+        "missing --capture-dir path must exit non-zero; got status {:?}",
+        output.status
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stub must NOT print `bound:` before the listen socket binds; got stdout {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--capture-dir") && stderr.contains(&bogus),
+        "stderr should name the failed --capture-dir + the offending path; got: {stderr:?}",
+    );
+}
+
+#[test]
+fn capture_dir_composes_with_respond_with_500() {
+    let token = "capture-token-compose-500";
+    let tmpdir = tempfile::TempDir::new().expect("tempdir");
+    let (_guard, addr) = spawn_stub_with_capture_and_respond_with(token, tmpdir.path(), 500);
+    let agent = ureq_agent_no_status_err();
+
+    let body = rmp_serde::to_vec_named(&sample_batch_with_pid(42)).expect("encode");
+    let resp = post_batch_with_headers(
+        &agent,
+        addr,
+        Some(&format!("Bearer {token}")),
+        wire::MEDIA_TYPE,
+        body.clone(),
+    );
+    assert_eq!(
+        resp.status().as_u16(),
+        500,
+        "configured --respond-with 500 takes precedence over the default 200",
+    );
+
+    // The capture file landed on disk despite the 500 response.
+    let captured = std::fs::read(tmpdir.path().join("batch-0001.msgpack"))
+        .expect("capture file should exist even on the configured-500 path");
+    assert_eq!(
+        captured, body,
+        "capture is byte-identical to the POSTed body regardless of response status",
+    );
+
+    // The in-memory store also grew (per the existing
+    // store-before-response ordering).
+    let snapshot = fetch_batches(&agent, addr);
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "store grew to 1 entry alongside the configured-500 response",
     );
 }
