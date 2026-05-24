@@ -546,29 +546,39 @@ fn build_request_identity() -> RequestIdentity {
                 .to_owned()
         }
     };
-    let request_uri = {
+    let (request_uri, argv0, path_translated) = {
         let globals = SapiGlobals::get();
         let info = globals.request_info();
-        info.request_uri()
-            .map(str::to_owned)
-            .or_else(|| info.argv0().map(str::to_owned))
+        (
+            info.request_uri().map(str::to_owned),
+            info.argv0().map(str::to_owned),
+            info.path_translated().map(str::to_owned),
+        )
     };
     let host = read_hostname();
-    request_identity_from_sapi(&sapi_name, request_uri.as_deref(), host.as_deref())
+    request_identity_from_sapi(
+        &sapi_name,
+        request_uri.as_deref(),
+        argv0.as_deref(),
+        path_translated.as_deref(),
+        host.as_deref(),
+    )
 }
 
 /// Pure helper: assemble a [`RequestIdentity`] from string inputs and
 /// the process PID. Factored out of [`build_request_identity`] so unit
 /// tests can exercise the value-building without acquiring PHP locks.
 ///
-/// `request_uri` is the SAPI-resolved URI when present (FPM populates
-/// `SG(request_info).request_uri`; CLI populates `argv0`). When both
-/// are missing — exotic SAPI, or a request that hasn't reached its
-/// URI-parse stage — we fall back to a stable placeholder so the
-/// trace's `uri_or_script` is never empty.
+/// `uri_or_script` is resolved by trying each of `request_uri`,
+/// `argv0`, and `path_translated` in order — see
+/// [`resolve_uri_or_script`] for the rationale. The final fallback
+/// (`"(unknown-uri)"`) is preserved so the trace's `uri_or_script` is
+/// never empty even on exotic SAPIs.
 fn request_identity_from_sapi(
     sapi_name: &str,
     request_uri: Option<&str>,
+    argv0: Option<&str>,
+    path_translated: Option<&str>,
     hostname: Option<&str>,
 ) -> RequestIdentity {
     let host: Arc<str> = Arc::from(hostname.unwrap_or("(unknown-host)"));
@@ -577,13 +587,40 @@ fn request_identity_from_sapi(
     // field then carries the same `Arc<str>` for the trace's lifetime,
     // and `flush_into_pending_batch` clones it into every `MetaPartial`
     // it produces. See PF-1 in `COMMENTS.md`.
-    let uri_or_script: Arc<str> = Arc::from(request_uri.unwrap_or("(unknown-uri)"));
+    let resolved = resolve_uri_or_script(request_uri, argv0, path_translated);
+    let uri_or_script: Arc<str> = Arc::from(resolved);
     RequestIdentity {
         host,
         sapi,
         pid: std::process::id(),
         uri_or_script,
     }
+}
+
+/// Resolve `meta.uri_or_script` from the three SAPI-provided sources
+/// in priority order:
+///
+/// 1. `request_uri` — populated under FPM and other web SAPIs.
+/// 2. `argv0` — populated under PHP CLI in some PHP / ext-php-rs
+///    versions.
+/// 3. `path_translated` — the entry-script path PHP itself resolved
+///    at startup. Reliably populated under PHP 8.3 / 8.4 CLI even
+///    when `argv0` returns `None`.
+/// 4. The literal `"(unknown-uri)"` placeholder — final fallback
+///    for exotic SAPIs or genuinely-missing entry-script
+///    information.
+///
+/// Split out as a pure free function so unit tests can drive each
+/// fallback path independently without acquiring PHP locks.
+fn resolve_uri_or_script<'a>(
+    request_uri: Option<&'a str>,
+    argv0: Option<&'a str>,
+    path_translated: Option<&'a str>,
+) -> &'a str {
+    request_uri
+        .or(argv0)
+        .or(path_translated)
+        .unwrap_or("(unknown-uri)")
 }
 
 /// Read the host name via `gethostname(3)`. Returns `None` on failure
@@ -1405,6 +1442,46 @@ mod tests {
         );
     }
 
+    // --- resolve_uri_or_script (the pure fallback chain) -----------------
+
+    #[test]
+    fn resolve_uri_or_script_prefers_request_uri_when_present() {
+        let resolved = resolve_uri_or_script(
+            Some("/api/v1/users?page=2"),
+            Some("/usr/local/bin/my-script.php"),
+            Some("/var/www/index.php"),
+        );
+        assert_eq!(resolved, "/api/v1/users?page=2");
+    }
+
+    #[test]
+    fn resolve_uri_or_script_prefers_argv0_over_path_translated() {
+        // Regression guard: under CLI with both `argv0` and
+        // `path_translated` populated, the chain SHALL keep using
+        // `argv0` (preserves today's CLI-with-argv0 behaviour).
+        let resolved = resolve_uri_or_script(
+            None,
+            Some("/usr/local/bin/php-script.php"),
+            Some("/different/path.php"),
+        );
+        assert_eq!(resolved, "/usr/local/bin/php-script.php");
+    }
+
+    #[test]
+    fn resolve_uri_or_script_falls_back_to_path_translated_under_cli_8_4() {
+        // The defect this change exists to fix: under PHP 8.4 CLI,
+        // `request_uri` and `argv0` both return `None`, but
+        // `path_translated` carries the script path.
+        let resolved = resolve_uri_or_script(None, None, Some("/usr/local/bin/my-script.php"));
+        assert_eq!(resolved, "/usr/local/bin/my-script.php");
+    }
+
+    #[test]
+    fn resolve_uri_or_script_uses_the_placeholder_when_every_source_is_missing() {
+        let resolved = resolve_uri_or_script(None, None, None);
+        assert_eq!(resolved, "(unknown-uri)");
+    }
+
     // --- request_identity_from_sapi ---------------------------------------
 
     #[test]
@@ -1412,6 +1489,8 @@ mod tests {
         let id = request_identity_from_sapi(
             "fpm-fcgi",
             Some("/api/v1/users?page=2"),
+            None,
+            None,
             Some("worker-7.prod"),
         );
         assert_eq!(&*id.sapi, "fpm-fcgi");
@@ -1422,12 +1501,13 @@ mod tests {
 
     #[test]
     fn request_identity_from_sapi_falls_back_to_argv_under_cli() {
-        // Under CLI we pass argv0 in the `request_uri` slot per the
-        // FFI caller in `build_request_identity` (it tries
-        // `request_info.request_uri()` first then `argv0()`).
+        // Under CLI with argv0 populated (the historical good case),
+        // the resolver picks argv0 over path_translated.
         let id = request_identity_from_sapi(
             "cli",
+            None,
             Some("/usr/local/bin/my-script.php"),
+            Some("/should/not/win.php"),
             Some("dev-laptop"),
         );
         assert_eq!(&*id.sapi, "cli");
@@ -1435,11 +1515,24 @@ mod tests {
     }
 
     #[test]
+    fn request_identity_from_sapi_falls_back_to_path_translated_under_cli_when_argv0_is_none() {
+        // The PHP-8.4-CLI case this change exists to fix.
+        let id = request_identity_from_sapi(
+            "cli",
+            None,
+            None,
+            Some("/usr/local/bin/php-8-4-script.php"),
+            Some("dev-laptop"),
+        );
+        assert_eq!(&*id.uri_or_script, "/usr/local/bin/php-8-4-script.php");
+    }
+
+    #[test]
     fn request_identity_from_sapi_uses_placeholders_when_inputs_are_missing() {
         // Defensive: a non-CLI/non-FPM SAPI with no request URI must
         // still produce a usable RequestIdentity (no panic, no empty
         // strings the wire format would have to special-case later).
-        let id = request_identity_from_sapi("apache2handler", None, None);
+        let id = request_identity_from_sapi("apache2handler", None, None, None, None);
         assert_eq!(&*id.sapi, "apache2handler");
         assert_eq!(&*id.uri_or_script, "(unknown-uri)");
         assert_eq!(&*id.host, "(unknown-host)");
@@ -1450,7 +1543,7 @@ mod tests {
         // The host name read here is whatever `gethostname` returns
         // on the test runner; we only assert it's populated.
         let host = read_hostname();
-        let id = request_identity_from_sapi("cli", Some("/x.php"), host.as_deref());
+        let id = request_identity_from_sapi("cli", Some("/x.php"), None, None, host.as_deref());
         assert_eq!(id.pid, std::process::id());
         assert!(!id.host.is_empty(), "host must be non-empty");
     }
