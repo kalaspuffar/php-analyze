@@ -283,6 +283,48 @@ pub struct CallFrame {
     pub mem_in_bytes: i64,
 }
 
+impl CallFrame {
+    /// Synthesize a [`CallRecord`] for a frame that is still on the
+    /// stack at MSHUTDOWN — i.e. one whose `end`-fcall observer
+    /// callback never fired. The `t_out_ns`, `cpu_*_now_ns`, and
+    /// `mem_out_bytes` arguments come from a single MSHUTDOWN-time
+    /// snapshot triple that the drain loop captures once and reuses
+    /// across every drained frame.
+    ///
+    /// `abnormal_exit` is hard-coded to `true`: per
+    /// `SPECIFICATION.md` §4.1.4 the field's intended meaning is
+    /// "function did not return normally", and a frame still open at
+    /// MSHUTDOWN is by definition not naturally ended.
+    ///
+    /// The CPU deltas use the same `saturating_sub(.).max(0)` pattern
+    /// as `observer::finish_call_record` (§3.2 "saturating, may be `0`
+    /// on monotonic-skew") so a clock-skew or `cpu_snapshot_mode=off`
+    /// configuration cannot produce a negative `cpu_*_ns`.
+    pub fn into_abnormal_call_record(
+        self,
+        t_out_ns: i64,
+        cpu_u_now_ns: i64,
+        cpu_s_now_ns: i64,
+        mem_out_bytes: i64,
+    ) -> CallRecord {
+        let cpu_u_ns = cpu_u_now_ns.saturating_sub(self.cpu_u_in_ns).max(0);
+        let cpu_s_ns = cpu_s_now_ns.saturating_sub(self.cpu_s_in_ns).max(0);
+        CallRecord {
+            call_id: self.call_id,
+            parent: self.parent,
+            fn_id: self.fn_id,
+            depth: self.depth,
+            t_in_ns: self.t_in_ns,
+            t_out_ns,
+            cpu_u_ns,
+            cpu_s_ns,
+            mem_in_bytes: self.mem_in_bytes,
+            mem_out_bytes,
+            abnormal_exit: true,
+        }
+    }
+}
+
 /// The metric record emitted at call exit. One per observed PHP call.
 ///
 /// Mirrors `SPECIFICATION.md` §4.1.4. Note the field names are the
