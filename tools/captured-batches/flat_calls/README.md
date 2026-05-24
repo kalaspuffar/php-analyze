@@ -31,11 +31,25 @@ Of the committed 3 batches × 10,000 records = 30,000 sample
 `noop` records, plus the script-body's single `closure:<file>:1`
 record (the first call in batch 1).
 
+The recorder's MSHUTDOWN drain (`SPECIFICATION.md` §3.2)
+emits the still-open script-body closure as a single
+`abnormal_exit = true` `CallRecord` with `(call_id=1,
+parent=0, depth=0)`. For `flat_calls`, that record lands in
+a drain batch that frequently gets channel-dropped at
+MSHUTDOWN on hosts where the shipper queue is saturated by
+the workload's 50+ steady-state batches, so the committed
+final batch sample (`batch-XXXX.msgpack`) may or may not
+contain it — see the smaller workloads (`json_batch/`,
+`recursive_walk/`) for fixtures that reliably carry the
+drained-root record.
+
 ## Committed sample
 
-- Recorder commit SHA at capture time: `c7924292ca4e`
+- Recorder commit SHA at capture time: `8b376d2c3afa`
 - Batches captured (full run): 54
-- Batches kept for git: 3 (the first three)
+- Batches kept for git: 3 (`batch-0001`, `batch-0002`, plus
+  the **final** batch — `batch-NNNN` where `NNNN` is the
+  highest count from the run)
 - File sizes: ~1 MB each
 
 The committed files are SAMPLES — see

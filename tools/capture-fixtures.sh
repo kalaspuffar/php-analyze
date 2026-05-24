@@ -210,42 +210,54 @@ EOF
 
     cleanup_stub
 
-    # Cap the committed set to the first N batches per workload.
-    # The full run produces many batches (e.g. flat_calls.php's
-    # 10⁶ calls produce ~50 batches of ~1 MB each). The
-    # visualizer's parser tests need only a handful of samples
-    # to verify their decoder; committing ~100 MB of binary
-    # fixtures per regen would grow the git history past any
-    # reasonable threshold. The first 3 batches give a small
-    # but meaningful set:
+    # Cap the committed set to a small representative sample per
+    # workload. The full run produces many batches (e.g.
+    # flat_calls.php's 10⁶ calls produce ~50 batches of ~1 MB
+    # each). Visualizer parser tests need only a handful of
+    # samples to verify their decoder; committing ~100 MB of
+    # binary fixtures per regen would grow the git history past
+    # any reasonable threshold.
+    #
+    # We keep batch-0001, batch-0002, and the **final** batch:
     #
     #   - Batch 1 is the recorder's first flush, which carries
     #     the script-body's `closure:<file>:1` dict entry plus
     #     a partial run of the workload's hot path.
-    #   - Batches 2 & 3 are steady-state mid-run flushes.
+    #   - Batch 2 is a steady-state mid-run flush.
+    #   - The final batch carries the MSHUTDOWN-drain output:
+    #     one `CallRecord` per still-open CallFrame, with
+    #     `abnormal_exit = true`. PHP's script-body closure is
+    #     the canonical case — it sits on the stack from script
+    #     start to MSHUTDOWN, so its record lands here as
+    #     `(call_id=1, parent=0, depth=0, abnormal_exit=true)`.
+    #     Without this sample the committed fixtures would not
+    #     reflect the drained-root wire shape that
+    #     `SPECIFICATION.md` §3.2 mandates.
     #
     # The downstream parser team can rerun
-    # `tools/capture-fixtures.sh` and bump the keep limit if
+    # `tools/capture-fixtures.sh` and adjust the keep policy if
     # they need more variety.
-    local keep=3
     local total
     total="$(find "$capture_dir" -maxdepth 1 -name 'batch-*.msgpack' -printf . 2>/dev/null | wc -c)"
-    if (( total > keep )); then
-        # `sort -t- -k2 -n` orders by the numeric NNNN suffix
-        # so we delete the highest-numbered (latest-arrival)
-        # files. The committed set is always batch-0001
-        # through batch-000N.
-        find "$capture_dir" -maxdepth 1 -name 'batch-*.msgpack' -printf '%f\n' \
-            | sort -t- -k2 -n \
-            | tail -n +$((keep + 1)) \
+    if (( total > 3 )); then
+        # Order files by their numeric NNNN suffix. Keep the
+        # first two and the last one; delete the rest.
+        local sorted
+        sorted="$(find "$capture_dir" -maxdepth 1 -name 'batch-*.msgpack' -printf '%f\n' \
+            | sort -t- -k2 -n)"
+        local first_two last
+        first_two="$(echo "$sorted" | head -n 2)"
+        last="$(echo "$sorted" | tail -n 1)"
+        echo "$sorted" \
+            | grep -vxF -e "$last" -e "$(echo "$first_two" | sed -n 1p)" -e "$(echo "$first_two" | sed -n 2p)" \
             | while read -r victim; do
-                rm -f "$capture_dir/$victim"
+                [ -n "$victim" ] && rm -f "$capture_dir/$victim"
             done
     fi
     local committed
     committed="$(find "$capture_dir" -maxdepth 1 -name 'batch-*.msgpack' -printf . 2>/dev/null | wc -c)"
     rm -f "$capture_dir/.run.stderr"
-    echo "==> $workload: captured $total batches, kept $committed for git"
+    echo "==> $workload: captured $total batches, kept $committed for git (first two + final)"
     return 0
 }
 
