@@ -79,6 +79,27 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+      # Enforce the shipped-cdylib size cap. The release profile is
+      # configured to strip DWARF and symbol tables; this step builds
+      # the actual artefact under `[profile.release]` and asserts its
+      # on-disk size stays under the cap. Pins the
+      # `project-documentation` requirement added by
+      # `release-profile-strip-debuginfo`; see `COMMENTS.md` C-20 for
+      # why `panic = "unwind"` must NOT be relaxed for further size
+      # wins. The cap is generous (5 MiB) versus the observed ~2.7 MiB
+      # so S-3 / S-4 follow-ups don't have to revise it.
+      - name: release build size cap (≤ 5 MiB)
+        run: |
+          cargo build --release -p php-analyze
+          OBSERVED=$(stat -c %s target/release/libphp_analyze.so)
+          CAP=5242880
+          echo "libphp_analyze.so: ${OBSERVED} bytes (cap: ${CAP} bytes / 5 MiB)"
+          if [ "${OBSERVED}" -gt "${CAP}" ]; then
+            echo "::error::libphp_analyze.so is ${OBSERVED} bytes; cap is ${CAP} bytes (5 MiB)."
+            echo "Inspect via: objdump -h target/release/libphp_analyze.so"
+            exit 1
+          fi
+
       # Keep the `recorder-dump` Cargo feature compiling. Slice 2's
       # integration tests use it; if no CI matrix entry exercises the
       # feature, slice-3 or later changes can accidentally break it
