@@ -156,6 +156,23 @@ const DIRECTIVES: &[Directive] = &[
         default: "per-call",
         redact_display: false,
     },
+    // Function-skip directives (`skip-functions-directive` / REVIEW.md
+    // P-0). The directive's `default: ""` is intentional: it signals
+    // "operator did not set this" so the config parser resolves to
+    // the curated `DEFAULT_SKIP_FUNCTIONS` list. An operator who
+    // explicitly sets `skip_functions = ""` is opting OUT of
+    // filtering — distinguished from "unset" by `Option<String>` in
+    // `RawIni`.
+    Directive {
+        name: "php_analyze.skip_functions",
+        default: "",
+        redact_display: false,
+    },
+    Directive {
+        name: "php_analyze.skip_internal",
+        default: "0",
+        redact_display: false,
+    },
 ];
 
 // --- Lifecycle hooks -------------------------------------------------------
@@ -731,6 +748,8 @@ fn raw_ini_from_ini_map(ini: &HashMap<String, Option<String>>) -> RawIni {
         shutdown_grace_ms: lookup_int("php_analyze.shutdown_grace_ms"),
         shipper_queue_depth: lookup_int("php_analyze.shipper_queue_depth"),
         cpu_snapshot_mode: lookup_str("php_analyze.cpu_snapshot_mode"),
+        skip_functions: lookup_str("php_analyze.skip_functions"),
+        skip_internal: lookup_bool("php_analyze.skip_internal"),
     }
 }
 
@@ -856,6 +875,19 @@ impl PhpInfoRenderer {
         rows.push((
             "php_analyze.cpu_snapshot_mode".to_owned(),
             c.cpu_snapshot_mode.as_ini_str().to_owned(),
+        ));
+        // Function-skip directives (skip-functions-directive / REVIEW.md P-0).
+        // The resolved set is sorted before joining so the same Config
+        // produces the same row regardless of HashSet iteration order.
+        let mut skip_names: Vec<&str> = c.skip_functions.iter().map(String::as_str).collect();
+        skip_names.sort_unstable();
+        rows.push((
+            "php_analyze.skip_functions".to_owned(),
+            skip_names.join(", "),
+        ));
+        rows.push((
+            "php_analyze.skip_internal".to_owned(),
+            if c.skip_internal { "On" } else { "Off" }.to_owned(),
         ));
     }
 }
@@ -1805,6 +1837,8 @@ mod tests {
             shutdown_grace: Duration::from_millis(5_000),
             shipper_queue_depth: 8,
             cpu_snapshot_mode: crate::config::CpuSnapshotMode::PerCall,
+            skip_functions: std::collections::HashSet::new(),
+            skip_internal: false,
         }
     }
 

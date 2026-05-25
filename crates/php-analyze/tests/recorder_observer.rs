@@ -160,6 +160,8 @@ fn try_run_all_fixtures(runner: &Path, fixtures_dir: &Path, binary: &str) -> boo
     // Phase-4 slice 2 fixtures:
     run_fixture_threshold_flush(runner, fixtures_dir, binary);
     run_fixture_empty_request(runner, fixtures_dir, binary);
+    // P-0 (`skip-functions-directive`) fixture:
+    run_fixture_skip_functions(runner, fixtures_dir, binary);
     true
 }
 
@@ -688,4 +690,83 @@ fn run_fixture_empty_request(runner: &Path, fixtures_dir: &Path, binary: &str) {
         parsed.calls.len(),
         parsed.calls,
     );
+}
+
+/// P-0 (`skip-functions-directive`) fixture. The fixture calls
+/// `strlen` and `count` (both on the curated default skip list) plus
+/// one user-defined `my_skip_fn_target`. The assertions pin:
+///
+/// 1. **No `strlen` or `count` records.** PHP's `should_observe`
+///    cache means the recorder's begin/end never even fires for
+///    these names — their dict entries don't exist, and their `C:`
+///    records don't exist.
+/// 2. **Exactly one `my_skip_fn_target` record.** The user-defined
+///    function is on neither the filter nor the skip-internal path.
+/// 3. **The dict only ever contains `my_skip_fn_target` (and the
+///    script body's closure entry).** No entries for default-skipped
+///    builtins.
+///
+/// This is intentionally distinct from `flat_calls.php`'s assertion
+/// shape: that fixture's `noop` is user-defined and unaffected by
+/// the default skip list, so its dump remains byte-equal post-P-0.
+fn run_fixture_skip_functions(runner: &Path, fixtures_dir: &Path, binary: &str) {
+    let parsed = run_fixture(runner, fixtures_dir, binary, "skip_functions.php", &[]);
+    assert_dropped_records(&parsed, 0, binary, "skip_functions.php");
+
+    // Spot-check: NO dict entries for default-skipped builtins.
+    for skipped in ["strlen", "count"] {
+        let hit = parsed.dict.iter().any(|d| d.fqn == skipped);
+        assert!(
+            !hit,
+            "{binary} skip_functions: default-skipped builtin `{skipped}` appeared \
+             in the dictionary; the should_observe filter should have suppressed it \
+             entirely (dict: {:?})",
+            parsed.dict,
+        );
+    }
+
+    // The user-defined `my_skip_fn_target` SHOULD appear in the dict
+    // exactly once.
+    let target_entries: Vec<_> = parsed
+        .dict
+        .iter()
+        .filter(|d| d.fqn == "my_skip_fn_target")
+        .collect();
+    assert_eq!(
+        target_entries.len(),
+        1,
+        "{binary} skip_functions: expected exactly one dict entry for \
+         `my_skip_fn_target`, got {} ({:?})",
+        target_entries.len(),
+        parsed.dict,
+    );
+
+    // And exactly one C: record for it.
+    let target_records = parsed
+        .calls
+        .iter()
+        .filter(|c| matches_function_dict(&parsed, c, "my_skip_fn_target"))
+        .count();
+    assert_eq!(
+        target_records, 1,
+        "{binary} skip_functions: expected exactly one record for \
+         `my_skip_fn_target`, got {target_records} (calls: {:?})",
+        parsed.calls,
+    );
+
+    // Belt-and-braces: NO record points at a `strlen` or `count` dict
+    // entry. (If the dict spot-check passed, this is also true by
+    // construction; the explicit check makes regression diagnosis
+    // easier.)
+    for skipped in ["strlen", "count"] {
+        let leaked = parsed
+            .calls
+            .iter()
+            .any(|c| matches_function_dict(&parsed, c, skipped));
+        assert!(
+            !leaked,
+            "{binary} skip_functions: at least one record was tagged with the \
+             default-skipped builtin `{skipped}`'s fn_id",
+        );
+    }
 }

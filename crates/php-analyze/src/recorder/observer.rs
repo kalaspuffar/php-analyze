@@ -20,15 +20,23 @@
 //! never invokes `begin` on the same thread while the same observer's
 //! `end` is in flight). See design.md §D-2.
 //!
-//! ## Why `should_observe` is unconditional
+//! ## `should_observe` filter semantics
 //!
 //! PHP caches `should_observe`'s result per unique function on first
-//! sight. A transient `false` (e.g. a MINIT-time PHP-internal call
+//! sight. A *transient* `false` (e.g. a MINIT-time PHP-internal call
 //! firing before `RINIT` populates the slot) would be cached
 //! permanently and silently drop that function from every later
-//! request. The runtime "is there a current trace?" filter therefore
-//! happens in `begin` / `end` (which are not cached), not in
-//! `should_observe`.
+//! request — so any per-request state filter MUST live in `begin` /
+//! `end` (which are not cached), never in `should_observe`.
+//!
+//! A *static* filter is safe and beneficial: when the answer is a
+//! deterministic function of the function's name (and class scope),
+//! the cached value stays correct across every subsequent request,
+//! and skipped functions cost **zero per call** for the lifetime of
+//! the process. The `Recorder::should_observe` impl uses this for
+//! `Config::skip_functions` and `Config::skip_internal` — see
+//! `REVIEW.md` finding P-0 and the `skip-functions-directive`
+//! change.
 //!
 //! ## The `FcallObserver::end` API and exception detection
 //!
@@ -1045,11 +1053,65 @@ impl Recorder {
     }
 }
 
+/// Pure observation-filter helper. Returns `true` when the function
+/// should be observed (recorder begin/end will fire), `false` to ask
+/// PHP to permanently elide observation of this Zend function entry
+/// (per the cache contract documented in the module header).
+///
+/// Composition: `false` iff (function name in `skip_functions`) OR
+/// (`skip_internal && info.is_internal`). The split is by design —
+/// callers without a populated `Config` (out-of-request fires before
+/// MINIT completes) fall through to the trait `should_observe`'s
+/// `let-else true` path and never reach this helper. See `REVIEW.md`
+/// finding P-0.
+fn should_observe_filter(
+    skip_internal: bool,
+    skip_functions: &std::collections::HashSet<String>,
+    info: &FcallInfo,
+) -> bool {
+    if skip_internal && info.is_internal {
+        return false;
+    }
+    let Some(name) = info.function_name else {
+        // Anonymous closures / opcode-specialised builtins arriving
+        // without a name: we can't filter what we can't name.
+        // Observe (conservative).
+        return true;
+    };
+    let key = match info.class_name {
+        Some(class) => {
+            let mut k = String::with_capacity(class.len() + name.len() + 2);
+            k.push_str(&class.to_ascii_lowercase());
+            k.push_str("::");
+            k.push_str(&name.to_ascii_lowercase());
+            k
+        }
+        None => name.to_ascii_lowercase(),
+    };
+    !skip_functions.contains(&key)
+}
+
 impl FcallObserver for Recorder {
-    /// Unconditionally `true`. See the module doc comment for why a
-    /// runtime "is there a current trace?" filter cannot live here.
-    fn should_observe(&self, _info: &FcallInfo) -> bool {
-        true
+    /// Consult `Config::skip_functions` / `Config::skip_internal` to
+    /// gate observation. PHP caches the result per Zend function
+    /// entry on first sight — so this body runs at most once per
+    /// unique function in the process lifetime, and `false` returns
+    /// cost zero per call from then on. See `REVIEW.md` finding P-0
+    /// and the `skip-functions-directive` change.
+    ///
+    /// **Why a static filter is safe here.** The module doc above
+    /// warns against returning a *transient* `false` from
+    /// `should_observe` (per-request state would be cached
+    /// permanently). A static filter does not have that problem: the
+    /// answer is a deterministic function of the function's name
+    /// (and class scope), identical on the first observation as on
+    /// the millionth, so the cached value stays correct across every
+    /// subsequent request.
+    fn should_observe(&self, info: &FcallInfo) -> bool {
+        match Config::global() {
+            Some(c) => should_observe_filter(c.skip_internal, &c.skip_functions, info),
+            None => true,
+        }
     }
 
     fn begin(&self, execute_data: &ExecuteData) {
@@ -3841,5 +3903,105 @@ mod tests {
             current_cpu_snapshot_mode(),
             crate::config::CpuSnapshotMode::PerCall
         );
+    }
+
+    // --- should_observe filter (skip-functions-directive / REVIEW.md P-0) -
+
+    fn fcall_info_named(
+        function_name: Option<&'static str>,
+        class_name: Option<&'static str>,
+        is_internal: bool,
+    ) -> FcallInfo<'static> {
+        FcallInfo {
+            function_name,
+            class_name,
+            filename: None,
+            lineno: 0,
+            is_internal,
+        }
+    }
+
+    fn skip_set(entries: &[&str]) -> std::collections::HashSet<String> {
+        entries.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn should_observe_filter_returns_false_for_skipped_free_function() {
+        let set = skip_set(&["strlen"]);
+        let info = fcall_info_named(Some("strlen"), None, true);
+        assert!(!should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_returns_true_for_unfiltered_free_function() {
+        let set = skip_set(&["strlen"]);
+        let info = fcall_info_named(Some("my_user_function"), None, false);
+        assert!(should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_uses_class_method_form_for_methods() {
+        // Method `Foo::bar` matches the `foo::bar` entry...
+        let set = skip_set(&["foo::bar"]);
+        let info = fcall_info_named(Some("bar"), Some("Foo"), false);
+        assert!(!should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_free_function_entry_does_not_match_method() {
+        // ...but a bare `bar` entry MUST NOT match the same method
+        // (free-function and method names live in different
+        // namespaces per design.md D-5).
+        let set = skip_set(&["bar"]);
+        let info = fcall_info_named(Some("bar"), Some("Foo"), false);
+        assert!(should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_lowercases_both_sides_for_case_insensitive_match() {
+        let set = skip_set(&["strlen"]);
+        let info = fcall_info_named(Some("StRlEn"), None, true);
+        assert!(!should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_lowercases_class_part_too() {
+        let set = skip_set(&["foo::bar"]);
+        let info = fcall_info_named(Some("BAR"), Some("FOO"), false);
+        assert!(!should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_skip_internal_returns_false_for_any_internal_call() {
+        // Empty skip_functions set; skip_internal = true. Every
+        // internal call is skipped regardless of name.
+        let set = skip_set(&[]);
+        let info = fcall_info_named(Some("some_internal_not_on_list"), None, true);
+        assert!(!should_observe_filter(true, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_skip_internal_does_not_affect_user_calls() {
+        let set = skip_set(&[]);
+        let info = fcall_info_named(Some("my_user_function"), None, false);
+        assert!(should_observe_filter(true, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_returns_true_when_no_function_name_is_available() {
+        // Anonymous closure or opcode-specialised builtin: we can't
+        // filter what we can't name. Observe (conservative).
+        let set = skip_set(&["strlen"]);
+        let info = fcall_info_named(None, None, false);
+        assert!(should_observe_filter(false, &set, &info));
+    }
+
+    #[test]
+    fn should_observe_filter_or_composition_skip_functions_takes_precedence() {
+        // Both filters would skip; result is still `false`. Sanity
+        // check that the OR composition doesn't accidentally invert.
+        let set = skip_set(&["strlen"]);
+        let info = fcall_info_named(Some("strlen"), None, true);
+        assert!(!should_observe_filter(true, &set, &info));
     }
 }
