@@ -26,17 +26,21 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use url::Url;
 
 /// Resolved, frozen configuration. Populated once at `MINIT` and never
 /// mutated thereafter. See `SPECIFICATION.md` §4.1.1.
 ///
 /// Deviations from the literal §4.1.1 sketch, with rationale:
 ///
-/// - `server_url` is `Option<Url>` rather than `Url`. The disabled state
-///   carries no validated URL, so requiring a `Url` would force a
-///   sentinel value. `None` makes the silent-disable case unrepresentable
-///   in a misleading way.
+/// - `server_url` is `Option<String>` rather than `String`. The disabled
+///   state carries no validated URL, so requiring a `String` would force
+///   a sentinel value. `None` makes the silent-disable case
+///   unrepresentable in a misleading way. The string itself is
+///   scheme-checked at construction (must start with `http://` or
+///   `https://`) and trimmed of surrounding whitespace by the upstream
+///   `RawIni`; it is otherwise the operator's bytes verbatim and is
+///   passed to the HTTP client (`ureq::Agent::post`) without further
+///   parsing.
 /// - `disable_reason` is added so `MINFO` can render the literal
 ///   `enabled (false: <reason>)` line required by the `extension-bootstrap`
 ///   spec without re-deriving the reason from the warnings list.
@@ -44,7 +48,7 @@ use url::Url;
 pub struct Config {
     pub enabled: bool,
     pub disable_reason: Option<DisableReason>,
-    pub server_url: Option<Url>,
+    pub server_url: Option<String>,
     pub auth_token: SecretString,
     pub auth_token_source: TokenSource,
     pub flush_records: usize,
@@ -600,34 +604,38 @@ impl ServerUrlOutcome {
     }
 }
 
+// `server_url` validation is scheme-only by design. The value travels
+// verbatim to `ureq::Agent::post(&str)`; full RFC-3987 IDNA parsing
+// (what `url::Url::parse` provided) is unnecessary because malformed
+// hosts, paths, or percent-encodings surface at HTTP-request time via
+// the existing shipper error-reporting path. See the
+// `drop-url-crate-for-scheme-validator` change's `design.md` D-1.
 fn resolve_server_url(
     raw: &RawIni,
     warnings: &mut Vec<ConfigWarning>,
-) -> (Option<Url>, ServerUrlOutcome) {
+) -> (Option<String>, ServerUrlOutcome) {
     let raw_url = raw.server_url.as_deref().unwrap_or("").trim();
     if raw_url.is_empty() {
         return (None, ServerUrlOutcome::Unset);
     }
-    match Url::parse(raw_url) {
-        Ok(url) => match url.scheme() {
-            "https" => (Some(url), ServerUrlOutcome::Ok),
-            "http" => {
-                warnings.push(ConfigWarning::HttpScheme);
-                (Some(url), ServerUrlOutcome::Ok)
-            }
-            other => {
-                warnings.push(ConfigWarning::UnsupportedScheme {
-                    scheme: other.to_owned(),
-                });
-                (None, ServerUrlOutcome::UnsupportedScheme)
-            }
-        },
-        Err(e) => {
-            warnings.push(ConfigWarning::InvalidUrl {
-                value: raw_url.to_owned(),
-                reason: e.to_string(),
+    let Some((scheme, _rest)) = raw_url.split_once("://") else {
+        warnings.push(ConfigWarning::InvalidUrl {
+            value: raw_url.to_owned(),
+            reason: "missing scheme (expected http:// or https://)".to_owned(),
+        });
+        return (None, ServerUrlOutcome::InvalidUrl);
+    };
+    match scheme {
+        "https" => (Some(raw_url.to_owned()), ServerUrlOutcome::Ok),
+        "http" => {
+            warnings.push(ConfigWarning::HttpScheme);
+            (Some(raw_url.to_owned()), ServerUrlOutcome::Ok)
+        }
+        other => {
+            warnings.push(ConfigWarning::UnsupportedScheme {
+                scheme: other.to_owned(),
             });
-            (None, ServerUrlOutcome::InvalidUrl)
+            (None, ServerUrlOutcome::UnsupportedScheme)
         }
     }
 }
@@ -710,7 +718,7 @@ mod tests {
         assert!(config.enabled);
         assert!(config.disable_reason.is_none());
         assert_eq!(
-            config.server_url.as_ref().map(Url::as_str),
+            config.server_url.as_deref(),
             Some("https://ingest.example.com/v1/ingest")
         );
         assert_eq!(config.auth_token.expose_secret(), "inline-token");
