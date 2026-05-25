@@ -260,6 +260,34 @@ pub(crate) fn with_current_trace<R>(f: impl FnOnce(&mut Trace) -> R) -> Option<R
 
 // --- Function-call snapshots (testability adapter) -------------------------
 
+/// `#[cfg(test)]` counter incremented once per
+/// `EntrySnapshots::capture_now` and `ExitSnapshots::capture_now`
+/// invocation. Lets unit tests assert "this drop path did not pay
+/// for any syscall" by reading the counter delta around a drop
+/// scenario (REVIEW.md §4.5 #1, gate-before-snapshot D-5).
+///
+/// The static and the increment site are both behind `#[cfg(test)]`,
+/// so production builds carry zero overhead. Tests serialise
+/// observations via the same lock pattern used by other test seams
+/// in this module — call [`reset_snapshot_capture_count_for_test`]
+/// at test entry to start from zero.
+#[cfg(test)]
+pub(crate) static SNAPSHOT_CAPTURE_COUNT_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only read accessor for [`SNAPSHOT_CAPTURE_COUNT_FOR_TEST`].
+#[cfg(test)]
+pub(crate) fn snapshot_capture_count_for_test() -> usize {
+    SNAPSHOT_CAPTURE_COUNT_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only reset for [`SNAPSHOT_CAPTURE_COUNT_FOR_TEST`]. Call at
+/// the start of a test that wants to assert a specific counter delta.
+#[cfg(test)]
+pub(crate) fn reset_snapshot_capture_count_for_test() {
+    SNAPSHOT_CAPTURE_COUNT_FOR_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The four clock/memory values captured at call entry by the begin
 /// handler. Passed through to `begin_with_snapshots` so unit tests can
 /// inject deterministic values without invoking the real syscalls.
@@ -287,6 +315,8 @@ impl EntrySnapshots {
     /// skips the syscall and returns zero CPU fields.
     #[inline]
     fn capture_now() -> Self {
+        #[cfg(test)]
+        SNAPSHOT_CAPTURE_COUNT_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_in_ns: raw.t_ns,
@@ -313,6 +343,8 @@ impl ExitSnapshots {
     /// [`EntrySnapshots::capture_now`]; same conditional CPU read.
     #[inline]
     fn capture_now() -> Self {
+        #[cfg(test)]
+        SNAPSHOT_CAPTURE_COUNT_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let raw = clocks::snapshot_now(current_cpu_snapshot_mode());
         Self {
             t_out_ns: raw.t_ns,
@@ -1022,13 +1054,22 @@ impl Recorder {
         let info = unsafe { extract_call_site(execute_data) };
 
         with_current_trace(|trace| {
-            let snapshots = EntrySnapshots::capture_now();
             // Production path: zero-alloc on the dict-hit branch. The
             // owning `FunctionKey` and rendered `fqn` are materialised
             // only inside the `intern_ref` build closure on a miss
             // (recorder-hot-path-tuning D-1 / D-2).
             let lazy = categorise_lazy(&info);
-            begin_with_snapshots_lazy(trace, &lazy, snapshots);
+            // Gate-before-snapshot (REVIEW.md P-1, gate-before-snapshot
+            // change): consult the depth/cap gates before paying the
+            // ~1,100 ns syscall trio for snapshots. Dropped begins now
+            // cost zero syscalls — the drop count, `dropped_begins`,
+            // and `virtual_depth` accounting all happen inside the
+            // predicate.
+            if !begin_lazy_would_accept(trace, &lazy) {
+                return;
+            }
+            let snapshots = EntrySnapshots::capture_now();
+            begin_with_snapshots_lazy_accept(trace, &lazy, snapshots);
         });
     }
 
@@ -1046,9 +1087,17 @@ impl Recorder {
         // on the trace stack from the matching `begin`. `_retval`
         // is unused per design D-7 (we don't inspect return values).
         with_current_trace(|trace| {
+            // Gate-before-snapshot (REVIEW.md P-1, gate-before-snapshot
+            // change): consume the `dropped_begins` LIFO matcher
+            // before paying the ~1,100 ns syscall trio + the
+            // `has_exception()` read. Ends paired with previously
+            // dropped begins now cost zero syscalls.
+            if !end_would_accept(trace) {
+                return;
+            }
             let abnormal = ExecutorGlobals::has_exception();
             let snapshots = ExitSnapshots::capture_now();
-            end_with_snapshots(trace, snapshots, abnormal);
+            end_with_snapshots_accept(trace, snapshots, abnormal);
         });
     }
 }
@@ -1165,6 +1214,24 @@ pub fn begin_with_snapshots(
     categorised: &Categorised<'_>,
     snapshots: EntrySnapshots,
 ) {
+    if begin_would_accept(trace, categorised) {
+        begin_with_snapshots_accept(trace, categorised, snapshots);
+    }
+    // else: drop already recorded by `begin_would_accept`.
+}
+
+/// Predicate half of [`begin_with_snapshots`]. Performs the
+/// `virtual_depth` increment, the depth gate, and the cap gate.
+/// Returns `true` when the call should be accepted; returns `false`
+/// after calling [`Trace::record_drop`] for the caller.
+///
+/// **No syscalls.** This is the gate-before-snapshot entry point
+/// from `gate-before-snapshot` (REVIEW.md P-1) — the caller (e.g.
+/// [`Recorder::begin_handler`]) consults this predicate first, and
+/// only invokes [`EntrySnapshots::capture_now`] when the answer is
+/// `true`. Dropped begins now pay zero syscalls for the work that
+/// would have been thrown away.
+fn begin_would_accept(trace: &mut Trace, categorised: &Categorised<'_>) -> bool {
     // 1. Track PHP-side depth unconditionally. `saturating_add` so a
     // pathological 2^32 begins in a single trace does not panic.
     trace.virtual_depth = trace.virtual_depth.saturating_add(1);
@@ -1172,7 +1239,7 @@ pub fn begin_with_snapshots(
     // 2. Depth gate.
     if trace.virtual_depth > trace.max_depth {
         trace.record_drop();
-        return;
+        return false;
     }
 
     // 3. Cap gate. `would_add` is the worst-case contribution this
@@ -1186,10 +1253,26 @@ pub fn begin_with_snapshots(
         + dict_miss_cost_ref(trace, &key_ref, &categorised.fqn, &categorised.file);
     if accounting::snapshot().saturating_add(would_add) > trace.buffer_cap_bytes {
         trace.record_drop();
-        return;
+        return false;
     }
 
-    // 4. Accept path.
+    true
+}
+
+/// Accept-only tail of [`begin_with_snapshots`]. Assumes
+/// [`begin_would_accept`] has already returned `true` for this
+/// `(trace, categorised)` pair — `virtual_depth` is bumped, neither
+/// gate fired. Pushes the dict entry (if new) and the `CallFrame`.
+///
+/// Calling this without the matching predicate having returned
+/// `true` would skip the gates and stage a record the gates were
+/// meant to reject; the bench-seam wrapper [`begin_with_snapshots`]
+/// composes them safely.
+fn begin_with_snapshots_accept(
+    trace: &mut Trace,
+    categorised: &Categorised<'_>,
+    snapshots: EntrySnapshots,
+) {
     let call_id = trace.next_call_id();
     let parent = trace.stack.last().map_or(0, |frame| frame.call_id);
     // `virtual_depth` is already 1-based after the increment above; the
@@ -1206,6 +1289,7 @@ pub fn begin_with_snapshots(
     // across many iterations, so the per-iteration `categorised.key`
     // clone the previous version did is replaced by a single
     // `categorised.key.as_ref()` probe.
+    let key_ref = categorised.key.as_ref();
     let kind = categorised.kind;
     let fqn: &str = categorised.fqn.as_ref();
     let file: &str = categorised.file.as_ref();
@@ -1257,13 +1341,30 @@ pub fn begin_with_snapshots_lazy(
     lazy: &LazyCategorised<'_>,
     snapshots: EntrySnapshots,
 ) {
+    if begin_lazy_would_accept(trace, lazy) {
+        begin_with_snapshots_lazy_accept(trace, lazy, snapshots);
+    }
+    // else: drop already recorded by `begin_lazy_would_accept`.
+}
+
+/// Predicate half of [`begin_with_snapshots_lazy`]. Performs the
+/// `virtual_depth` increment and runs the depth + cap gates. Returns
+/// `true` when the call should be accepted; returns `false` after
+/// calling [`Trace::record_drop`] for the caller.
+///
+/// **No syscalls.** The gate-before-snapshot entry point from
+/// `gate-before-snapshot` (REVIEW.md P-1). [`Recorder::begin_handler`]
+/// consults this predicate before invoking
+/// [`EntrySnapshots::capture_now`]; dropped begins now pay zero
+/// syscalls for the work that would have been thrown away.
+fn begin_lazy_would_accept(trace: &mut Trace, lazy: &LazyCategorised<'_>) -> bool {
     // 1. Track PHP-side depth unconditionally.
     trace.virtual_depth = trace.virtual_depth.saturating_add(1);
 
     // 2. Depth gate.
     if trace.virtual_depth > trace.max_depth {
         trace.record_drop();
-        return;
+        return false;
     }
 
     // 3. Cap gate. `would_add` projection: `contains_key_ref` is a
@@ -1279,10 +1380,22 @@ pub fn begin_with_snapshots_lazy(
     };
     if accounting::snapshot().saturating_add(would_add) > trace.buffer_cap_bytes {
         trace.record_drop();
-        return;
+        return false;
     }
 
-    // 4. Accept path.
+    true
+}
+
+/// Accept-only tail of [`begin_with_snapshots_lazy`]. Assumes
+/// [`begin_lazy_would_accept`] has already returned `true` for this
+/// `(trace, lazy)` pair — `virtual_depth` is bumped, neither gate
+/// fired. Stages the dict entry (allocating only on a miss) and
+/// pushes the `CallFrame`.
+fn begin_with_snapshots_lazy_accept(
+    trace: &mut Trace,
+    lazy: &LazyCategorised<'_>,
+    snapshots: EntrySnapshots,
+) {
     let call_id = trace.next_call_id();
     let parent = trace.stack.last().map_or(0, |frame| frame.call_id);
     #[allow(clippy::cast_possible_truncation)]
@@ -1355,6 +1468,25 @@ fn dict_miss_cost_ref(trace: &Trace, key_ref: &FunctionKeyRef<'_>, fqn: &str, fi
 // `pub` (not `pub(crate)`) for the bench-seam re-export. See the
 // note on `EntrySnapshots` for the rationale.
 pub fn end_with_snapshots(trace: &mut Trace, snapshots: ExitSnapshots, abnormal: bool) {
+    if end_would_accept(trace) {
+        end_with_snapshots_accept(trace, snapshots, abnormal);
+    }
+    // else: dropped_begins consumed by `end_would_accept`.
+}
+
+/// Predicate half of [`end_with_snapshots`]. Decrements
+/// `virtual_depth` and consumes the `dropped_begins` LIFO matcher.
+/// Returns `true` when the end should be accepted (the matching
+/// begin produced a frame on the stack); returns `false` when the
+/// matching begin was previously dropped, having decremented
+/// `dropped_begins` for the caller.
+///
+/// **No syscalls.** The gate-before-snapshot entry point from
+/// `gate-before-snapshot` (REVIEW.md P-1). [`Recorder::end_handler`]
+/// consults this predicate before invoking
+/// [`ExitSnapshots::capture_now`] and [`ExecutorGlobals::has_exception`];
+/// ends paired with dropped begins now pay zero syscalls.
+fn end_would_accept(trace: &mut Trace) -> bool {
     // Decrement first so the depth is consistent for any caller that
     // observes `virtual_depth` mid-pop. `saturating_sub` defends an
     // adversarial-end-before-begin sequence (test 10.3); in well-formed
@@ -1365,9 +1497,17 @@ pub fn end_with_snapshots(trace: &mut Trace, snapshots: ExitSnapshots, abnormal:
     // silently.
     if trace.dropped_begins > 0 {
         trace.dropped_begins -= 1;
-        return;
+        return false;
     }
+    true
+}
 
+/// Accept-only tail of [`end_with_snapshots`]. Assumes
+/// [`end_would_accept`] has already returned `true` for this
+/// `trace` — `virtual_depth` is decremented, `dropped_begins` was
+/// already zero. Pops the matching frame from the stack and emits
+/// the `CallRecord`.
+fn end_with_snapshots_accept(trace: &mut Trace, snapshots: ExitSnapshots, abnormal: bool) {
     let popped = trace.stack.pop();
     debug_assert!(
         popped.is_some(),
@@ -4003,5 +4143,148 @@ mod tests {
         let set = skip_set(&["strlen"]);
         let info = fcall_info_named(Some("strlen"), None, true);
         assert!(!should_observe_filter(true, &set, &info));
+    }
+
+    // --- Gate-before-snapshot (REVIEW.md P-1 / gate-before-snapshot) ------
+    //
+    // These tests pin "dropped begin/end events SHALL NOT invoke clock or
+    // memory syscalls". The `SNAPSHOT_CAPTURE_COUNT_FOR_TEST` counter is
+    // incremented inside `EntrySnapshots::capture_now` and
+    // `ExitSnapshots::capture_now` under `#[cfg(test)]` (production builds
+    // are unaffected — both the static and the increment site are
+    // `cfg(test)`-gated). Tests serialise observations via `account_guard`
+    // so the counter delta is reliable under `cargo test`'s parallel
+    // runner.
+
+    #[test]
+    fn begin_dropped_by_depth_gate_captures_zero_snapshots() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        reset_snapshot_capture_count_for_test();
+        let mut trace = trace_with_max_depth(5);
+        let cat = cat_for("recurse");
+
+        // Fill the trace to exactly `max_depth` via the production
+        // owning-key path. These five begins each capture a snapshot
+        // (the counter increments by 5).
+        for _ in 0..5 {
+            let snap = EntrySnapshots::capture_now();
+            begin_with_snapshots(&mut trace, &cat, snap);
+        }
+        let counter_at_max = snapshot_capture_count_for_test();
+        assert_eq!(
+            counter_at_max, 5,
+            "five accepted begins should have captured exactly five snapshots"
+        );
+
+        // The sixth begin is the one this test is about: it must be
+        // dropped by the depth gate without paying for a snapshot.
+        // We exercise the **predicate** directly — the handler
+        // composition is what `Recorder::begin_handler` does
+        // internally; the predicate is the load-bearing surface for
+        // "no syscall on drop".
+        let accepted = begin_would_accept(&mut trace, &cat);
+        assert!(!accepted, "depth gate must reject the sixth begin");
+
+        // The counter MUST NOT have advanced. This is the headline
+        // P-1 assertion.
+        assert_eq!(
+            snapshot_capture_count_for_test(),
+            counter_at_max,
+            "depth-gated drop must capture zero snapshots"
+        );
+
+        // Drop semantics are preserved verbatim.
+        assert_eq!(trace.virtual_depth, 6, "depth tracks PHP regardless");
+        assert_eq!(trace.dropped_begins, 1);
+        assert_eq!(trace.drop_counter.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn begin_dropped_by_cap_gate_captures_zero_snapshots() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        reset_snapshot_capture_count_for_test();
+        // Cap is tight enough that the very first begin's `would_add`
+        // projection breaches it.
+        let mut trace = trace_with_cap(1);
+        let cat = cat_for("blocked");
+
+        let accepted = begin_would_accept(&mut trace, &cat);
+        assert!(!accepted, "cap gate must reject the begin");
+
+        assert_eq!(
+            snapshot_capture_count_for_test(),
+            0,
+            "cap-gated drop must capture zero snapshots"
+        );
+        assert_eq!(trace.dropped_begins, 1);
+        assert_eq!(trace.drop_counter.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn end_paired_with_dropped_begin_captures_zero_snapshots() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        reset_snapshot_capture_count_for_test();
+        // Construct a trace where one begin has already been dropped
+        // (the `dropped_begins > 0` LIFO precondition the end path
+        // peeks).
+        let mut trace = trace_with_max_depth(1024);
+        trace.virtual_depth = 1;
+        trace.dropped_begins = 1;
+
+        let accepted = end_would_accept(&mut trace);
+        assert!(!accepted, "end paired with dropped begin must not accept");
+
+        assert_eq!(
+            snapshot_capture_count_for_test(),
+            0,
+            "end paired with dropped begin must capture zero snapshots"
+        );
+        assert_eq!(
+            trace.dropped_begins, 0,
+            "LIFO matcher must consume the dropped_begins counter"
+        );
+        assert_eq!(
+            trace.virtual_depth, 0,
+            "virtual_depth must decrement regardless of accept/drop"
+        );
+    }
+
+    #[test]
+    fn accepted_begin_end_pair_captures_exactly_two_snapshots() {
+        let _guard = account_guard();
+        accounting::reset_for_test();
+        reset_snapshot_capture_count_for_test();
+        let mut trace = trace_with_max_depth(1024);
+        let cat = cat_for("happy");
+
+        // Begin: predicate accepts → snapshot captured → accept tail
+        // stages the frame.
+        let begin_ok = begin_would_accept(&mut trace, &cat);
+        assert!(begin_ok);
+        let begin_snap = EntrySnapshots::capture_now();
+        begin_with_snapshots_accept(&mut trace, &cat, begin_snap);
+
+        // End: predicate accepts (no dropped_begins to consume) →
+        // snapshot captured → accept tail emits the record.
+        let end_ok = end_would_accept(&mut trace);
+        assert!(end_ok);
+        let end_snap = ExitSnapshots::capture_now();
+        end_with_snapshots_accept(&mut trace, end_snap, false);
+
+        assert_eq!(
+            snapshot_capture_count_for_test(),
+            2,
+            "accepted begin+end pair must capture exactly two snapshots"
+        );
+        assert_eq!(trace.dropped_begins, 0);
+        assert_eq!(trace.drop_counter.load(Ordering::Acquire), 0);
+        assert_eq!(
+            trace.buffer.len(),
+            1,
+            "accepted pair must emit one CallRecord"
+        );
     }
 }
