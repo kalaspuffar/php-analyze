@@ -23,11 +23,6 @@
 //!   dictionary interner (`Dictionary`), the production `Recorder`
 //!   (`FcallObserver` impl), the `BootObserver` dispatcher, and the
 //!   `RINIT`/`RSHUTDOWN` lifecycle entry points.
-//! - [`spike`] — Phase-0 spike: an `FcallObserver` that logs every
-//!   begin/end event to a configurable destination. Off by default
-//!   (`php_analyze.spike_observer = 0`). Reached only through the
-//!   `BootObserver::Spike` variant; production loads with the default
-//!   directive set route through `BootObserver::Recorder`.
 //! - [`shipper`] — Phase-4 substrate (slice 1): the bounded
 //!   `crossbeam_channel` between the recorder (producer) and the
 //!   shipper (consumer), the lazy thread spawn at the first `RINIT`
@@ -44,7 +39,6 @@ pub mod clocks;
 pub mod config;
 pub mod recorder;
 pub(crate) mod shipper;
-pub mod spike;
 pub mod wire;
 
 pub use config::initialise_from_ini;
@@ -114,9 +108,8 @@ fn startup(ty: i32, mod_num: i32) -> i32 {
 /// load-bearing; see `openspec/changes/spike-zend-observer/design.md`
 /// §D-1 Resolution). [`recorder::build_boot_observer`] consults
 /// `Config::global()` to build a [`recorder::BootObserver`] that
-/// dispatches to (a) the recorder when `enabled && !spike_observer`,
-/// (b) the spike when `enabled && spike_observer`, (c) a no-op
-/// `Disabled` variant otherwise.
+/// dispatches to the recorder when `Config::enabled` is true, and to
+/// a no-op `Disabled` variant otherwise.
 #[php_module]
 #[php(startup = startup)]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {

@@ -22,8 +22,8 @@
 //! compiles each `tests/*.rs` to a separate binary, so the
 //! production cdylib, the unit tests inside `src/`, and the
 //! other integration tests (`shipper_round_trip.rs`,
-//! `spike_observer.rs`, `recorder_observer.rs`) all use Rust's
-//! default `System` allocator unchanged.
+//! `recorder_observer.rs`) all use Rust's default `System`
+//! allocator unchanged.
 //!
 //! ## Why not `bench_seam` / `bench-seam` feature?
 //!

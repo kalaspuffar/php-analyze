@@ -302,7 +302,6 @@ opcache.enable = 0
 php_analyze.enabled = 1
 php_analyze.server_url = "http://127.0.0.1:$STUB_PORT$STUB_PATH"
 php_analyze.auth_token = "$STUB_TOKEN"
-php_analyze.spike_observer = 0
 php_analyze.shutdown_grace_ms = 4000
 php_analyze.shipper_queue_depth = 1024
 EOF
