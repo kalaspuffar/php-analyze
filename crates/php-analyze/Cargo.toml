@@ -25,8 +25,6 @@ ext-php-rs = { version = "=0.15.13", features = ["observer"] }
 secrecy = "0.10"
 # `thiserror` powers the `ConfigError` enum.
 thiserror = "2"
-# `url` parses and validates `server_url` (must be `http://` or `https://`).
-url = "2"
 # `rustc_hash::FxBuildHasher` is the hash builder for the recorder's
 # function dictionary (`recorder::dictionary::Dictionary`). Small
 # composite keys, trusted inputs — SipHash's DoS resistance is wasted

@@ -34,7 +34,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use secrecy::{ExposeSecret, SecretString};
-use url::Url;
 
 use super::on_batch::{DropReason, OnBatch, OnBatchOutcome};
 use super::PendingBatch;
@@ -182,7 +181,12 @@ pub(super) fn run_with_retry(
 /// the §5.2 retry parameters.
 pub(crate) struct RmpEncodeAndHttpPost {
     agent: ureq::Agent,
-    server_url: Url,
+    /// Scheme-checked `http://` / `https://` URL string; validated at
+    /// `MINIT` by [`crate::config::resolve_server_url`]. Stored as a
+    /// plain `String` because `ureq::Agent::post` accepts `&str` and
+    /// the shipper never reads any URL component other than the full
+    /// value.
+    server_url: String,
     auth_token: SecretString,
     retry_count: u32,
     retry_backoff_ms: u32,
@@ -194,7 +198,7 @@ impl RmpEncodeAndHttpPost {
     /// once and reused across every POST (per design D-6 → AC-SH-6:
     /// 1000 sends, 1 TCP connection).
     pub(crate) fn new(
-        server_url: Url,
+        server_url: String,
         auth_token: SecretString,
         retry_count: u32,
         retry_backoff: Duration,
@@ -251,7 +255,7 @@ impl OnBatch for RmpEncodeAndHttpPost {
         // `&self.*` are sound for the closure's entire lifetime and
         // we save two `String` allocations + one `Arc` clone per
         // batch.
-        let url = self.server_url.as_str();
+        let url: &str = &self.server_url;
         let user_agent = self.user_agent.as_str();
         let agent = &self.agent;
 
@@ -293,14 +297,14 @@ impl OnBatch for RmpEncodeAndHttpPost {
     }
 
     /// `SPECIFICATION.md` §5.2 step 4 drop-notice URL token. Returns
-    /// the configured `server_url`'s string form so the drop notice
-    /// emitted on the PHP-thread side reads `... <url> <status_or_error> ...`
-    /// for operator triage. The bearer token is held in
-    /// `self.auth_token` and is NOT exposed through this accessor —
-    /// the `Url` type has no slot for it (AC-SH-4 enforced by
-    /// construction).
+    /// the configured `server_url` so the drop notice emitted on the
+    /// PHP-thread side reads `... <url> <status_or_error> ...` for
+    /// operator triage. The bearer token is held in `self.auth_token`
+    /// and is NOT exposed through this accessor — the field is a plain
+    /// scheme-checked URL string and carries no slot for credentials
+    /// (AC-SH-4 enforced by construction).
     fn server_url(&self) -> Option<&str> {
-        Some(self.server_url.as_str())
+        Some(&self.server_url)
     }
 }
 

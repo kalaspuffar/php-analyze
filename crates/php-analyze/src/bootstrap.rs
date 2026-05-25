@@ -835,11 +835,7 @@ impl PhpInfoRenderer {
 
         rows.push((
             "php_analyze.server_url".to_owned(),
-            c.server_url
-                .as_ref()
-                .map(url::Url::as_str)
-                .unwrap_or("(unset)")
-                .to_owned(),
+            c.server_url.as_deref().unwrap_or("(unset)").to_owned(),
         ));
         // Hard-coded "***"; never touches `c.auth_token.expose_secret`.
         rows.push(("php_analyze.auth_token".to_owned(), "***".to_owned()));
