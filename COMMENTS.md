@@ -248,24 +248,16 @@ file they touch is open for another reason.
 
 #### Phase-0 spike tidy-up
 
-- `spike-graceful-degrade-on-missing-config` — promote
-  `inactive_sink()` to `SpikeObserver::inactive()` and replace
-  `build_spike_observer`'s `expect` on `Config::global()` with a
-  `let-else` returning the inactive observer (S-4).
-- `spike-tidy-fqn-and-deadcode` — `fqn` unreachable `unwrap_or`,
-  `with_sink` doc clarification, `LocalFcallInfo::empty()`
-  null-`func` notice (S-5, S-12, S-14).
-- `spike-tighten-integration-assertions` — tighten `assert_pair`
-  to `entry_hits == 1 && exit_hits == 1` per fixture and assert
-  `array_map` callback fires 3× (S-10).
-- `spike-portable-run-sh` — replace `python3` JSON parse with
-  shell-only `${CARGO_TARGET_DIR:-…}` (S-11).
-- `spike-log-path-validate-absolute` — reject non-absolute
-  `spike_log_path` with `ConfigWarning::SpikeLogPathNotAbsolute`
-  (S-8).
-- `spike-doc-cleanup` — `// NOTE for Phase 5` near the per-call
-  allocations, soften / cite the `should_observe` caching claim
-  (S-9, S-13).
+Obsoleted by `delete-spike-module` (`REVIEW.md` S-4) — the spike
+module, its directives (`php_analyze.spike_observer`,
+`php_analyze.spike_log_path`), the `BootObserver::Spike`
+dispatch arm, the integration test (`tests/spike_observer.rs`),
+and the PHP fixtures (`tests/php-spike/`) have all been removed
+from the source tree. The historical `spike-graceful-degrade-on-
+missing-config`, `spike-tidy-fqn-and-deadcode`,
+`spike-tighten-integration-assertions`, `spike-portable-run-sh`,
+`spike-log-path-validate-absolute`, and `spike-doc-cleanup`
+follow-ups are discharged.
 
 #### Recorder follow-ups
 

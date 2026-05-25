@@ -191,7 +191,6 @@ opcache.enable = 0
 php_analyze.enabled = 1
 php_analyze.server_url = "http://127.0.0.1:$stub_port$stub_path"
 php_analyze.auth_token = "$stub_token"
-php_analyze.spike_observer = 0
 php_analyze.shutdown_grace_ms = 5000
 php_analyze.shipper_queue_depth = 1024
 EOF

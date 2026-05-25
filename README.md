@@ -237,16 +237,6 @@ will not change them and return `false`.
   or alter its behaviour at runtime. Inspection lives in `phpinfo()`
   / `php --ri php_analyze`.
 
-### Developer-only spike mode
-
-Two additional directives (`php_analyze.spike_observer` and
-`php_analyze.spike_log_path`) gate a developer-only logging mode that
-writes one line per function entry/exit to stderr or a file. **Do not
-enable spike mode in production** — it's slow, unbounded, and exists
-only to validate the Zend-observer wiring. See
-[`crates/php-analyze/src/lib.rs`](./crates/php-analyze/src/lib.rs)
-module docs for details.
-
 ---
 
 ## Architecture (in one diagram)
@@ -434,8 +424,7 @@ deviations and design notes accumulate in
 │   ├── php-bench/               # Canonical workloads (used by benches + captures)
 │   ├── php-fpm/                 # PHP fixtures for FPM integration test
 │   ├── php-recorder/            # PHP fixtures for recorder-observer test
-│   ├── php-shipper/             # PHP fixtures for shipper round-trip test
-│   └── php-spike/               # PHP fixtures for the spike-observer test
+│   └── php-shipper/             # PHP fixtures for shipper round-trip test
 ├── tools/
 │   ├── xdebug-spot-check/       # Accuracy-vs-Xdebug spot-check tool
 │   ├── capture-fixtures.sh      # Regenerate the reference batch captures

@@ -87,14 +87,12 @@ INI_FILE="$TMPDIR_RUN/recorder.ini"
 
 # `server_url` and `auth_token` must be present so Phase-1's silent-
 # disable does not kick in. Their values are never used (no shipper
-# exists yet). `spike_observer = 0` is the default, but we set it
-# explicitly so `BootObserver::Recorder` is the resolved variant.
+# exists yet).
 cat >"$INI_FILE" <<EOF
 extension=$CDYLIB
 php_analyze.enabled              = 1
 php_analyze.server_url           = "https://recorder.invalid/ingest"
 php_analyze.auth_token           = "recorder-driver-token-not-real"
-php_analyze.spike_observer       = 0
 EOF
 
 # Ensure the dump path is empty before the run so a re-run picks up

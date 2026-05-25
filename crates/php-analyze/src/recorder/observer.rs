@@ -1,6 +1,6 @@
 //! Production observer wiring: the `Recorder` that drives the slice-1
 //! substrate from real PHP `FcallObserver` events, plus the `BootObserver`
-//! dispatcher that picks (Disabled | Spike | Recorder) once at `MINIT`.
+//! dispatcher that picks (Disabled | Recorder) once at `MINIT`.
 //!
 //! The per-request `Trace` lives in a `thread_local!` slot owned by this
 //! module. `bootstrap::rinit` populates it via [`rinit_allocate_trace`];
@@ -34,8 +34,8 @@
 //!
 //! `ext_php_rs = 0.15.13` exposes `fn end(&self, execute_data: &ExecuteData, retval: Option<&Zval>)`
 //! — there is no `abnormal: bool` parameter. The recorder reads
-//! `ExecutorGlobals::has_exception()` inline (same path the spike
-//! uses). See design.md §D-7 and the C-8 entry in `COMMENTS.md`.
+//! `ExecutorGlobals::has_exception()` inline. See design.md §D-7 and
+//! the C-8 entry in `COMMENTS.md`.
 
 use std::cell::RefCell;
 
@@ -51,7 +51,6 @@ use crate::recorder::types::{
     CallFrame, CallRecord, DictEntry, FunctionKey, FunctionKeyRef, FunctionKind, PendingBatch,
     RequestIdentity, Trace, TraceLimits, CALL_RECORD_FIXED_BYTES, DICT_ENTRY_FIXED_BYTES,
 };
-use crate::spike::SpikeObserver;
 
 // --- Thread-local trace slot ----------------------------------------------
 
@@ -62,8 +61,7 @@ thread_local! {
 }
 
 /// Populate the thread-local with a fresh `Trace`. Called from
-/// `bootstrap::rinit` when the extension is enabled and the spike is
-/// off.
+/// `bootstrap::rinit` when the extension is enabled.
 ///
 /// **Posture (RO-1).** A previous request that ran `RINIT` without a
 /// matching `RSHUTDOWN` is a bug we want to know about — but
@@ -103,7 +101,7 @@ pub fn rinit_allocate_trace(identity: RequestIdentity, limits: TraceLimits) {
 
 /// Drop the thread-local `Trace`. Called from `bootstrap::rshutdown`
 /// unconditionally — a no-op when the slot is already `None`
-/// (extension disabled, spike active, or `RINIT` was skipped).
+/// (extension disabled or `RINIT` was skipped).
 ///
 /// ## Phase-4 slice 2: `RSHUTDOWN` final flush
 ///
@@ -240,9 +238,8 @@ fn drain_open_frames_into_buffer(trace: &mut Trace) {
 
 /// Borrow the current `Trace` mutably for the duration of `f`.
 ///
-/// Returns `None` when the slot is empty (extension disabled, spike
-/// active, or out-of-request observer fire). Returns `Some(f(trace))`
-/// otherwise.
+/// Returns `None` when the slot is empty (extension disabled or
+/// out-of-request observer fire). Returns `Some(f(trace))` otherwise.
 ///
 /// The borrow is scoped to `f`'s body. Callers MUST NOT recursively
 /// invoke any function that itself calls `with_current_trace` —
@@ -513,10 +510,9 @@ impl RawCallSite<'static> {
 /// Parse `&ExecuteData` into a [`RawCallSite<'a>`].
 ///
 /// `ext_php_rs::zend::FcallInfo::from_execute_data` is `pub(crate)`
-/// upstream, so we cannot call it. The struct walk below mirrors the
-/// spike's `extract_info`; when `ext-php-rs` promotes the constructor,
-/// the right move is to drop this function (and the spike's twin) and
-/// adapt the upstream value into `RawCallSite`.
+/// upstream, so we cannot call it. When `ext-php-rs` promotes the
+/// constructor, the right move is to drop this function and adapt the
+/// upstream value into `RawCallSite`.
 ///
 /// # Safety
 ///
@@ -1447,15 +1443,14 @@ fn emit_flush_dump_line(_trace: &Trace, _batch: &PendingBatch, _trigger: FlushTr
 
 /// Top-level observer registered with `ModuleBuilder::fcall_observer`.
 /// Picks exactly one variant at `MINIT` based on `Config::global()`:
-/// `Disabled` when the master switch is off, `Spike` when the spike
-/// directive is on, `Recorder` otherwise.
+/// `Disabled` when the master switch is off (or `Config::global()`
+/// hasn't populated yet), `Recorder` when the extension is enabled.
 ///
 /// The `match self` in each trait method compiles down to a single
 /// discriminant load — essentially free per call after LLVM has
 /// inlined the variants' impls.
 pub enum BootObserver {
     Disabled,
-    Spike(SpikeObserver),
     Recorder(Recorder),
 }
 
@@ -1463,7 +1458,6 @@ impl FcallObserver for BootObserver {
     fn should_observe(&self, info: &FcallInfo) -> bool {
         match self {
             Self::Disabled => false,
-            Self::Spike(s) => s.should_observe(info),
             Self::Recorder(r) => r.should_observe(info),
         }
     }
@@ -1471,7 +1465,6 @@ impl FcallObserver for BootObserver {
     fn begin(&self, execute_data: &ExecuteData) {
         match self {
             Self::Disabled => {}
-            Self::Spike(s) => s.begin(execute_data),
             Self::Recorder(r) => r.begin(execute_data),
         }
     }
@@ -1479,7 +1472,6 @@ impl FcallObserver for BootObserver {
     fn end(&self, execute_data: &ExecuteData, retval: Option<&Zval>) {
         match self {
             Self::Disabled => {}
-            Self::Spike(s) => s.end(execute_data, retval),
             Self::Recorder(r) => r.end(execute_data, retval),
         }
     }
@@ -1491,18 +1483,15 @@ impl FcallObserver for BootObserver {
 /// `Config::global()` is `Some` at this point (the macro-expansion
 /// order documented in `COMMENTS.md` C-5 makes our user `startup`
 /// shim run before the observer factory). The `let-else` is the
-/// defensive fallback per S-4: if a future ext-php-rs reorders
-/// startup, the extension falls back to the inactive observer rather
-/// than panicking across FFI.
+/// defensive fallback: if a future ext-php-rs reorders startup, the
+/// extension falls back to the inactive observer rather than
+/// panicking across FFI.
 pub fn build_boot_observer() -> BootObserver {
     let Some(config) = Config::global() else {
         return BootObserver::Disabled;
     };
     if !config.enabled {
         return BootObserver::Disabled;
-    }
-    if config.spike_observer {
-        return BootObserver::Spike(SpikeObserver::from_config(config));
     }
     BootObserver::Recorder(build_recorder_observer())
 }

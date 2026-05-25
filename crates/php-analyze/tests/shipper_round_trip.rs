@@ -214,7 +214,6 @@ fn try_round_trip(php_binary: &str, cdylib: &Path) -> RoundTripOutcome {
             "php_analyze.enabled        = 1\n",
             "php_analyze.server_url     = \"{url}\"\n",
             "php_analyze.auth_token     = \"{token}\"\n",
-            "php_analyze.spike_observer = 0\n",
             // Tight `shutdown_grace` so the test exits promptly even
             // if the stub somehow drops the connection. The default
             // is `1500 ms`; `300 ms` is plenty for one batch on
@@ -352,7 +351,6 @@ fn try_round_trip_connection_reuse(php_binary: &str, cdylib: &Path) -> RoundTrip
             "php_analyze.enabled        = 1\n",
             "php_analyze.server_url     = \"{url}\"\n",
             "php_analyze.auth_token     = \"{token}\"\n",
-            "php_analyze.spike_observer = 0\n",
             "php_analyze.flush_records  = 1\n",
             "php_analyze.shutdown_grace = 5000\n",
         ),
@@ -452,7 +450,6 @@ fn try_round_trip_retry_exhaust(php_binary: &str, cdylib: &Path) -> RoundTripOut
             "php_analyze.enabled          = 1\n",
             "php_analyze.server_url       = \"{url}\"\n",
             "php_analyze.auth_token       = \"{token}\"\n",
-            "php_analyze.spike_observer   = 0\n",
             "php_analyze.retry_count      = 3\n",
             "php_analyze.retry_backoff_ms = 10\n",
             "php_analyze.http_timeout_ms  = 200\n",
@@ -604,7 +601,6 @@ fn try_round_trip_mshutdown_drain(php_binary: &str, cdylib: &Path) -> RoundTripO
             "php_analyze.enabled          = 1\n",
             "php_analyze.server_url       = \"{url}\"\n",
             "php_analyze.auth_token       = \"{token}\"\n",
-            "php_analyze.spike_observer    = 0\n",
             "php_analyze.shutdown_grace_ms = 200\n",
             "php_analyze.http_timeout_ms   = 200\n",
             "php_analyze.retry_count       = 5\n",

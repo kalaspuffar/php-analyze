@@ -234,7 +234,6 @@ fn make_profiled_ini(cdylib: &Path, tmpdir: &Path) -> PathBuf {
             "php_analyze.enabled           = 1\n",
             "php_analyze.server_url        = \"http://127.0.0.1:1/sink\"\n",
             "php_analyze.auth_token        = \"bench-token\"\n",
-            "php_analyze.spike_observer    = 0\n",
             "php_analyze.shutdown_grace_ms = 200\n",
             "php_analyze.http_timeout_ms   = 200\n",
             "{cpu_mode_line}"

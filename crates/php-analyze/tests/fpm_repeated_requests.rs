@@ -472,7 +472,6 @@ impl FpmProcess {
              php_analyze.enabled = 1\n\
              php_analyze.server_url = \"{server_url}\"\n\
              php_analyze.auth_token = \"{token}\"\n\
-             php_analyze.spike_observer = 0\n\
              ; `shutdown_grace_ms = 4000` is the largest value\n\
              ; that fits under PHP-FPM's hardcoded 5-second\n\
              ; SIGQUIT-to-SIGTERM grace (see PHP-FPM source's\n\
