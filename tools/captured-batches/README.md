@@ -34,6 +34,23 @@ workload's call shape in more detail plus its own
 `batch-NNNN.msgpack` files (zero-padded 4-digit monotonic
 counter starting at `0001`, in arrival order).
 
+The committed kept-set per workload is **batch-0001,
+batch-0002, and the final batch the capture sink received**
+(`batch-NNNN` where `NNNN` is the highest count from the
+full run). Keeping the final batch is required so the
+fixtures demonstrate the MSHUTDOWN-drain wire shape
+documented in `SPECIFICATION.md` §3.2: the recorder pops
+any still-open `CallFrame`s into the final batch as
+`abnormal_exit = true` `CallRecord`s. PHP's script-body
+closure is the canonical case — it sits on the stack from
+script start to MSHUTDOWN, so its drained record lands in
+the final batch as `(call_id=1, parent=0, depth=0)`. The
+`recursive_walk/` and `json_batch/` final batches reliably
+carry that record; the `flat_calls/` final batch's drain
+record may be channel-dropped at MSHUTDOWN on hosts with
+heavy steady-state shipper-queue pressure (see that
+workload's README).
+
 ## Samples, not goldens
 
 These files **change run-to-run**. Sources of variation:

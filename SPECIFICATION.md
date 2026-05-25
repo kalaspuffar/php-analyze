@@ -204,7 +204,7 @@ Per REQ §4.2 and §7.10:
 - Maintain the **function dictionary**: on first sight of a function in this trace, allocate a `fn_id` (monotonic from 1) and stage a `DictEntry` for inclusion in the next batch.
 - Check flush thresholds after each emitted record: if `records ≥ flush_records` OR `estimated_bytes ≥ flush_bytes`, hand current buffer to shipper.
 - Enforce `buffer_cap_bytes`: if a new record would push `bytes_in_memory` (atomic snapshot) past the cap, drop the record (and any pending dict entry) and bump `drop_counter`.
-- At `RSHUTDOWN`: emit final batch even if empty? **No** — only if non-empty (REQ F-BF-3 / F-LC-4).
+- At `RSHUTDOWN`: **drain any still-open `CallFrame`s from the trace's stack into the pending buffer before flushing**, then emit final batch if non-empty (REQ F-BF-3 / F-LC-4). The drain pops frames top-first (highest `depth` first) and synthesises a `CallRecord` per frame using a single MSHUTDOWN-time snapshot triple — `CLOCK_MONOTONIC` ns for `t_out_ns`, `getrusage(RUSAGE_THREAD)` for `cpu_*_now_ns`, `zend_memory_usage(true)` for `mem_out_bytes`. Every drained record has `abnormal_exit = true` (per §4.1.4: the matching `end`-fcall callback never fired). The drained records share the same exit snapshot, so individual durations of `abnormal_exit=true` records should be read as "frame was open from `t_in_ns` until MSHUTDOWN", not as accurate per-frame measurements. The combined "drain + flush" produces a **single batch**, never split. PHP's script-body closure is the canonical case that requires this drain: it begins at script start, never ends naturally before MSHUTDOWN, and without the drain it never appears in any shipped batch — leaving every other call orphaned at the consumer side.
 
 **Clock sources**:
 - Wall time (`t_in`, `t_out`): `clock_gettime(CLOCK_MONOTONIC, …)`.
@@ -480,6 +480,8 @@ Top-level batch is a MessagePack map with three keys:
 #### 4.2.3 `calls` array entries
 
 Each entry is a MessagePack map with the keys from §4.1.4 in the same names: `call_id, parent, fn, depth, t_in, t_out, cpu_u, cpu_s, mem_in, mem_out, abnormal_exit`. Note `fn` is the wire-shortened name for `fn_id` (per REQ §9.1).
+
+**`parent` semantics**: a `CallRecord` whose `parent` field is the integer `0` is a **top-level call** — the immediate child of the trace's synthetic root. The recorder never emits a `CallRecord` with `call_id == 0`; `call_id` values start at `1`, and `0` is reserved as the "no parent" sentinel. When `parent` is non-zero, it MUST equal the `call_id` of another `CallRecord` in the same trace — either one already shipped in a previous batch, or one shipped **later in the same batch** (the recorder emits records in end-of-call order, so a child can precede its still-open parent within a single batch). Consumers SHOULD defer tree attachment until each batch is fully parsed; an unresolved non-zero `parent` after the trace's final batch is a data-integrity signal the consumer MAY use as it sees fit. The recorder guarantees that every `CallFrame` pushed during the trace produces a matching `CallRecord` somewhere in some batch — either naturally via the `end`-fcall handler or via the MSHUTDOWN drain documented in §3.2.
 
 > **Forward-compatibility rule**: unknown extra keys in any map MUST be ignored by the server (REQ-side defensive constraint). The extension only ever emits the keys above.
 

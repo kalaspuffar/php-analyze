@@ -39,15 +39,27 @@ calls — distributed as roughly 1/3 `make_tree` + 2/3
 children, doubling its sample size relative to the build).
 
 Of the committed 3 batches × 10,000 records = 30,000 sample
-records, plus the script-body closure's single record in
-batch 1.
+records, plus the script-body closure's single drained
+record in the final batch (see below).
+
+The recorder's MSHUTDOWN drain (`SPECIFICATION.md` §3.2)
+emits the still-open script-body closure as a single
+`abnormal_exit = true` `CallRecord` with `(call_id=1,
+parent=0, depth=0)`. For this workload the drain batch
+reliably reaches the capture sink (the steady-state
+shipper-queue pressure is mild), so the committed final-
+batch sample carries that drained record.
 
 ## Committed sample
 
-- Recorder commit SHA at capture time: `c7924292ca4e`
+- Recorder commit SHA at capture time: `8b376d2c3afa`
 - Batches captured (full run): 25
-- Batches kept for git: 3 (the first three)
-- File sizes: ~1 MB each
+- Batches kept for git: 3 (`batch-0001`, `batch-0002`, plus
+  the **final** batch `batch-0025` — the highest-numbered
+  batch the capture sink received, which carries the
+  MSHUTDOWN-drained root record)
+- File sizes: ~1 MB each (the final batch is smaller — it
+  contains only the residual records plus the drained root)
 
 Regenerate via `tools/capture-fixtures.sh` from the repo
 root. See [`../README.md`](../README.md) for the
@@ -65,6 +77,12 @@ samples-not-goldens disclaimer.
 - The `(call_id, parent)` graph reconstructs the recursive
   call tree. The visualizer's tree-rendering tests can use
   this fixture to verify their parent-pointer traversal.
+- The final batch contains exactly one `CallRecord` with
+  `call_id == 1`, `parent == 0`, `depth == 0`, and
+  `abnormal_exit == true` — the MSHUTDOWN-drained
+  script-body closure root. Every other record's `parent`
+  field resolves either to a `call_id` in the same trace
+  or to that root.
 - `call.cpu_u` / `call.cpu_s` values are `0` on a build of
   the recorder running under `php_analyze.cpu_snapshot_mode
   = per-call` (the default — but those values can be near

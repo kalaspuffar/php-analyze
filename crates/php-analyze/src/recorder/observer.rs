@@ -153,6 +153,20 @@ pub fn rshutdown_release_trace() {
             return;
         };
 
+        // Drain any still-open CallFrames into abnormal-exit
+        // CallRecords before the final flush. PHP's script body is
+        // observed as a closure that begins at script start; its
+        // matching `end`-fcall callback never fires before MSHUTDOWN,
+        // so without this drain the root frame's CallRecord never
+        // reaches the wire and downstream collectors that enforce
+        // referential integrity on `parent` would file every other
+        // call as an orphan. See
+        // `openspec/specs/recorder-call-events/spec.md`
+        // ("`rshutdown_release_trace` SHALL drain still-open
+        // CallFrames into abnormal-exit CallRecords before the final
+        // flush") for the contract.
+        drain_open_frames_into_buffer(&mut trace);
+
         // Phase-4 slice 2: hand the non-empty buffer to the shipper
         // before the trace is dropped.
         if !trace.buffer.is_empty() {
@@ -174,6 +188,54 @@ pub fn rshutdown_release_trace() {
         crate::recorder::dump::write_trace_if_path_set(&trace);
         drop(trace);
     });
+}
+
+/// Drain every still-open `CallFrame` on `trace.stack` into the
+/// trace's buffer as abnormal-exit `CallRecord`s.
+///
+/// Ordering invariant — **top-first**: we pop from the top of the
+/// stack and emit immediately. The drained record sequence is
+/// therefore `(depth=N, depth=N-1, …, depth=0)`, matching the
+/// recorder's existing end-of-call emission order (a child's record
+/// always precedes its parent's). The §4.2.3 wire-format Requirement
+/// on `parent` referential integrity assumes this ordering within a
+/// single batch.
+///
+/// Snapshot invariant — **shared exit triple**: we capture one
+/// `ExitSnapshots` before the loop and reuse it for every drained
+/// record. The drain runs in a tight loop with no PHP code executing
+/// between frames, so per-frame snapshots would only measure the
+/// drain loop's own cost. The shared-snapshot approach preserves the
+/// "frames ended at MSHUTDOWN" semantic and keeps the drain
+/// allocation- and syscall-free per record.
+///
+/// Accounting invariant — every drained record flows through
+/// `Trace::push_record`, so `buffer_estimated_bytes` and the
+/// process-wide `BYTES_IN_MEMORY` atomic track the drained records
+/// exactly as they would for naturally-ended records. The subsequent
+/// `accounting::sub(trace.buffer_estimated_bytes)` in
+/// `rshutdown_release_trace` therefore restores the atomic to its
+/// pre-trace value after the resulting batch is flushed.
+///
+/// This deliberately does **not** consult `flush_records` /
+/// `flush_bytes`: the spec requires a single-batch emission for the
+/// drain, so we never flush mid-loop. The outer
+/// `rshutdown_release_trace` runs exactly one flush after the drain
+/// returns.
+fn drain_open_frames_into_buffer(trace: &mut Trace) {
+    if trace.stack.is_empty() {
+        return;
+    }
+    let exit = ExitSnapshots::capture_now();
+    while let Some(frame) = trace.stack.pop() {
+        let record = frame.into_abnormal_call_record(
+            exit.t_out_ns,
+            exit.cpu_u_now_ns,
+            exit.cpu_s_now_ns,
+            exit.mem_out_bytes,
+        );
+        trace.push_record(record);
+    }
 }
 
 /// Borrow the current `Trace` mutably for the duration of `f`.
@@ -3216,6 +3278,169 @@ mod tests {
         accounting::sub(residual[0].size_estimate);
         assert_eq!(accounting::snapshot(), 0);
 
+        crate::shipper::reset_for_test();
+    }
+
+    // --- MSHUTDOWN drain of unclosed CallFrames --------------------------
+
+    #[test]
+    fn rshutdown_drains_a_single_unclosed_root_frame_as_abnormal_exit() {
+        // PHP's script-body closure begins at script start; its
+        // matching end-fcall never fires before MSHUTDOWN. Without
+        // the drain, no CallRecord with call_id=1 would ever ship.
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        rinit_allocate_trace(stub_identity(), permissive_limits());
+        with_current_trace(|trace| {
+            let cat = cat_for("script_main_closure");
+            // One begin, NO matching end_with_snapshots — the frame
+            // sits on `Trace.stack` waiting for the drain.
+            begin_with_snapshots(trace, &cat, entry_snapshots());
+            assert_eq!(trace.stack.len(), 1);
+            assert!(
+                trace.buffer.is_empty(),
+                "no records emitted yet; the begin only pushes a frame",
+            );
+        });
+
+        rshutdown_release_trace();
+
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(
+            batches.len(),
+            1,
+            "the drain must produce exactly one final batch covering the drained root",
+        );
+        assert_eq!(batches[0].calls.len(), 1);
+        let root = &batches[0].calls[0];
+        assert_eq!(root.call_id, 1);
+        assert_eq!(root.parent, 0);
+        assert_eq!(root.depth, 0);
+        assert!(
+            root.abnormal_exit,
+            "a frame drained at MSHUTDOWN ended abnormally by definition",
+        );
+        assert!(
+            root.t_out_ns >= root.t_in_ns,
+            "t_out_ns came from the drain snapshot; must be >= the captured t_in_ns",
+        );
+
+        // The shipper-side consume-subtract is Section 6; emulate it
+        // so the atomic ends balanced.
+        accounting::sub(batches[0].size_estimate);
+        assert_eq!(accounting::snapshot(), 0);
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn rshutdown_drains_two_nested_unclosed_frames_top_first_with_shared_exit_snapshot() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        rinit_allocate_trace(stub_identity(), permissive_limits());
+        with_current_trace(|trace| {
+            let outer = cat_for("outer");
+            let inner = cat_for("inner");
+            // Two unmatched begins → both frames on the stack.
+            begin_with_snapshots(trace, &outer, entry_snapshots());
+            begin_with_snapshots(trace, &inner, entry_snapshots());
+            assert_eq!(trace.stack.len(), 2);
+        });
+
+        rshutdown_release_trace();
+
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(batches.len(), 1);
+        let calls = &batches[0].calls;
+        assert_eq!(calls.len(), 2);
+        // Top-first order: the inner (call_id=2, parent=1, depth=1)
+        // frame is popped and emitted first; the outer
+        // (call_id=1, parent=0, depth=0) frame follows.
+        assert_eq!(
+            (calls[0].call_id, calls[0].parent, calls[0].depth),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (calls[1].call_id, calls[1].parent, calls[1].depth),
+            (1, 0, 0)
+        );
+        assert!(calls[0].abnormal_exit && calls[1].abnormal_exit);
+        // Shared exit snapshot — both records get byte-equal exit
+        // fields. The CPU/mem fields may legitimately differ (each
+        // is `snapshot - frame.cpu_*_in_ns`), so we assert only on
+        // `t_out_ns` and `mem_out_bytes`, which are taken directly
+        // from the shared snapshot.
+        assert_eq!(calls[0].t_out_ns, calls[1].t_out_ns);
+        assert_eq!(calls[0].mem_out_bytes, calls[1].mem_out_bytes);
+
+        accounting::sub(batches[0].size_estimate);
+        assert_eq!(accounting::snapshot(), 0);
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn rshutdown_drain_is_a_noop_for_a_balanced_trace() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        rinit_allocate_trace(stub_identity(), permissive_limits());
+        with_current_trace(|trace| {
+            let cat = cat_for("balanced");
+            begin_with_snapshots(trace, &cat, entry_snapshots());
+            end_with_snapshots(trace, exit_snapshots(), false);
+            assert!(
+                trace.stack.is_empty(),
+                "balanced begin/end leaves the stack empty; drain must be a no-op",
+            );
+            assert_eq!(trace.buffer.len(), 1);
+        });
+
+        rshutdown_release_trace();
+
+        let batches = drain_queued_batches(&rx);
+        assert_eq!(
+            batches.len(),
+            1,
+            "the existing flush branch sends the one buffered record",
+        );
+        assert_eq!(
+            batches[0].calls.len(),
+            1,
+            "no extra drained records — the stack was already empty",
+        );
+        assert!(
+            !batches[0].calls[0].abnormal_exit,
+            "the balanced record ended normally; the drain did not synthesize anything",
+        );
+
+        accounting::sub(batches[0].size_estimate);
+        assert_eq!(accounting::snapshot(), 0);
+        crate::shipper::reset_for_test();
+    }
+
+    #[test]
+    fn rshutdown_drain_on_empty_slot_sends_nothing_and_leaves_atomic_at_zero() {
+        let _shipper_guard = crate::shipper::acquire_test_lock();
+        let _account_guard = account_guard();
+        accounting::reset_for_test();
+        let rx = install_test_channel(8);
+
+        // No rinit_allocate_trace — the slot is empty.
+        rshutdown_release_trace();
+        rshutdown_release_trace();
+
+        assert!(
+            drain_queued_batches(&rx).is_empty(),
+            "no trace means nothing to drain and nothing to flush",
+        );
+        assert_eq!(accounting::snapshot(), 0);
         crate::shipper::reset_for_test();
     }
 

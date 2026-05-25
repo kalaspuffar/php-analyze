@@ -32,14 +32,25 @@ A full run produces ~11 batches × 10,000 records ≈ 110,000
 calls. Of the committed 3 batches × 10,000 records = 30,000
 sample records, distributed roughly evenly across the four
 functions (`json_encode`, `json_decode`, `row_id`, plus the
-script-body closure's single record).
+script-body closure's single drained record in the final
+batch — see below).
+
+The recorder's MSHUTDOWN drain (`SPECIFICATION.md` §3.2)
+emits the still-open script-body closure as a single
+`abnormal_exit = true` `CallRecord` with `(call_id=1,
+parent=0, depth=0)`. The committed final-batch sample
+(`batch-0011`) carries that drained record alongside any
+residual records flushed at MSHUTDOWN.
 
 ## Committed sample
 
-- Recorder commit SHA at capture time: `c7924292ca4e`
+- Recorder commit SHA at capture time: `8b376d2c3afa`
 - Batches captured (full run): 11
-- Batches kept for git: 3 (the first three)
-- File sizes: ~1 MB each
+- Batches kept for git: 3 (`batch-0001`, `batch-0002`, plus
+  the **final** batch `batch-0011`)
+- File sizes: ~1 MB each (the final batch is much smaller —
+  it contains only the residual records plus the drained
+  root)
 
 Regenerate via `tools/capture-fixtures.sh` from the repo
 root. See [`../README.md`](../README.md) for the
@@ -60,3 +71,9 @@ samples-not-goldens disclaimer.
 - `call.mem_in` / `call.mem_out` are non-zero — JSON operations
   allocate PHP-side memory; the recorder captures
   `zend_memory_usage(true)` snapshots that reflect that.
+- The final batch contains exactly one `CallRecord` with
+  `call_id == 1`, `parent == 0`, `depth == 0`, and
+  `abnormal_exit == true` — the MSHUTDOWN-drained
+  script-body closure root. Every other record's `parent`
+  field resolves either to a previously-seen `call_id` or
+  to that root.
