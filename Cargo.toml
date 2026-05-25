@@ -21,4 +21,11 @@ unsafe_op_in_unsafe_fn = "warn"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-debug = "line-tables-only"
+# Suppress DWARF emission across the workspace. `line-tables-only` was not
+# being honoured for the whole dependency closure; we keep the shipped
+# `.so` lean by emitting nothing and stripping at link time as a belt.
+# `panic` stays at the rustc default of `"unwind"` because the shipper
+# thread relies on `JoinHandle::join() -> Err` to surface panics without
+# aborting the PHP worker. See `COMMENTS.md` C-20.
+debug = false
+strip = "symbols"

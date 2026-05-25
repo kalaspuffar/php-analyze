@@ -721,6 +721,114 @@ work outside this change's scope; landing the allocation
 improvements now keeps `main` strictly closer to the budget and
 unblocks the spec discussion with concrete numbers.
 
+### C-20 — `panic = "abort"` declined: shipper-thread panic isolation needs unwinding
+
+**Status**: declined during the 2026-05-25 code review (`REVIEW.md`
+finding S-2). Recorded here so the option does not get re-proposed
+on a future binary-size pass without revisiting the reliability
+tradeoff.
+
+**Surface**: `Cargo.toml:20-25` (`[profile.release]`),
+`crates/php-analyze/src/shipper/mod.rs:98-110` (`JoinOutcome::Panicked`).
+
+**The proposal**: set `panic = "abort"` to shrink `.eh_frame` and
+remove landing-pad pollution from every function — claimed ~180 KB
+saving plus smaller `.text`.
+
+**Why it was declined**: the shipper module defines
+`JoinOutcome::Panicked` as a distinct variant of the MSHUTDOWN
+drain outcome. That variant is reached via `JoinHandle::join()`
+returning `Err`, which **only works under `panic = "unwind"`**.
+With `panic = "abort"`, a panic in the shipper thread aborts the
+entire PHP worker process — the request thread that was happily
+serving traffic dies with it, every batch in the channel is lost,
+every other request being served by the same worker is killed.
+
+For an extension whose top reliability requirement is *"never
+crash the PHP process"* (`SPECIFICATION.md` §8.3 NFR-REL-1, AD-4),
+the unwind tables are paying for real isolation between the
+shipper and request threads. The codebase's lack of an explicit
+`catch_unwind` boundary is misleading: `JoinHandle::join()` IS the
+catch — it just lives across the thread boundary instead of within
+a single stack.
+
+**If revisited**: would require either (a) accepting that a
+panicking shipper thread takes the whole worker down (regression
+vs. today's documented posture), or (b) wrapping the shipper loop
+body in an explicit `catch_unwind` so the abort posture and the
+recovery posture compose. Option (b) is feasible but adds code
+complexity for a small binary-size saving; not worth doing without
+a binary-size NFR forcing the conversation.
+
+### C-21 — `RefCell<Trace>` → `Cell<*mut Trace>` deferred until benched
+
+**Status**: deferred during the 2026-05-25 code review (`REVIEW.md`
+finding P-4). The optimisation is sound on paper but introduces
+unsafe code for a marginal gain, and the cost/benefit only
+justifies it once the bench shows the borrow check is the
+next-dominant cost after `should_observe` filtering (P-0) and
+gate-before-snapshot (P-1) land.
+
+**Surface**: `crates/php-analyze/src/recorder/observer.rs:58-62`
+(thread-local declaration), `252-254` (the `with_current_trace`
+accessor).
+
+**The idea**: today's `RefCell<Option<Trace>>` does a runtime
+borrow check on every `begin` / `end` event. The module docstring
+(`observer.rs:13-21`) already documents that observer callbacks
+are non-reentrant on a single thread, so the borrow is always
+uncontended. Replacing the `RefCell` with `Cell<*mut Trace>` (or
+`UnsafeCell<Option<Trace>>` with a documented invariant) saves
+~5–15 ns per call.
+
+**Why it was deferred**:
+
+- Introduces unsafe at a hot-path entry point. Today's `RefCell`
+  is the safety net that catches a hypothetical future re-entry
+  bug at runtime; raw pointers make a violation UB.
+- Marginal gain (~10–30 ns / call total at begin + end) relative
+  to the other levers. P-0 alone is expected to remove many of
+  these calls from observation entirely, which makes the per-call
+  saving smaller in aggregate.
+- The post-P-0+P-1 bench result determines whether this is the
+  next-dominant cost. If the bench lands the geo-mean comfortably
+  under R-1's 5×, this optimisation buys nothing useful.
+
+**Revisit condition**: bench after P-0+P-1+P-3+P-5+P-6 land. If
+the `with_current_trace` borrow shows up as a top entry in a
+profile of `recorder_hot_path.rs`, schedule an OpenSpec change
+with a careful safety audit. Otherwise leave the `RefCell` in
+place.
+
+### C-22 — Minor per-call findings deferred (P-7 / P-8)
+
+**Status**: deferred during the 2026-05-25 code review. Both
+findings are real but the impact is too small to schedule against
+the R-1 budget; recorded here so they aren't forgotten if a future
+profiling pass surfaces them as next-dominant.
+
+**P-7 — `unknown_placeholder` uses `format!` on the
+unknown-call-site fallback path** (`observer.rs:755-757`). Only
+reached when Zend reports a function with no name (rare; mostly
+the spike's edge-case material). When it does fire, it's always
+on the dictionary-miss path which already allocates. The `format!`
+is not visible in any common-case profile.
+
+**P-8 — `rmp_serde::to_vec_named` is slower than `to_vec`**
+(`shipper/encode.rs:76-78`). Runs on the shipper thread, not the
+request hot path — does not contribute to the OBJ-2 / R-1 budget
+at all. Switching from named maps to positional arrays would be a
+**wire-format change** (downstream collectors that parse by name
+would break), so it isn't a free swap. Park unless the shipper
+thread itself becomes a CPU concern, which is unlikely given the
+shipper runs at most one batch-encode per `flush_records` /
+`flush_bytes` threshold cross.
+
+**See also**: C-19 (per-call `getrusage` is the structural cost and
+is staying — `cpu_snapshot_mode = PerCall` is required for
+argument-dependent leaf-node CPU attribution; this matches the
+posture decision recorded in `REVIEW.md` §2).
+
 ---
 
 ## 4. Repository hygiene
