@@ -21,6 +21,7 @@
 //!   missing usable token => [`Config::enabled`] is `false` and **at most
 //!   one** disable warning is emitted.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -66,6 +67,24 @@ pub struct Config {
     /// a measurable share of recorder overhead — see
     /// `COMMENTS.md` C-19.
     pub cpu_snapshot_mode: CpuSnapshotMode,
+    /// Function names for which `FcallObserver::should_observe` SHALL
+    /// return `false`. Operator-configurable via
+    /// `php_analyze.skip_functions`. Defaults to the curated
+    /// [`DEFAULT_SKIP_FUNCTIONS`] list when the directive is unset.
+    /// Entries are lowercased on parse; lookup keys are lowercased on
+    /// probe so matching is case-insensitive (matches PHP's
+    /// identifier semantics). Methods use the `class::method` form;
+    /// free functions use the bare name.
+    ///
+    /// Filtered functions cost **zero per call** after the first
+    /// sight: PHP caches `should_observe`'s answer per Zend function
+    /// entry for the process lifetime. See `REVIEW.md` finding P-0.
+    pub skip_functions: HashSet<String>,
+    /// When `true`, every `FcallInfo::is_internal == true` call is
+    /// skipped regardless of name. Operator-configurable via
+    /// `php_analyze.skip_internal`. Defaults to `false`. Composes
+    /// with `skip_functions` using OR.
+    pub skip_internal: bool,
 }
 
 /// Where the resolved bearer token came from. Rendered in `MINFO` (the
@@ -190,6 +209,15 @@ pub struct RawIni {
     /// through [`CpuSnapshotMode::parse`] in
     /// [`Config::from_ini_values`].
     pub cpu_snapshot_mode: Option<String>,
+    /// Raw `php_analyze.skip_functions` value. `None` means the
+    /// directive was absent (use [`DEFAULT_SKIP_FUNCTIONS`]);
+    /// `Some("")` means "no filtering"; otherwise the string is a
+    /// comma-separated list of function names (or `Class::method`
+    /// forms) parsed by [`parse_skip_functions`].
+    pub skip_functions: Option<String>,
+    /// Raw `php_analyze.skip_internal` value. `None` means the
+    /// directive was absent (use `false`).
+    pub skip_internal: Option<bool>,
 }
 
 /// Observation emitted while resolving a [`Config`]. The bootstrap layer
@@ -307,6 +335,11 @@ impl Config {
             // while the extension is off but rendering `phpinfo()`
             // still needs a defined value.
             cpu_snapshot_mode: CpuSnapshotMode::PerCall,
+            // Filter is empty when the extension is disabled: the
+            // recorder isn't running, so no filtering is relevant.
+            // `phpinfo()` renders this as the empty list.
+            skip_functions: HashSet::new(),
+            skip_internal: false,
         }
     }
 
@@ -468,6 +501,9 @@ impl Config {
             },
         };
 
+        let skip_functions = parse_skip_functions(raw.skip_functions.as_deref());
+        let skip_internal = raw.skip_internal.unwrap_or(false);
+
         let config = Self {
             enabled,
             disable_reason,
@@ -484,6 +520,8 @@ impl Config {
             shutdown_grace: Duration::from_millis(shutdown_grace_ms as u64),
             shipper_queue_depth: shipper_queue_depth as usize,
             cpu_snapshot_mode,
+            skip_functions,
+            skip_internal,
         };
 
         (config, warnings)
@@ -604,6 +642,113 @@ fn resolve_server_url(
             (None, ServerUrlOutcome::UnsupportedScheme)
         }
     }
+}
+
+/// Curated default skip list. Every entry is a high-frequency,
+/// sub-microsecond, pure-CPU PHP builtin whose CPU-vs-I/O profile is
+/// uninformative (always 100% on-CPU, always cheap, never blocked).
+/// Observing them at full per-call resolution costs more than the
+/// call itself.
+///
+/// The list is reproduced verbatim from the
+/// `skip-functions-directive` change's `design.md` §D-3, which
+/// records the four selection criteria each entry satisfies. Names
+/// are lowercase to match the runtime lookup key (PHP function names
+/// are case-insensitive; see `design.md` §D-4). All entries are
+/// root-namespace builtins, so no namespace prefix is needed.
+///
+/// Aliases (`is_int`/`is_integer`, `is_long`/`is_int`, `sizeof`/
+/// `count`, `key_exists`/`array_key_exists`, `doubleval`/`floatval`)
+/// are listed independently because PHP's executor dispatches each
+/// name as a separate Zend function entry — caching `should_observe`
+/// per entry means both must appear in the set for the alias to be
+/// filtered.
+pub const DEFAULT_SKIP_FUNCTIONS: &[&str] = &[
+    // Type predicates (return bool, no allocation, branch-only).
+    "is_array",
+    "is_bool",
+    "is_callable",
+    "is_countable",
+    "is_float",
+    "is_int",
+    "is_integer",
+    "is_iterable",
+    "is_long",
+    "is_null",
+    "is_numeric",
+    "is_object",
+    "is_scalar",
+    "is_string",
+    // Cheap introspection (symbol-table or zend_string lookups; no autoload).
+    "gettype",
+    "get_class",
+    "get_called_class",
+    "get_parent_class",
+    "function_exists",
+    "method_exists",
+    "property_exists",
+    "defined",
+    "spl_object_id",
+    "spl_object_hash",
+    // Length / count (O(1) on PHP's internal types).
+    "strlen",
+    "count",
+    "sizeof",
+    "array_key_exists",
+    "key_exists",
+    "key",
+    "current",
+    // Type conversions (no parse loops worth attributing per-call).
+    "intval",
+    "floatval",
+    "doubleval",
+    "strval",
+    "boolval",
+    // Cheap math primitives (single-op CPU; never blocked).
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "intdiv",
+];
+
+/// Resolve the `php_analyze.skip_functions` directive's raw value
+/// into a [`HashSet`] of lowercase function-name keys.
+///
+/// - `None`: directive unset → return the curated
+///   [`DEFAULT_SKIP_FUNCTIONS`] list as an owned `HashSet`.
+/// - `Some(s)` with `s.trim().is_empty()`: operator explicitly opted
+///   out of filtering → empty set.
+/// - `Some(s)` otherwise: split on `,`, trim each entry, lowercase
+///   each entry, drop empties, collect.
+///
+/// Entries with a `::` substring are method-form keys (e.g.
+/// `foo::bar`); entries without are free-function keys (e.g.
+/// `strlen`). The `should_observe` probe site builds the lookup key
+/// in the matching shape and probes this set directly.
+fn parse_skip_functions(raw: Option<&str>) -> HashSet<String> {
+    // Both `None` (directive unset) and `Some(s)` where `s` collapses
+    // to zero non-empty entries (empty string, whitespace-only, CSV
+    // of empties) resolve to the curated default. PHP's INI subsystem
+    // cannot distinguish "unset" from "set to empty", so the parser
+    // treats them identically — see this change's `design.md` D-2.
+    let parsed: HashSet<String> = raw
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    if parsed.is_empty() {
+        return DEFAULT_SKIP_FUNCTIONS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+    }
+    parsed
 }
 
 enum TokenOutcome {
@@ -994,6 +1139,128 @@ mod tests {
             })
             .collect();
         assert_eq!(disable_warnings.len(), 1, "got {warnings:?}");
+    }
+
+    // --- skip_functions / skip_internal (skip-functions-directive) --------
+
+    #[test]
+    fn skip_functions_absent_directive_resolves_to_curated_default() {
+        // `RawIni::skip_functions = None` → use DEFAULT_SKIP_FUNCTIONS.
+        // Spot-check a few entries to confirm the curated list landed.
+        let (config, _warnings) = Config::from_ini_values(&minimal_valid_raw());
+        for name in ["strlen", "count", "is_array", "is_int", "gettype"] {
+            assert!(
+                config.skip_functions.contains(name),
+                "default skip set should contain `{name}`; got {:?}",
+                config.skip_functions
+            );
+        }
+        // Every default entry is lowercased.
+        for entry in &config.skip_functions {
+            assert_eq!(
+                entry.to_ascii_lowercase(),
+                *entry,
+                "default skip entry not lowercased: {entry:?}"
+            );
+        }
+        // Size matches the constant.
+        assert_eq!(
+            config.skip_functions.len(),
+            DEFAULT_SKIP_FUNCTIONS.len(),
+            "default set size mismatch"
+        );
+    }
+
+    #[test]
+    fn skip_functions_empty_string_resolves_to_curated_default() {
+        // PHP's INI subsystem cannot distinguish "directive unset" from
+        // "directive set to empty string" — both arrive as the same
+        // value. The implementation treats both identically: use the
+        // curated default. Documented in design.md D-2 and the spec
+        // scenario "Empty / whitespace-only directive value falls back
+        // to the curated default".
+        let raw = RawIni {
+            skip_functions: Some(String::new()),
+            ..minimal_valid_raw()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        // `lookup_str` strips empties before this branch is reached in
+        // production, but the parser is robust: an explicit `Some("")`
+        // collapses to "no non-empty entries" → falls through to the
+        // default.
+        assert_eq!(config.skip_functions.len(), DEFAULT_SKIP_FUNCTIONS.len());
+    }
+
+    #[test]
+    fn skip_functions_csv_replaces_default_and_lowercases_each_entry() {
+        let raw = RawIni {
+            skip_functions: Some("foo, BAR ,Baz::Qux".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        assert_eq!(config.skip_functions.len(), 3);
+        for expected in ["foo", "bar", "baz::qux"] {
+            assert!(
+                config.skip_functions.contains(expected),
+                "expected `{expected}` in set; got {:?}",
+                config.skip_functions
+            );
+        }
+        // The curated default's spot-check names MUST NOT be present
+        // (the operator's list replaces the default).
+        for absent in ["strlen", "count", "is_array"] {
+            assert!(
+                !config.skip_functions.contains(absent),
+                "operator-set list should not retain default entry `{absent}`",
+            );
+        }
+    }
+
+    #[test]
+    fn skip_functions_whitespace_only_entries_are_dropped() {
+        let raw = RawIni {
+            skip_functions: Some(", , foo, ".to_owned()),
+            ..minimal_valid_raw()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        assert_eq!(config.skip_functions.len(), 1);
+        assert!(config.skip_functions.contains("foo"));
+    }
+
+    #[test]
+    fn skip_internal_defaults_to_false_when_directive_absent() {
+        let (config, _warnings) = Config::from_ini_values(&minimal_valid_raw());
+        assert!(!config.skip_internal);
+    }
+
+    #[test]
+    fn skip_internal_parses_truthy_and_falsy() {
+        for value in [true, false] {
+            let raw = RawIni {
+                skip_internal: Some(value),
+                ..minimal_valid_raw()
+            };
+            let (config, _warnings) = Config::from_ini_values(&raw);
+            assert_eq!(config.skip_internal, value);
+        }
+    }
+
+    #[test]
+    fn skip_directives_are_empty_under_master_switch_off() {
+        // Master-switch-off short-circuits config resolution (R-5):
+        // the disabled config carries empty skip set + skip_internal =
+        // false regardless of operator input. The recorder isn't
+        // running, so the filter values are inert.
+        let raw = RawIni {
+            enabled: Some(false),
+            skip_functions: Some("strlen,count".to_owned()),
+            skip_internal: Some(true),
+            ..RawIni::default()
+        };
+        let (config, _warnings) = Config::from_ini_values(&raw);
+        assert!(!config.enabled);
+        assert!(config.skip_functions.is_empty());
+        assert!(!config.skip_internal);
     }
 
     // --- cpu_snapshot_mode (recorder-cpu-snapshot-cadence) ----------------
