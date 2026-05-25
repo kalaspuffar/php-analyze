@@ -549,11 +549,21 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 /// value.
 pub fn initialise_from_ini(raw: RawIni) -> Vec<ConfigWarning> {
     let (config, warnings) = Config::from_ini_values(&raw);
-    // Ignore the result: a second MINIT in the same process is unusual
-    // (PHP-FPM workers inherit the master's CONFIG), but if it does
-    // happen the first value wins. The bootstrap layer treats `MINIT` as
-    // a one-shot.
-    let _ = CONFIG.set(config);
+    // `CpuSnapshotMode` is `Copy`; capture before the move into the
+    // `OnceLock`. Used by the recorder hot-path cache publication
+    // below.
+    let cpu_snapshot_mode = config.cpu_snapshot_mode;
+    // A second MINIT in the same process is unusual (PHP-FPM workers
+    // inherit the master's CONFIG), but if it does happen the first
+    // value wins. The bootstrap layer treats `MINIT` as a one-shot.
+    if CONFIG.set(config).is_ok() {
+        // P-3 (recorder-hot-path-polish): publish the resolved
+        // `cpu_snapshot_mode` to the process-wide cache so the
+        // recorder hot path can skip `Config::global()` per call.
+        // Only publish when `CONFIG.set` actually accepted the
+        // value, mirroring the first-MINIT-wins semantic above.
+        crate::recorder::observer::publish_cached_cpu_snapshot_mode(cpu_snapshot_mode);
+    }
     warnings
 }
 

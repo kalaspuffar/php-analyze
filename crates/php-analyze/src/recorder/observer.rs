@@ -357,47 +357,106 @@ impl ExitSnapshots {
 
 /// Resolve the active `cpu_snapshot_mode` for the current process.
 ///
-/// Reads `Config::global().cpu_snapshot_mode` (the frozen-at-MINIT
-/// value) and returns its `Copy` mode. Before `MINIT` runs — or in
-/// the `cargo test` build where production paths are exercised in
-/// isolation — the global is uninitialised; this helper falls back
-/// to [`CpuSnapshotMode::PerCall`] so unit tests preserve the
-/// spec-current behaviour without depending on global state.
-///
-/// The branch on `Config::global()`'s `Option` is single-load against
-/// a `OnceLock`; the steady-state cost (post-MINIT) is one memory
-/// load. The mode itself is `Copy`, so the return is a value-copy.
+/// Reads the process-wide [`CACHED_CPU_SNAPSHOT_MODE`] atomic — a
+/// single relaxed load. The cache is populated exactly once at MINIT
+/// by [`publish_cached_cpu_snapshot_mode`] (called from
+/// [`crate::config::initialise_from_ini`]) so subsequent reads on
+/// the recorder hot path do not re-resolve `Config::global()`. The
+/// pre-MINIT path (cache unset) falls back to `Config::global()`'s
+/// chain and then [`CpuSnapshotMode::PerCall`] — matches the
+/// existing spec-current default. See REVIEW.md P-3 and the
+/// `recorder-hot-path-polish` change for the cache contract.
 ///
 /// **Test seam**: under `cfg(test)`, [`set_cpu_snapshot_mode_for_test`]
-/// can publish a mode that this helper observes before consulting
-/// `Config::global()`. The override is process-wide; tests that use
-/// it MUST [`clear_cpu_snapshot_mode_for_test`] on teardown.
+/// can publish a mode that this helper observes BEFORE consulting
+/// the cache. The override is process-wide; tests that use it MUST
+/// [`clear_cpu_snapshot_mode_for_test`] on teardown.
 #[inline]
 fn current_cpu_snapshot_mode() -> crate::config::CpuSnapshotMode {
     #[cfg(test)]
     if let Some(mode) = cpu_snapshot_mode_test_override() {
         return mode;
     }
-    crate::config::Config::global()
-        .map(|c| c.cpu_snapshot_mode)
-        .unwrap_or(crate::config::CpuSnapshotMode::PerCall)
+    match CACHED_CPU_SNAPSHOT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        CPU_SNAPSHOT_MODE_PER_CALL => crate::config::CpuSnapshotMode::PerCall,
+        CPU_SNAPSHOT_MODE_OFF => crate::config::CpuSnapshotMode::Off,
+        // Cache unset (pre-MINIT) — fall through to the
+        // `Config::global()` chain. Unreachable on the production
+        // hot path once `initialise_from_ini` has run.
+        _ => crate::config::Config::global()
+            .map(|c| c.cpu_snapshot_mode)
+            .unwrap_or(crate::config::CpuSnapshotMode::PerCall),
+    }
+}
+
+/// Shared encoding for both the production cache
+/// ([`CACHED_CPU_SNAPSHOT_MODE`]) and the test override
+/// ([`CPU_SNAPSHOT_MODE_TEST_OVERRIDE`]). The constants live at
+/// module scope so the same decoder serves both atomics.
+const CPU_SNAPSHOT_MODE_UNSET: u8 = 0xff;
+const CPU_SNAPSHOT_MODE_PER_CALL: u8 = 0;
+const CPU_SNAPSHOT_MODE_OFF: u8 = 1;
+
+/// Process-wide cache for `Config::cpu_snapshot_mode`, populated at
+/// MINIT by [`publish_cached_cpu_snapshot_mode`]. The recorder hot
+/// path reads this via [`current_cpu_snapshot_mode`] with one
+/// `Ordering::Relaxed` load — no `Config::global()` resolution per
+/// call. See REVIEW.md P-3 and the `recorder-hot-path-polish`
+/// change.
+///
+/// The atomic is module-private. Production publication goes through
+/// [`publish_cached_cpu_snapshot_mode`]; tests use the `#[cfg(test)]`
+/// helpers below for verification.
+static CACHED_CPU_SNAPSHOT_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(CPU_SNAPSHOT_MODE_UNSET);
+
+/// Publish the resolved `cpu_snapshot_mode` into the process-wide
+/// cache. Called once at MINIT by [`crate::config::initialise_from_ini`]
+/// after `Config::set` succeeds, so the cache and `Config::global()`
+/// are consistent in the same observable moment.
+///
+/// Production callers invoke this exactly once. Tests use
+/// [`reset_cached_cpu_snapshot_mode_for_test`] to restore the
+/// unset sentinel between assertions.
+pub(crate) fn publish_cached_cpu_snapshot_mode(mode: crate::config::CpuSnapshotMode) {
+    let encoded = encode_cpu_snapshot_mode(mode);
+    CACHED_CPU_SNAPSHOT_MODE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Encode a [`crate::config::CpuSnapshotMode`] into the shared
+/// `AtomicU8` representation. Used by both the production cache
+/// publication path and the test override setter.
+fn encode_cpu_snapshot_mode(mode: crate::config::CpuSnapshotMode) -> u8 {
+    match mode {
+        crate::config::CpuSnapshotMode::PerCall => CPU_SNAPSHOT_MODE_PER_CALL,
+        crate::config::CpuSnapshotMode::Off => CPU_SNAPSHOT_MODE_OFF,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cached_cpu_snapshot_mode_for_test() -> u8 {
+    CACHED_CPU_SNAPSHOT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cached_cpu_snapshot_mode_for_test() {
+    CACHED_CPU_SNAPSHOT_MODE.store(
+        CPU_SNAPSHOT_MODE_UNSET,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Test-only override slot for [`current_cpu_snapshot_mode`]. Encoded
-/// as an `AtomicU8` because `AtomicEnum` is not in stdlib:
-/// - `0xff` = no override (default; helper consults `Config::global`).
-/// - `0` = `CpuSnapshotMode::PerCall`.
-/// - `1` = `CpuSnapshotMode::Off`.
+/// via the shared `CPU_SNAPSHOT_MODE_*` constants — sentinel `0xff`
+/// (`CPU_SNAPSHOT_MODE_UNSET`) means no override (helper falls
+/// through to the production cache, then the `Config::global()`
+/// chain).
 ///
-/// The encoding mirrors the natural source order of the variants;
-/// tests reset the slot to `0xff` on teardown so cross-test
+/// Tests reset the slot to `0xff` on teardown so cross-test
 /// contamination is impossible.
 #[cfg(test)]
 static CPU_SNAPSHOT_MODE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0xff);
-
-#[cfg(test)]
-const CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET: u8 = 0xff;
+    std::sync::atomic::AtomicU8::new(CPU_SNAPSHOT_MODE_UNSET);
 
 /// Serialises every test that touches the
 /// [`CPU_SNAPSHOT_MODE_TEST_OVERRIDE`] slot. Cargo test runs tests
@@ -416,9 +475,9 @@ static CPU_SNAPSHOT_MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 fn cpu_snapshot_mode_test_override() -> Option<crate::config::CpuSnapshotMode> {
     use std::sync::atomic::Ordering;
     match CPU_SNAPSHOT_MODE_TEST_OVERRIDE.load(Ordering::Relaxed) {
-        CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET => None,
-        0 => Some(crate::config::CpuSnapshotMode::PerCall),
-        1 => Some(crate::config::CpuSnapshotMode::Off),
+        CPU_SNAPSHOT_MODE_UNSET => None,
+        CPU_SNAPSHOT_MODE_PER_CALL => Some(crate::config::CpuSnapshotMode::PerCall),
+        CPU_SNAPSHOT_MODE_OFF => Some(crate::config::CpuSnapshotMode::Off),
         // Any other value is a test-side bug — the encoding above is
         // total.
         other => panic!("CPU_SNAPSHOT_MODE_TEST_OVERRIDE has bogus value {other}"),
@@ -433,21 +492,17 @@ fn cpu_snapshot_mode_test_override() -> Option<crate::config::CpuSnapshotMode> {
 #[cfg(test)]
 fn set_cpu_snapshot_mode_for_test(mode: crate::config::CpuSnapshotMode) {
     use std::sync::atomic::Ordering;
-    let encoded = match mode {
-        crate::config::CpuSnapshotMode::PerCall => 0,
-        crate::config::CpuSnapshotMode::Off => 1,
-    };
-    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(encoded, Ordering::Relaxed);
+    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(encode_cpu_snapshot_mode(mode), Ordering::Relaxed);
 }
 
 /// Clear the test override; subsequent reads of
 /// [`current_cpu_snapshot_mode`] fall back to the
-/// `Config::global()`-or-default path. Idempotent. Callers MUST
-/// hold [`CPU_SNAPSHOT_MODE_TEST_LOCK`].
+/// production cache, then the `Config::global()`-or-default chain.
+/// Idempotent. Callers MUST hold [`CPU_SNAPSHOT_MODE_TEST_LOCK`].
 #[cfg(test)]
 fn clear_cpu_snapshot_mode_for_test() {
     use std::sync::atomic::Ordering;
-    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(CPU_SNAPSHOT_MODE_TEST_OVERRIDE_UNSET, Ordering::Relaxed);
+    CPU_SNAPSHOT_MODE_TEST_OVERRIDE.store(CPU_SNAPSHOT_MODE_UNSET, Ordering::Relaxed);
 }
 
 /// Acquire [`CPU_SNAPSHOT_MODE_TEST_LOCK`] without publishing an
@@ -638,7 +693,33 @@ unsafe fn zend_string_to_cow<'a>(zs: *mut ffi::zend_string) -> Option<std::borro
     let len = unsafe { (*zs).len };
     let ptr = unsafe { (*zs).val.as_ptr() };
     let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-    Some(String::from_utf8_lossy(slice))
+    // P-5 (recorder-hot-path-polish): three-arm fast path. PHP
+    // function/class identifiers are parser-validated ASCII; that's
+    // the dominant input shape on the hot path. `slice.is_ascii()`
+    // lowers to SIMD (`pmovmskb` on x86_64), so the check is a few
+    // cycles per 16-byte chunk. The previous monolithic
+    // `from_utf8_lossy` walked the bytes twice.
+    if slice.is_ascii() {
+        // SAFETY: ASCII bytes (every byte in 0..=0x7f) are a strict
+        // subset of valid UTF-8. `is_ascii` is total over the slice;
+        // the byte sequence cannot change between the check and the
+        // conversion (the underlying `zend_string` payload is
+        // observation-time stable per Zend's contract).
+        return Some(std::borrow::Cow::Borrowed(unsafe {
+            std::str::from_utf8_unchecked(slice)
+        }));
+    }
+    match std::str::from_utf8(slice) {
+        Ok(s) => Some(std::borrow::Cow::Borrowed(s)),
+        // RO-4 fallback: a `zend_string` whose payload bytes are not
+        // valid UTF-8 (a rare filesystem-path edge case observed in
+        // the spike's data). Lossy-decode preserves the categorise
+        // routing contract while substituting U+FFFD for invalid
+        // sequences.
+        Err(_) => Some(std::borrow::Cow::Owned(
+            String::from_utf8_lossy(slice).into_owned(),
+        )),
+    }
 }
 
 // --- categorise -----------------------------------------------------------
@@ -1045,15 +1126,28 @@ impl Recorder {
     /// between `MINIT` and the first `RINIT` (slot empty) — and any
     /// future out-of-request fire — no longer pay for clock reads
     /// they cannot record.
+    ///
+    /// P-6 (`recorder-hot-path-polish`): the `extract_call_site` walk
+    /// also moves inside the closure, so out-of-request fires pay
+    /// zero for the unsafe pointer-chain walk as well.
     fn begin_handler(&self, execute_data: &ExecuteData) {
-        // SAFETY: the observer trait hands us a `&ExecuteData` that is
-        // valid for the duration of the call. `extract_call_site`
-        // reads through `(*execute_data).func` and a handful of
-        // `zend_string` pointers, all of which remain valid until
-        // `end` returns.
-        let info = unsafe { extract_call_site(execute_data) };
-
         with_current_trace(|trace| {
+            // P-6 (recorder-hot-path-polish): `extract_call_site`
+            // moves inside the closure so out-of-request observer
+            // fires (slot empty between MINIT and the first RINIT,
+            // after RSHUTDOWN if PHP retains the observer cache) pay
+            // zero for the unsafe pointer walk. In-request fires are
+            // unaffected — the walk still happens before any other
+            // work the production path depends on.
+            //
+            // SAFETY: the observer trait hands us a `&ExecuteData`
+            // that is valid for the entire `begin` call, which
+            // encompasses this closure body.
+            // `extract_call_site` reads through `(*execute_data).func`
+            // and a handful of `zend_string` pointers, all of which
+            // remain valid until `end` returns.
+            let info = unsafe { extract_call_site(execute_data) };
+
             // Production path: zero-alloc on the dict-hit branch. The
             // owning `FunctionKey` and rendered `fqn` are materialised
             // only inside the `intern_ref` build closure on a miss
@@ -2072,7 +2166,9 @@ mod tests {
     fn zend_string_to_cow_returns_a_zero_copy_borrow_for_valid_utf8() {
         // The common case (parser-validated PHP identifiers and
         // UTF-8 paths) must stay zero-copy — the hot path budget
-        // depends on it.
+        // depends on it. Post-P-5 (recorder-hot-path-polish) this
+        // hits the `is_ascii` fast path; the assertion shape is
+        // unchanged from before P-5.
         let payload = b"my_fn";
         let bytes = make_zend_string(payload);
         let zs = bytes.as_ptr() as *mut ffi::zend_string;
@@ -2081,6 +2177,42 @@ mod tests {
         assert!(
             matches!(cow, std::borrow::Cow::Borrowed(_)),
             "valid UTF-8 must be borrowed, not allocated; got {cow:?}",
+        );
+    }
+
+    #[test]
+    fn zend_string_to_cow_ascii_input_takes_the_fast_path() {
+        // P-5 (recorder-hot-path-polish): ASCII identifiers (the
+        // dominant input shape) hit the `is_ascii` fast path. The
+        // returned `Cow` is `Borrowed`; the SAFETY-discharged
+        // `from_utf8_unchecked` is sound because every byte is in
+        // `0..=0x7f`.
+        let payload = b"MyApp\\Controller::handleRequest";
+        let bytes = make_zend_string(payload);
+        let zs = bytes.as_ptr() as *mut ffi::zend_string;
+        let cow = unsafe { zend_string_to_cow::<'_>(zs) }.expect("non-null");
+        assert_eq!(cow, "MyApp\\Controller::handleRequest");
+        assert!(
+            matches!(cow, std::borrow::Cow::Borrowed(_)),
+            "ASCII input must hit the fast path → Cow::Borrowed; got {cow:?}",
+        );
+    }
+
+    #[test]
+    fn zend_string_to_cow_valid_non_ascii_utf8_returns_borrowed() {
+        // Post-P-5 the helper distinguishes "valid UTF-8" from
+        // "must be lossy-decoded". A valid-UTF-8 non-ASCII byte
+        // sequence (here: U+00E9 LATIN SMALL LETTER E WITH ACUTE)
+        // now returns `Cow::Borrowed` instead of allocating a lossy
+        // String. Behaviour equivalent (same bytes), shape improved.
+        let payload = "café".as_bytes(); // c, a, f, 0xC3, 0xA9 — valid UTF-8
+        let bytes = make_zend_string(payload);
+        let zs = bytes.as_ptr() as *mut ffi::zend_string;
+        let cow = unsafe { zend_string_to_cow::<'_>(zs) }.expect("non-null");
+        assert_eq!(cow, "café");
+        assert!(
+            matches!(cow, std::borrow::Cow::Borrowed(_)),
+            "valid non-ASCII UTF-8 must be borrowed; got {cow:?}",
         );
     }
 
@@ -4285,6 +4417,114 @@ mod tests {
             trace.buffer.len(),
             1,
             "accepted pair must emit one CallRecord"
+        );
+    }
+
+    // --- Cached cpu_snapshot_mode (REVIEW.md P-3 / recorder-hot-path-polish)
+    //
+    // These tests pin the contract: the production cache is populated
+    // at MINIT, hot-path reads honour the priority chain (test
+    // override > cache > Config::global() chain), and the cache's
+    // encoding is shared with the existing test override slot. They
+    // share the `CPU_SNAPSHOT_MODE_TEST_LOCK` so cache resets do not
+    // race with override state under `cargo test`'s parallel runner.
+
+    fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        lock_cpu_snapshot_mode_for_test()
+    }
+
+    #[test]
+    fn publish_writes_the_encoded_mode_into_the_cache() {
+        let _lock = cache_test_lock();
+        reset_cached_cpu_snapshot_mode_for_test();
+        publish_cached_cpu_snapshot_mode(crate::config::CpuSnapshotMode::Off);
+        assert_eq!(
+            cached_cpu_snapshot_mode_for_test(),
+            CPU_SNAPSHOT_MODE_OFF,
+            "Off must encode to {CPU_SNAPSHOT_MODE_OFF}"
+        );
+        publish_cached_cpu_snapshot_mode(crate::config::CpuSnapshotMode::PerCall);
+        assert_eq!(
+            cached_cpu_snapshot_mode_for_test(),
+            CPU_SNAPSHOT_MODE_PER_CALL,
+            "PerCall must encode to {CPU_SNAPSHOT_MODE_PER_CALL}"
+        );
+        reset_cached_cpu_snapshot_mode_for_test();
+    }
+
+    #[test]
+    fn current_reads_the_cache_when_set_and_no_test_override() {
+        let _lock = cache_test_lock();
+        clear_cpu_snapshot_mode_for_test();
+        // Cache set to Off → current returns Off without consulting
+        // Config::global() (the production hot-path read shape).
+        publish_cached_cpu_snapshot_mode(crate::config::CpuSnapshotMode::Off);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::Off,
+        );
+        // Cache set to PerCall → current returns PerCall.
+        publish_cached_cpu_snapshot_mode(crate::config::CpuSnapshotMode::PerCall);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall,
+        );
+        reset_cached_cpu_snapshot_mode_for_test();
+    }
+
+    #[test]
+    fn test_override_takes_precedence_over_the_cache() {
+        let _lock = cache_test_lock();
+        // Production cache says Off.
+        publish_cached_cpu_snapshot_mode(crate::config::CpuSnapshotMode::Off);
+        // Test override says PerCall — must win.
+        set_cpu_snapshot_mode_for_test(crate::config::CpuSnapshotMode::PerCall);
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall,
+            "test override must beat the production cache"
+        );
+        // Clear the override → cache wins again.
+        clear_cpu_snapshot_mode_for_test();
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::Off,
+            "cleared override must fall through to the cache"
+        );
+        reset_cached_cpu_snapshot_mode_for_test();
+    }
+
+    #[test]
+    fn pre_publication_falls_through_to_default() {
+        let _lock = cache_test_lock();
+        clear_cpu_snapshot_mode_for_test();
+        reset_cached_cpu_snapshot_mode_for_test();
+        // Both override and cache are unset. `Config::global()` is
+        // typically uninitialised in unit-test builds (no
+        // `initialise_from_ini` call), so the helper falls all the
+        // way through to the documented default.
+        assert_eq!(
+            current_cpu_snapshot_mode(),
+            crate::config::CpuSnapshotMode::PerCall,
+            "pre-MINIT path must default to PerCall"
+        );
+    }
+
+    #[test]
+    fn cache_and_test_override_share_the_same_encoding() {
+        // Both atomics use the module-scope constants. Sanity check
+        // that the encoding is total over the variants and the
+        // sentinel is reserved.
+        assert_eq!(CPU_SNAPSHOT_MODE_PER_CALL, 0);
+        assert_eq!(CPU_SNAPSHOT_MODE_OFF, 1);
+        assert_eq!(CPU_SNAPSHOT_MODE_UNSET, 0xff);
+        assert_eq!(
+            encode_cpu_snapshot_mode(crate::config::CpuSnapshotMode::PerCall),
+            CPU_SNAPSHOT_MODE_PER_CALL,
+        );
+        assert_eq!(
+            encode_cpu_snapshot_mode(crate::config::CpuSnapshotMode::Off),
+            CPU_SNAPSHOT_MODE_OFF,
         );
     }
 }
